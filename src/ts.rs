@@ -344,6 +344,26 @@ unsafe fn offset_known(p: *const u8, len: usize, seconds: i64, civil_ok: bool) -
     (seconds.wrapping_add(to_utc).wrapping_mul(1_000), (len == 25) & civil_ok & zone_ok)
 }
 
+/// `flag`, with the compiler kept from knowing how it was worked out, so that a
+/// branch on it stays one branch. `std::hint::black_box` does that too, but
+/// through memory: the flag is stored to the stack and compared there, on every
+/// line, and the one branch of the line loop that is guessed wrong one time in
+/// ten waits for that store before it can be found wrong. Here it stays in a
+/// register (as `scan::wide::apart` keeps a bitmap).
+#[inline(always)]
+fn hidden(flag: bool) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let mut bits = u8::from(flag);
+        unsafe { std::arch::asm!("/* {0} */", inout(reg_byte) bits, options(pure, nomem, nostack, preserves_flags)) };
+        bits != 0
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        std::hint::black_box(flag)
+    }
+}
+
 /// Epoch milliseconds of the `len` bytes at `p`, or BAD.
 ///
 /// Which form a `ts` takes is as good as random from line to line, so the two
@@ -366,9 +386,9 @@ pub unsafe fn parse(p: *const u8, len: usize, dates: &mut Dates) -> i64 {
     let ok = std::hint::select_unpredictable(is_digits, digits_ok, is_utc & civil_ok);
     // `ok` is true nine times in ten, so this branch is cheap, but only as one
     // branch: the compiler splits a branch on "A and B, or C and D" into a branch
-    // on each, and the first of those is the form again. black_box hides how `ok`
-    // was made, so it cannot (measured: 700,000 mispredictions per million lines without it).
-    if std::hint::black_box(ok) {
+    // on each, and the first of those is the form again. `hidden` keeps from it
+    // how `ok` was made, so it cannot (measured: 700,000 mispredictions per million lines without it).
+    if hidden(ok) {
         return value;
     }
     // Taken by nearly every line that gets here, so it is a branch the CPU predicts.
