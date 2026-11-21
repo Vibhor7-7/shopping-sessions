@@ -58,7 +58,7 @@ impl Links {
                 let slot = stop.trailing_zeros() as usize; // the first slot that is `id` or free
                 let person = *line.add(2 * slot + 1);
                 let is_found = (found >> slot) & 1 != 0;
-                return if is_found { person } else { id };
+                return std::hint::select_unpredictable(is_found, person, id);
             }
             self.person_from(id, (home as usize + 4) & self.mask)
         }
@@ -124,9 +124,9 @@ impl Lines for LinkLines {
     #[inline(always)]
     unsafe fn line(&mut self, data: *const u8, start: usize, commas: *const u32, end: usize, quotes: u32) {
         let comma = *commas as usize;
-        let (mut a0, mut a1, mut b0, mut b1) = (start, comma, comma + 1, end);
-        let wrapped = reader::unquote(data, &mut a0, &mut a1) + reader::unquote(data, &mut b0, &mut b1);
-        if quotes != 2 * wrapped || a0 == a1 || b0 == b1 {
+        let (a0, a1, w0) = reader::unquoted(data, start, comma);
+        let (b0, b1, w1) = reader::unquoted(data, comma + 1, end);
+        if quotes != 2 * (w0 + w1) || a0 == a1 || b0 == b1 {
             return; // malformed, or a side is empty
         }
         let a = key::key_of_padded(data.add(a0), a1 - a0);

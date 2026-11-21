@@ -49,13 +49,12 @@ pub trait Lines {
     unsafe fn line(&mut self, data: *const u8, start: usize, commas: *const u32, end: usize, quotes: u32);
 }
 
-/// Shrinks a field to what is inside its quotes, if it is wrapped in a pair. Returns 1 if it was.
+/// A field's bounds once the quotes around it, if it is wrapped in a pair, are
+/// left out; and 1 if it was wrapped. By value, so the bounds stay in registers.
 #[inline(always)]
-pub unsafe fn unquote(data: *const u8, start: &mut usize, end: &mut usize) -> u32 {
-    let wrapped = (*end - *start >= 2) & (*data.add(*start) == b'"') & (*data.add(*end).sub(1) == b'"');
-    *start += wrapped as usize;
-    *end -= wrapped as usize;
-    wrapped as u32
+pub unsafe fn unquoted(data: *const u8, start: usize, end: usize) -> (usize, usize, u32) {
+    let wrapped = (end - start >= 2) & (*data.add(start) == b'"') & (*data.add(end).sub(1) == b'"');
+    (start + wrapped as usize, end - wrapped as usize, wrapped as u32)
 }
 
 fn read_fully(file: &File, mut into: &mut [u8], mut at: u64) -> usize {

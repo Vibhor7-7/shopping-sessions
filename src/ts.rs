@@ -311,9 +311,12 @@ pub unsafe fn parse(p: *const u8, len: usize, dates: &mut Dates) -> i64 {
     let (seconds, civil_ok) = civil_known(p, dates);
     let is_digits = len == 13;
     let is_utc = (len == 20) & (*p.add(19) == b'Z');
-    if (is_digits & digits_ok) | (is_utc & civil_ok) {
-        let pick = (is_digits as i64).wrapping_neg();
-        (digits & pick) | (seconds.wrapping_mul(1_000) & !pick)
+    // Selected, not branched on: left to itself the compiler turns this back into
+    // a branch on the form, which is the one thing here that cannot be predicted.
+    let value = std::hint::select_unpredictable(is_digits, digits, seconds.wrapping_mul(1_000));
+    let ok = std::hint::select_unpredictable(is_digits, digits_ok, is_utc & civil_ok);
+    if ok {
+        value
     } else {
         parse_general(p, len, dates)
     }

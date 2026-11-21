@@ -201,30 +201,25 @@ impl Lines for EventLines<'_, '_> {
     unsafe fn line(&mut self, data: *const u8, start: usize, commas: *const u32, end: usize, quotes: u32) {
         let sink = &mut *self.0;
         let context = sink.context;
-        let mut from = [0usize; 7];
-        let mut to = [0usize; 7];
-        from[0] = start;
-        for i in 0..6 {
-            let comma = *commas.add(i) as usize;
-            to[i] = comma;
-            from[i + 1] = comma + 1;
-        }
-        to[6] = end;
-        let mut wrapped = 0;
-        for i in 0..7 {
-            wrapped += reader::unquote(data, &mut from[i], &mut to[i]);
-        }
+        let comma = |i: usize| *commas.add(i) as usize;
+        let (id, id_end, w0) = reader::unquoted(data, start, comma(0));
+        let (user_at, user_end, w1) = reader::unquoted(data, comma(0) + 1, comma(1));
+        let (ts_at, ts_end, w2) = reader::unquoted(data, comma(1) + 1, comma(2));
+        let (ingest_at, ingest_end, w3) = reader::unquoted(data, comma(2) + 1, comma(3));
+        let (kind_at, kind_end, w4) = reader::unquoted(data, comma(3) + 1, comma(4));
+        let (product_at, product_end, w5) = reader::unquoted(data, comma(4) + 1, comma(5));
+        let (price_at, price_end, w6) = reader::unquoted(data, comma(5) + 1, end);
         // Quotes anywhere but around whole fields make the line malformed; so does an empty event_id.
-        if quotes != 2 * wrapped || from[0] == to[0] {
+        if quotes != 2 * (w0 + w1 + w2 + w3 + w4 + w5 + w6) || id == id_end {
             return;
         }
-        let event = key::key_of_padded(data.add(from[0]), to[0] - from[0]);
-        let ingest = ts::parse_utc(data.add(from[3]), to[3] - from[3], &mut sink.dates);
-        let at_ms = ts::parse(data.add(from[2]), to[2] - from[2], &mut sink.dates);
+        let event = key::key_of_padded(data.add(id), id_end - id);
+        let ingest = ts::parse_utc(data.add(ingest_at), ingest_end - ingest_at, &mut sink.dates);
+        let at_ms = ts::parse(data.add(ts_at), ts_end - ts_at, &mut sink.dates);
         let catalog = context.catalog;
 
-        let mut alive = to[1] != from[1]
-            && to[5] != from[5]
+        let mut alive = user_end != user_at
+            && product_end != product_at
             && ingest != ts::BAD
             && at_ms != ts::BAD
             && at_ms >= catalog.window_start
@@ -232,16 +227,17 @@ impl Lines for EventLines<'_, '_> {
             && ingest.wrapping_sub(at_ms) <= ts::DAY_MS;
         let mut purchase = 0u32;
         if alive {
-            let kind = to[4] - from[4];
+            let kind = kind_end - kind_at;
             if kind == 4 {
-                let word = (data.add(from[4]) as *const u32).read_unaligned();
-                alive = word == VIEW || word == CART;
-            } else if kind == 8 && (data.add(from[4]) as *const u64).read_unaligned() == PURCHASE {
-                let cents = price(data, from[6], to[6]);
+                // Nine in ten are views, the rest carts, in no order: compared, not branched on.
+                let word = (data.add(kind_at) as *const u32).read_unaligned();
+                alive = (word == VIEW) | (word == CART);
+            } else if kind == 8 && (data.add(kind_at) as *const u64).read_unaligned() == PURCHASE {
+                let cents = price(data, price_at, price_end);
                 if cents == 0 {
                     alive = false;
                 } else {
-                    purchase = context.purchase(cents, catalog.category(data.add(from[5]), to[5] - from[5]));
+                    purchase = context.purchase(cents, catalog.category(data.add(product_at), product_end - product_at));
                 }
             } else {
                 alive = false;
@@ -249,7 +245,7 @@ impl Lines for EventLines<'_, '_> {
         }
         let (mut user, mut home) = (0, 0);
         if alive {
-            user = key::key_of_padded(data.add(from[1]), to[1] - from[1]);
+            user = key::key_of_padded(data.add(user_at), user_end - user_at);
             home = context.links.prefetch(user);
         }
         let ingest = if ingest == ts::BAD {
@@ -275,32 +271,24 @@ impl Lines for ClickLines<'_, '_> {
     unsafe fn line(&mut self, data: *const u8, start: usize, commas: *const u32, end: usize, quotes: u32) {
         let sink = &mut *self.0;
         let context = sink.context;
-        let mut from = [0usize; 4];
-        let mut to = [0usize; 4];
-        from[0] = start;
-        for i in 0..3 {
-            let comma = *commas.add(i) as usize;
-            to[i] = comma;
-            from[i + 1] = comma + 1;
-        }
-        to[3] = end;
-        let mut wrapped = 0;
-        for i in 0..4 {
-            wrapped += reader::unquote(data, &mut from[i], &mut to[i]);
-        }
-        if quotes != 2 * wrapped || from[0] == to[0] || from[1] == to[1] {
+        let comma = |i: usize| *commas.add(i) as usize;
+        let (id, id_end, w0) = reader::unquoted(data, start, comma(0));
+        let (user_at, user_end, w1) = reader::unquoted(data, comma(0) + 1, comma(1));
+        let (campaign_at, campaign_end, w2) = reader::unquoted(data, comma(1) + 1, comma(2));
+        let (ts_at, ts_end, w3) = reader::unquoted(data, comma(2) + 1, end);
+        if quotes != 2 * (w0 + w1 + w2 + w3) || id == id_end || user_at == user_end {
             return; // malformed, no click_id, or no user_id
         }
-        let at_ms = ts::parse(data.add(from[3]), to[3] - from[3], &mut sink.dates);
+        let at_ms = ts::parse(data.add(ts_at), ts_end - ts_at, &mut sink.dates);
         let catalog = context.catalog;
         if at_ms == ts::BAD || at_ms < context.epoch || at_ms >= catalog.window_end {
             return;
         }
-        let campaign = catalog.campaign(data.add(from[2]), to[2] - from[2]);
+        let campaign = catalog.campaign(data.add(campaign_at), campaign_end - campaign_at);
         if campaign == catalog::NONE {
             return;
         }
-        let user = key::key_of_padded(data.add(from[1]), to[1] - from[1]);
+        let user = key::key_of_padded(data.add(user_at), user_end - user_at);
         let home = context.links.prefetch(user);
         let slot = sink.click_count & (RING - 1);
         if sink.click_count >= RING {
@@ -308,7 +296,7 @@ impl Lines for ClickLines<'_, '_> {
             sink.settle_click(ready);
         }
         sink.waiting_clicks[slot] =
-            PendingClick { user, click: key::key_of_padded(data.add(from[0]), to[0] - from[0]), ts: (at_ms - context.epoch) as u32, campaign, home };
+            PendingClick { user, click: key::key_of_padded(data.add(id), id_end - id), ts: (at_ms - context.epoch) as u32, campaign, home };
         sink.click_count += 1;
     }
 }
