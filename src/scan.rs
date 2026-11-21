@@ -11,8 +11,10 @@ pub struct Index {
     /// Offsets of every `\n`, ascending.
     pub newlines: Vec<u32>,
     pub newline_count: usize,
-    /// Offsets of every `,`, ascending, then 8 sentinels of `u32::MAX`.
-    pub commas: Vec<u32>,
+    /// One slot of `u32::MAX`, then the offsets of every `,` and `\n`, ascending,
+    /// then 8 sentinels of `u32::MAX`. The slot in front stands for a delimiter at
+    /// offset -1, so the line at offset 0 has one before it like every other line.
+    delims: Vec<u32>,
     /// Quotes before each 64-byte block, and each block's quote bitmap.
     quotes_before: Vec<u32>,
     quote_bits: Vec<u64>,
@@ -23,7 +25,7 @@ impl Index {
         Self {
             newlines: vec![0; capacity + 80],
             newline_count: 0,
-            commas: vec![0; capacity + 80],
+            delims: vec![u32::MAX; capacity + 81],
             quotes_before: vec![0; capacity / 64 + 3],
             quote_bits: vec![0; capacity / 64 + 3],
         }
@@ -31,6 +33,12 @@ impl Index {
 
     pub fn capacity(&self) -> usize {
         self.newlines.len() - 80
+    }
+
+    /// The first delimiter's slot. The slot before it is readable and holds `u32::MAX`.
+    #[inline(always)]
+    pub fn delims(&self) -> *const u32 {
+        unsafe { self.delims.as_ptr().add(1) }
     }
 
     /// How many `"` lie before offset `at`.
@@ -47,7 +55,7 @@ impl Index {
     pub unsafe fn build(&mut self, data: *const u8, len: usize) {
         debug_assert!(len <= self.capacity());
         let mut newline_out = self.newlines.as_mut_ptr();
-        let mut comma_out = self.commas.as_mut_ptr();
+        let mut delim_out = self.delims.as_mut_ptr().add(1);
         let blocks = len.div_ceil(64);
         let mut quotes = 0u32;
         for block in 0..blocks {
@@ -63,14 +71,14 @@ impl Index {
             quotes += quote_bits.count_ones();
             let base = (block * 64) as u32;
             newline_out = flatten::<2>(newlines, base, newline_out);
-            comma_out = flatten::<8>(commas, base, comma_out);
+            delim_out = flatten::<8>(commas | newlines, base, delim_out);
         }
         // So `quotes_before(len)` works when len is a multiple of 64.
         *self.quotes_before.get_unchecked_mut(blocks) = quotes;
         *self.quote_bits.get_unchecked_mut(blocks) = 0;
         self.newline_count = newline_out.offset_from(self.newlines.as_ptr()) as usize;
         for i in 0..8 {
-            *comma_out.add(i) = u32::MAX;
+            *delim_out.add(i) = u32::MAX;
         }
     }
 }
@@ -224,10 +232,12 @@ mod tests {
             let mut index = Index::new(1024);
             unsafe { index.build(data.as_ptr(), len) };
             let newlines: Vec<u32> = (0..len).filter(|&i| data[i] == b'\n').map(|i| i as u32).collect();
-            let commas: Vec<u32> = (0..len).filter(|&i| data[i] == b',').map(|i| i as u32).collect();
+            let delims: Vec<u32> = (0..len).filter(|&i| data[i] == b',' || data[i] == b'\n').map(|i| i as u32).collect();
             assert_eq!(&index.newlines[..index.newline_count], &newlines[..]);
-            assert_eq!(&index.commas[..commas.len()], &commas[..]);
-            assert_eq!(&index.commas[commas.len()..commas.len() + 8], &[u32::MAX; 8]);
+            let found = unsafe { std::slice::from_raw_parts(index.delims().sub(1), delims.len() + 9) };
+            assert_eq!(found[0], u32::MAX);
+            assert_eq!(&found[1..=delims.len()], &delims[..]);
+            assert_eq!(&found[delims.len() + 1..], &[u32::MAX; 8]);
             let mut quotes = 0;
             for at in 0..=len {
                 assert_eq!(index.quotes_before(at), quotes, "quotes before {at} of {len}");

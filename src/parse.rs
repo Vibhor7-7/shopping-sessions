@@ -17,7 +17,7 @@ use crate::catalog::{self, Catalog};
 use crate::key::{self, Key};
 use crate::links::Links;
 use crate::pool::{Chunks, Combine, Pool};
-use crate::reader::{self, Input, Job, Lines, ReadBuf};
+use crate::reader::{self, Fields, Input, Job, Lines, ReadBuf};
 use crate::sys;
 use crate::ts;
 
@@ -198,19 +198,20 @@ impl Lines for EventLines<'_, '_> {
     const COMMAS: usize = 6;
 
     #[inline(always)]
-    unsafe fn line(&mut self, data: *const u8, start: usize, commas: *const u32, end: usize, quotes: u32) {
+    unsafe fn line(&mut self, data: *const u8, delims: *const u32, quotes: u32) {
         let sink = &mut *self.0;
         let context = sink.context;
-        let comma = |i: usize| *commas.add(i) as usize;
-        let (id, id_end, w0) = reader::unquoted(data, start, comma(0));
-        let (user_at, user_end, w1) = reader::unquoted(data, comma(0) + 1, comma(1));
-        let (ts_at, ts_end, w2) = reader::unquoted(data, comma(1) + 1, comma(2));
-        let (ingest_at, ingest_end, w3) = reader::unquoted(data, comma(2) + 1, comma(3));
-        let (kind_at, kind_end, w4) = reader::unquoted(data, comma(3) + 1, comma(4));
-        let (product_at, product_end, w5) = reader::unquoted(data, comma(4) + 1, comma(5));
-        let (price_at, price_end, w6) = reader::unquoted(data, comma(5) + 1, end);
+        let mut fields = Fields::new();
+        let wrapped = reader::split::<7>(data, delims, &mut fields);
+        let (id, id_end) = (fields.at(0), fields.at(0) + fields.len(0));
+        let (user_at, user_end) = (fields.at(1), fields.at(1) + fields.len(1));
+        let (ts_at, ts_end) = (fields.at(2), fields.at(2) + fields.len(2));
+        let (ingest_at, ingest_end) = (fields.at(3), fields.at(3) + fields.len(3));
+        let (kind_at, kind_end) = (fields.at(4), fields.at(4) + fields.len(4));
+        let (product_at, product_end) = (fields.at(5), fields.at(5) + fields.len(5));
+        let (price_at, price_end) = (fields.at(6), fields.at(6) + fields.len(6));
         // Quotes anywhere but around whole fields make the line malformed; so does an empty event_id.
-        if quotes != 2 * (w0 + w1 + w2 + w3 + w4 + w5 + w6) || id == id_end {
+        if quotes != 2 * wrapped || id == id_end {
             return;
         }
         let event = key::key_of_padded(data.add(id), id_end - id);
@@ -268,15 +269,16 @@ impl Lines for ClickLines<'_, '_> {
     const COMMAS: usize = 3;
 
     #[inline(always)]
-    unsafe fn line(&mut self, data: *const u8, start: usize, commas: *const u32, end: usize, quotes: u32) {
+    unsafe fn line(&mut self, data: *const u8, delims: *const u32, quotes: u32) {
         let sink = &mut *self.0;
         let context = sink.context;
-        let comma = |i: usize| *commas.add(i) as usize;
-        let (id, id_end, w0) = reader::unquoted(data, start, comma(0));
-        let (user_at, user_end, w1) = reader::unquoted(data, comma(0) + 1, comma(1));
-        let (campaign_at, campaign_end, w2) = reader::unquoted(data, comma(1) + 1, comma(2));
-        let (ts_at, ts_end, w3) = reader::unquoted(data, comma(2) + 1, end);
-        if quotes != 2 * (w0 + w1 + w2 + w3) || id == id_end || user_at == user_end {
+        let mut fields = Fields::new();
+        let wrapped = reader::split::<4>(data, delims, &mut fields);
+        let (id, id_end) = (fields.at(0), fields.at(0) + fields.len(0));
+        let (user_at, user_end) = (fields.at(1), fields.at(1) + fields.len(1));
+        let (campaign_at, campaign_end) = (fields.at(2), fields.at(2) + fields.len(2));
+        let (ts_at, ts_end) = (fields.at(3), fields.at(3) + fields.len(3));
+        if quotes != 2 * wrapped || id == id_end || user_at == user_end {
             return; // malformed, no click_id, or no user_id
         }
         let at_ms = ts::parse(data.add(ts_at), ts_end - ts_at, &mut sink.dates);
