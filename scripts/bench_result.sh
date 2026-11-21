@@ -6,4 +6,4 @@ gh run watch "$id" --exit-status --interval 15 > /dev/null 2>&1 || true
 echo "run $id: $(gh run view "$id" --json conclusion,headSha --jq '.conclusion + " " + .headSha[0:7]')"
 gh run view "$id" --log 2> /dev/null \
   | awk -F'\t' '{ line = $NF; sub(/^[^ ]*Z /, "", line); print line }' \
-  | grep -E "^Model name|^(bin/|SS_|\(defaults\)|NCPU|--- )|^container wall|^bare docker|^docker run of|^(base|head): |FAILED|rror:" || true
+  | grep -E "^Model name|^(bin/|SS_|\(defaults\)|NCPU|--- )|^container wall|^bare docker|^docker run of|^(base|head): |^pipeline: (inside|links)|^AnonHuge|FAILED|rror:" || true

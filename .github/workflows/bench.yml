@@ -85,6 +85,14 @@ jobs:
           ENV_A: ${{ inputs.env_a }}
           ENV_B: ${{ inputs.env_b }}
         run: scripts/ab.sh data bin/base bin/head 3
+      - name: Where the CPU time goes (user, kernel, page faults), this commit
+        run: |
+          for threads in 4 1; do
+            rm -rf out
+            NCPU=$threads /usr/bin/time -f "NCPU=$threads: %e s wall, %U s user, %S s kernel, %R minor faults, %M KB peak" bin/head data out 2> time.log
+            grep -E "NCPU=|inside links|links .* ms" time.log
+          done
+          grep -E "AnonHugePages|Hugepagesize" /proc/meminfo
       - name: Sweep of settings on this commit
         if: inputs.sweep != ''
         run: |
