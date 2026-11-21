@@ -16,6 +16,10 @@ jobs:
       - name: Build the image
         run: docker build -t shopping-sessions:latest .
       - name: Fixtures, with the scorer's flags
+        # The scorer gives 8 CPUs and 24 GB; a hosted runner has 4 and 16.
+        env:
+          CPUS: 4
+          MEM: 12g
         run: |
           pip install --quiet polars
           python3 scripts/run_fixtures.py fixtures -- scripts/docker_run.sh
