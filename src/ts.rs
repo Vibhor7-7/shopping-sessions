@@ -315,7 +315,11 @@ pub unsafe fn parse(p: *const u8, len: usize, dates: &mut Dates) -> i64 {
     // a branch on the form, which is the one thing here that cannot be predicted.
     let value = std::hint::select_unpredictable(is_digits, digits, seconds.wrapping_mul(1_000));
     let ok = std::hint::select_unpredictable(is_digits, digits_ok, is_utc & civil_ok);
-    if ok {
+    // `ok` is true nine times in ten, so this branch is cheap, but only as one
+    // branch: the compiler splits a branch on "A and B, or C and D" into a branch
+    // on each, and the first of those is the form again. black_box hides how `ok`
+    // was made, so it cannot (measured: 700,000 mispredictions per million lines without it).
+    if std::hint::black_box(ok) {
         value
     } else {
         parse_general(p, len, dates)
@@ -326,7 +330,7 @@ pub unsafe fn parse(p: *const u8, len: usize, dates: &mut Dates) -> i64 {
 #[inline(always)]
 pub unsafe fn parse_utc(p: *const u8, len: usize, dates: &mut Dates) -> i64 {
     let (seconds, ok) = civil_known(p, dates);
-    if ok & (len == 20) & (*p.add(19) == b'Z') {
+    if std::hint::black_box(ok & (len == 20) & (*p.add(19) == b'Z')) {
         seconds * 1_000
     } else {
         parse_general(p, len, dates)

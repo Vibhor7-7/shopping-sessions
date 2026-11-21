@@ -38,3 +38,13 @@ jobs:
           python3 scripts/run_fixtures.py fixtures -- target/release/pipeline
           SS_JOB_BYTES=7 SS_BLOCK_BYTES=17 python3 scripts/run_fixtures.py fixtures -- target/release/pipeline
           scripts/check_reference.sh
+      - name: Pipeline and reference agree on a stand-in dataset
+        run: |
+          cargo build --release --bin synth 2>&1 | tail -1
+          target/release/synth --events 1500000 --clicks 400000 --seed 21 --output data
+          target/release/reference data ref
+          for settings in "NCPU=4" "NCPU=3 SS_PERSON_BITS=3 SS_DEDUP_BITS=11" "NCPU=4 SS_JOB_BYTES=40000 SS_BLOCK_BYTES=3000"; do
+            rm -rf out; env $settings target/release/pipeline data out 2>/dev/null
+            echo "[$settings] $(python3 scripts/compare_exact.py out ref | tail -1)"
+            python3 scripts/compare_exact.py out ref | tail -1 | grep -q MATCH
+          done
