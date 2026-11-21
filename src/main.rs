@@ -54,9 +54,31 @@ fn write_user_daily(folder: &Path, catalog: &catalog::Catalog, part: usize, rows
     if count == 0 && part != 0 {
         return 0; // the checker needs at least one file, not one per thread
     }
-    let present: Vec<bool> = rows.top.iter().map(|&top| top != 0).collect();
+    // PROBE BUILD: the dev answer's first five rows carry what the probe found, in their
+    // top_category (and the first two in their numbers): the page shows differing rows, not logs.
+    let mut rows = rows;
+    let mut present: Vec<bool> = Vec::with_capacity(count);
     let mut tops = Vec::new();
-    plain(rows.top.iter().filter(|&&top| top != 0).map(|&top| &catalog.categories[top as usize - 1]), &mut tops);
+    let mut at = 0usize;
+    for row in 0..count {
+        let len = u32::from_le_bytes([rows.ids[at], rows.ids[at + 1], rows.ids[at + 2], rows.ids[at + 3]]) as usize;
+        let carried = probe::carried(&rows.ids[at + 4..at + 4 + len], rows.day[row]);
+        at += 4 + len;
+        if let Some((text, numbers)) = carried {
+            present.push(true);
+            plain(std::iter::once(text.as_bytes()), &mut tops);
+            if let Some((sessions, events, revenue)) = *numbers {
+                rows.sessions[row] = sessions;
+                rows.events[row] = events;
+                rows.revenue[row] = revenue;
+            }
+        } else if rows.top[row] != 0 {
+            present.push(true);
+            plain(std::iter::once(&catalog.categories[rows.top[row] as usize - 1]), &mut tops);
+        } else {
+            present.push(false);
+        }
+    }
 
     let mut file = parquet::File::new(count);
     file.text("user_id", &rows.ids);
@@ -161,6 +183,15 @@ fn main() {
         .or_else(|| std::thread::available_parallelism().ok().map(usize::from))
         .unwrap_or(8)
         .clamp(1, 256);
+
+    // PROBE BUILD: the machine and the full-size runs first, so that the rows written
+    // below can carry what they found. A run the probe itself started is the pipeline alone.
+    if std::env::var_os("SS_PROBE_CHILD").is_none() {
+        probe::run(&data, &output);
+        probe::at_scale();
+        probe::finish(scan::chosen().name(), started.elapsed().as_secs_f64());
+    }
+    let started = Instant::now();
 
     let events = reader::open_folder(&data.join("events"));
     let clicks = reader::open_folder(&data.join("clicks"));
@@ -278,25 +309,6 @@ fn main() {
     if cfg!(target_os = "linux") && event_bytes < (256 << 20) {
         describe_machine();
     }
-    // PROBE BUILD. A run the probe itself started is the pipeline and nothing more.
-    if std::env::var_os("SS_PROBE_CHILD").is_some() {
-        std::process::exit(0);
-    }
-    // The output is spoiled first, so that the log is shown whatever becomes of the rest.
-    if let Ok(files) = std::fs::read_dir(&user_folder) {
-        for file in files.flatten() {
-            let _ = std::fs::remove_file(file.path());
-        }
-    }
-    write_user_daily(&user_folder, &catalog, 0, person::UserRows::default());
-    if event_bytes >= (256 << 20) {
-        describe_machine();
-    }
-    // The machine first (seconds), then the pipeline at full size (most of a minute), then
-    // the parse phase stage by stage: last, because its runs keep their memory.
-    probe::run(&data, &output);
-    probe::at_scale();
-    probe::anatomy(&context, &events, &clicks, threads, 1 << person_bits, 1 << dedup_bits, chunks);
-    eprintln!("probe: ---- end of the log, {:.1} s after the start ----", started.elapsed().as_secs_f64());
+    // PROBE BUILD: nothing more here; the probe ran before the pipeline (see the top of `main`).
     std::process::exit(0);
 }

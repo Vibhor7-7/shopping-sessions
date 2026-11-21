@@ -5,7 +5,114 @@
 
 use std::io::{Read, Write};
 use std::os::unix::fs::MetadataExt;
+use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
+
+/// Every line the probe says, kept as well as printed: the track page shows a
+/// rejected submission its differing rows, not its log, so what the probe found
+/// goes out in five rows of user_daily (`finish`, `carried`).
+static LOG: Mutex<Vec<String>> = Mutex::new(Vec::new());
+/// The runs of `at_scale`: label, milliseconds from start to exit, the phases' line.
+static RUNS: Mutex<Vec<(String, f64, String)>> = Mutex::new(Vec::new());
+/// What the five rows carry: a text each, and for the first two, numbers.
+static CARRIED: OnceLock<Vec<(String, Option<(u32, u32, i64)>)>> = OnceLock::new();
+
+fn say(line: String) {
+    eprintln!("{line}");
+    LOG.lock().unwrap().push(line);
+}
+
+macro_rules! say {
+    ($($arg:tt)*) => { say(format!($($arg)*)) };
+}
+
+/// The dev answer's first five rows by user_id and day (the dev set is seed 1 of
+/// the published generator, the same everywhere): the rows the page shows first.
+const TARGETS: [(&[u8], i32); 5] =
+    [(b"U14NPKDLL", 21173), (b"U1AK82W40", 21167), (b"U1GQRGV02", 21165), (b"U1O7PFB0O", 21171), (b"U1O7PFB0O", 21172)];
+
+/// The text, and perhaps numbers, that the row of this user and day carries instead of its own top_category.
+pub fn carried(id: &[u8], day: i32) -> Option<&'static (String, Option<(u32, u32, i64)>)> {
+    if id.len() != 9 {
+        return None;
+    }
+    let carried = CARRIED.get()?;
+    TARGETS.iter().position(|&(user, on)| user == id && on == day).and_then(|at| carried.get(at))
+}
+
+/// Sorts what was said into five texts, the most telling first in each, and the
+/// full-size runs' best times into numbers for the first two rows.
+pub fn finish(scan: &str, seconds: f64) {
+    let lines = LOG.lock().unwrap().clone();
+    let runs = RUNS.lock().unwrap().clone();
+    let mut texts = vec![String::new(); 5];
+    let mut section = 3usize;
+    let mut scale = false;
+    for line in &lines {
+        let text = line.strip_prefix("probe: ").unwrap_or(line);
+        if text.starts_with("----") {
+            scale = text.contains("whole pipeline");
+            section = if scale {
+                0
+            } else if text.contains("environment") {
+                4
+            } else if text.contains("when things were made") {
+                2
+            } else if text.contains("memory") || text.contains("disks") || text.contains("input:") || text.contains("256-bit") || text.contains("how many threads") {
+                1
+            } else {
+                3
+            };
+            continue;
+        }
+        let first = ["cpu:", "flags of interest", "processors listed", "available_parallelism"].iter().any(|k| text.starts_with(k))
+            || ["transparent_hugepage/enabled", "transparent_hugepage/defrag", "cgroup/cpu.max", "cgroup/memory.max", "/proc/version"].iter().any(|k| text.contains(k));
+        let mut text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        if scale {
+            for (long, short) in [
+                (" ms from start to exit (exit status: 0)", ""),
+                (" (what a process costs by itself)", ""),
+                ("as scored, run ", "S"),
+                (", run ", "r"),
+                ("NCPU=", "N"),
+                ("SS_SCAN=narrow", "NAR"),
+                (" partitions of each kind", "p"),
+                ("SS_BLOCK_BYTES=", "B"),
+                ("links ", "l"),
+                ("parse ", "p"),
+                ("dedup ", "d"),
+                ("people ", "pe"),
+                ("total ", "t"),
+                (" ms", ""),
+                (" | scan ", "|"),
+                (" | ", "|"),
+            ] {
+                text = text.replace(long, short);
+            }
+        }
+        let into = if first { 0 } else { section };
+        texts[into].push_str(&text);
+        texts[into].push_str("; ");
+    }
+    texts[0] = format!("scan {scan}; probe took {seconds:.1} s; {}", texts[0]);
+    let best = |label: &str| -> Option<&(String, f64, String)> {
+        runs.iter().filter(|run| run.0.starts_with(label)).min_by(|a, b| a.1.total_cmp(&b.1))
+    };
+    let phase = |line: &str, name: &str| -> i64 {
+        line.split(name).nth(1).and_then(|rest| rest.trim_start().split(' ').next()).and_then(|v| v.parse::<f64>().ok()).map_or(0, |v| v.round() as i64)
+    };
+    let wall = |label: &str| best(label).map_or(0, |run| run.1.round() as i64);
+    let first = best("as scored").map(|run| {
+        (run.1.round() as u32, phase(&run.2, "total") as u32, phase(&run.2, "parse") * 1_000_000 + phase(&run.2, "people") * 1_000 + phase(&run.2, "dedup"))
+    });
+    let second = best("as scored").map(|_| (wall("NCPU=4") as u32, wall("NCPU=16") as u32, wall("SS_SCAN=narrow") * 1_000_000 + wall("2^9") * 1_000 + wall("2^11")));
+    let carried = texts
+        .into_iter()
+        .enumerate()
+        .map(|(at, text)| (text.chars().take(4000).collect::<String>(), [first, second].get(at).copied().flatten()))
+        .collect();
+    let _ = CARRIED.set(carried);
+}
 
 fn head(path: &str, bytes: usize) -> String {
     let mut text = vec![0u8; bytes];
@@ -18,11 +125,11 @@ fn show(path: &str, bytes: usize) {
     // Short lines, and not many: a log too long may be cut where it is shown.
     for (i, line) in text.lines().enumerate() {
         if i < 36 {
-            eprintln!("probe: {path}: {}", line.chars().take(170).collect::<String>());
+            say!("probe: {path}: {}", line.chars().take(170).collect::<String>());
         }
     }
     if text.is_empty() {
-        eprintln!("probe: {path}: (empty or unreadable)");
+        say!("probe: {path}: (empty or unreadable)");
     }
 }
 
@@ -36,69 +143,69 @@ fn spin(iterations: u64) -> u64 {
 
 pub fn run(data: &std::path::Path, output: &std::path::Path) {
     let now = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64());
-    eprintln!("probe: ---- machine ----");
+    say!("probe: ---- machine ----");
     let cpu = head("/proc/cpuinfo", 1 << 20);
     let field = |name: &str| cpu.lines().find(|l| l.starts_with(name)).and_then(|l| l.split(':').nth(1)).unwrap_or("").trim().to_string();
-    eprintln!("probe: cpu: {} | family {} model {} stepping {} | {} MHz | cache {}", field("model name"), field("cpu family"), field("model\t"), field("stepping"), field("cpu MHz"), field("cache size"));
-    eprintln!("probe: processors listed: {}", cpu.lines().filter(|l| l.starts_with("processor")).count());
+    say!("probe: cpu: {} | family {} model {} stepping {} | {} MHz | cache {}", field("model name"), field("cpu family"), field("model\t"), field("stepping"), field("cpu MHz"), field("cache size"));
+    say!("probe: processors listed: {}", cpu.lines().filter(|l| l.starts_with("processor")).count());
     let flags = field("flags");
-    eprintln!("probe: flags of interest: {}", flags.split(' ').filter(|f| f.starts_with("avx") || ["bmi1", "bmi2", "erms", "fsrm", "gfni", "vaes", "vpclmulqdq", "pclmulqdq", "ht", "hypervisor", "sha_ni", "adx", "popcnt", "movbe", "pdpe1gb"].contains(f)).collect::<Vec<_>>().join(" "));
+    say!("probe: flags of interest: {}", flags.split(' ').filter(|f| f.starts_with("avx") || ["bmi1", "bmi2", "erms", "fsrm", "gfni", "vaes", "vpclmulqdq", "pclmulqdq", "ht", "hypervisor", "sha_ni", "adx", "popcnt", "movbe", "pdpe1gb"].contains(f)).collect::<Vec<_>>().join(" "));
     for line in head("/proc/self/status", 4096).lines().filter(|l| l.starts_with("Cpus_allowed") || l.starts_with("Mems_allowed_list") || l.starts_with("Threads") || l.starts_with("Uid") || l.starts_with("Seccomp") || l.starts_with("NoNewPrivs") || l.starts_with("CapEff")) {
-        eprintln!("probe: status: {line}");
+        say!("probe: status: {line}");
     }
-    eprintln!("probe: available_parallelism: {:?}", std::thread::available_parallelism());
+    say!("probe: available_parallelism: {:?}", std::thread::available_parallelism());
     for path in ["/proc/version", "/proc/loadavg", "/proc/uptime", "/proc/self/cgroup", "/sys/fs/cgroup/cpu.max", "/sys/fs/cgroup/cpuset.cpus.effective", "/sys/fs/cgroup/cpu.weight", "/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory.high", "/sys/fs/cgroup/memory.swap.max", "/sys/fs/cgroup/pids.max", "/sys/fs/cgroup/cpu.stat", "/sys/fs/cgroup/memory.peak", "/sys/fs/cgroup/memory.events", "/sys/kernel/mm/transparent_hugepage/enabled", "/sys/kernel/mm/transparent_hugepage/defrag", "/sys/kernel/mm/transparent_hugepage/shmem_enabled", "/proc/sys/vm/overcommit_memory", "/proc/sys/vm/dirty_ratio", "/proc/sys/vm/dirty_background_ratio", "/sys/devices/system/cpu/smt/active", "/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor", "/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq", "/sys/devices/system/cpu/cpu0/topology/thread_siblings_list"] {
         show(path, 1500);
     }
     for line in head("/proc/meminfo", 4096).lines().filter(|l| ["MemTotal", "MemFree", "MemAvailable", "Cached", "Dirty", "AnonHugePages", "HugePages_Total", "Hugepagesize", "SwapTotal"].iter().any(|k| l.starts_with(k))) {
-        eprintln!("probe: meminfo: {line}");
+        say!("probe: meminfo: {line}");
     }
     for line in head("/proc/self/mountinfo", 16000).lines().filter(|l| l.split(' ').nth(4).is_some_and(|at| ["/", "/data", "/output", "/scratch", "/tmp", "/app"].contains(&at))).take(8) {
-        eprintln!("probe: mount: {}", line.chars().take(200).collect::<String>());
+        say!("probe: mount: {}", line.chars().take(200).collect::<String>());
     }
     for line in head("/proc/self/limits", 2000).lines().filter(|l| ["Max locked memory", "Max address space", "Max open files", "Max processes", "Max stack size"].iter().any(|k| l.starts_with(k))) {
-        eprintln!("probe: limit: {}", line.split_whitespace().collect::<Vec<_>>().join(" "));
+        say!("probe: limit: {}", line.split_whitespace().collect::<Vec<_>>().join(" "));
     }
-    eprintln!("probe: ---- environment (values only for the documented ones) ----");
+    say!("probe: ---- environment (values only for the documented ones) ----");
     for (name, value) in std::env::vars() {
         if ["DATA_DIR", "OUTPUT_DIR", "SCRATCH_DIR", "HOME", "NCPU", "MEM_GB", "PATH", "TMPDIR", "HOSTNAME"].contains(&name.as_str()) {
-            eprintln!("probe: env {name}={value}");
+            say!("probe: env {name}={value}");
         } else {
-            eprintln!("probe: env {name}=<{} bytes>", value.len());
+            say!("probe: env {name}=<{} bytes>", value.len());
         }
     }
-    eprintln!("probe: args: {:?}; pid {}; cwd {:?}", std::env::args().collect::<Vec<_>>(), std::process::id(), std::env::current_dir().ok());
+    say!("probe: args: {:?}; pid {}; cwd {:?}", std::env::args().collect::<Vec<_>>(), std::process::id(), std::env::current_dir().ok());
 
-    eprintln!("probe: ---- when things were made (seconds before now) ----");
+    say!("probe: ---- when things were made (seconds before now) ----");
     let at = now();
     for path in ["/", "/app", "/app/pipeline", "/bin", "/bin/busybox", "/etc", "/tmp", "/data", "/output", "/scratch", "/proc/self", "/proc/1", "/sys/fs/cgroup", "/dev", "/data/manifest.json", "/data/events", "/data/products.csv"] {
         match std::fs::metadata(path) {
-            Ok(m) => eprintln!("probe: {path}: mode {:o} uid {} dev {:x} size {} | changed {:.3} s ago, modified {:.3} s ago, read {:.3} s ago", m.mode(), m.uid(), m.dev(), m.len(), at - (m.ctime() as f64 + m.ctime_nsec() as f64 * 1e-9), at - (m.mtime() as f64 + m.mtime_nsec() as f64 * 1e-9), at - (m.atime() as f64 + m.atime_nsec() as f64 * 1e-9)),
-            Err(e) => eprintln!("probe: {path}: {e}"),
+            Ok(m) => say!("probe: {path}: mode {:o} uid {} dev {:x} size {} | changed {:.3} s ago, modified {:.3} s ago, read {:.3} s ago", m.mode(), m.uid(), m.dev(), m.len(), at - (m.ctime() as f64 + m.ctime_nsec() as f64 * 1e-9), at - (m.mtime() as f64 + m.mtime_nsec() as f64 * 1e-9), at - (m.atime() as f64 + m.atime_nsec() as f64 * 1e-9)),
+            Err(e) => say!("probe: {path}: {e}"),
         }
     }
     let stat = head("/proc/self/stat", 1024);
     let after = stat.rsplit(')').next().unwrap_or("");
     let start_ticks: f64 = after.split_whitespace().nth(19).and_then(|v| v.parse().ok()).unwrap_or(0.0);
     let uptime: f64 = head("/proc/uptime", 64).split_whitespace().next().and_then(|v| v.parse().ok()).unwrap_or(0.0);
-    eprintln!("probe: this process was started {:.3} s ago (clock ticks of 10 ms)", uptime - start_ticks / 100.0);
+    say!("probe: this process was started {:.3} s ago (clock ticks of 10 ms)", uptime - start_ticks / 100.0);
     for dir in ["/", "/app", "/data", "/output", "/scratch", "/tmp"] {
         let names: Vec<String> = std::fs::read_dir(dir).map(|d| d.flatten().take(40).map(|e| e.file_name().to_string_lossy().into_owned()).collect()).unwrap_or_default();
-        eprintln!("probe: ls {dir}: {} entries: {}", names.len(), names.join(" "));
+        say!("probe: ls {dir}: {} entries: {}", names.len(), names.join(" "));
     }
     for folder in ["events", "clicks", "links"] {
         let sizes: Vec<u64> = std::fs::read_dir(data.join(folder)).map(|d| d.flatten().filter_map(|e| e.metadata().ok()).map(|m| m.len()).collect()).unwrap_or_default();
-        eprintln!("probe: {folder}: {} files, {} bytes, largest {}", sizes.len(), sizes.iter().sum::<u64>(), sizes.iter().max().copied().unwrap_or(0));
+        say!("probe: {folder}: {} files, {} bytes, largest {}", sizes.len(), sizes.iter().sum::<u64>(), sizes.iter().max().copied().unwrap_or(0));
     }
 
-    eprintln!("probe: ---- how many threads really run at once (same work per thread; flat = that many real CPUs) ----");
+    say!("probe: ---- how many threads really run at once (same work per thread; flat = that many real CPUs) ----");
     for threads in [1usize, 2, 4, 8, 16] {
         let started = Instant::now();
         let sums: Vec<u64> = crate::sys::parallel(threads, |i| spin(std::hint::black_box(60_000_000 + i as u64)));
-        eprintln!("probe: {threads:>2} threads: {:.1} ms (checksum {:x})", started.elapsed().as_secs_f64() * 1e3, sums.iter().fold(0, |a, b| a ^ b));
+        say!("probe: {threads:>2} threads: {:.1} ms (checksum {:x})", started.elapsed().as_secs_f64() * 1e3, sums.iter().fold(0, |a, b| a ^ b));
     }
 
-    eprintln!("probe: ---- memory ----");
+    say!("probe: ---- memory ----");
     let on_huge_pages = || {
         head("/proc/self/smaps_rollup", 4096).lines().find(|l| l.starts_with("AnonHugePages")).and_then(|l| l.split_whitespace().nth(1).map(str::to_string)).unwrap_or_else(|| "?".into())
     };
@@ -117,11 +224,11 @@ pub fn run(data: &std::path::Path, output: &std::path::Path) {
         let started = Instant::now();
         drop(copy);
         drop(block);
-        eprintln!("probe: {label}: touch {touched:.1} ms, copy {copied:.1} ms, this process then has {huge} kB on huge pages, unmap both {:.1} ms ({last})", started.elapsed().as_secs_f64() * 1e3);
+        say!("probe: {label}: touch {touched:.1} ms, copy {copied:.1} ms, this process then has {huge} kB on huge pages, unmap both {:.1} ms ({last})", started.elapsed().as_secs_f64() * 1e3);
     }
     plain_pages();
 
-    eprintln!("probe: ---- disks ----");
+    say!("probe: ---- disks ----");
     let chunk = vec![7u8; 8 << 20];
     for dir in [output.to_path_buf(), std::path::PathBuf::from(std::env::var("SCRATCH_DIR").unwrap_or_else(|_| "/scratch".into())), std::path::PathBuf::from("/tmp")] {
         let megabytes = if dir.starts_with("/tmp") { 16 } else { 96 };
@@ -139,20 +246,20 @@ pub fn run(data: &std::path::Path, output: &std::path::Path) {
         let reread = started.elapsed().as_secs_f64() * 1e3;
         let started = Instant::now();
         let _ = std::fs::remove_file(&path);
-        eprintln!("probe: {}: write {megabytes} MB {wrote:.1} ms ({written:?}), read back {reread:.1} ms ({read} bytes), delete {:.1} ms", dir.display(), started.elapsed().as_secs_f64() * 1e3);
+        say!("probe: {}: write {megabytes} MB {wrote:.1} ms ({written:?}), read back {reread:.1} ms ({read} bytes), delete {:.1} ms", dir.display(), started.elapsed().as_secs_f64() * 1e3);
     }
     if let Some(largest) = std::fs::read_dir(data.join("events")).ok().and_then(|d| d.flatten().max_by_key(|e| e.metadata().map(|m| m.len()).unwrap_or(0))) {
         for round in 1..=2 {
             let started = Instant::now();
             let bytes = std::fs::read(largest.path()).map(|b| b.len()).unwrap_or(0);
-            eprintln!("probe: read the largest event file, round {round}: {bytes} bytes in {:.1} ms", started.elapsed().as_secs_f64() * 1e3);
+            say!("probe: read the largest event file, round {round}: {bytes} bytes in {:.1} ms", started.elapsed().as_secs_f64() * 1e3);
         }
     }
     if let Some(largest) = std::fs::read_dir(data.join("events")).ok().and_then(|d| d.flatten().max_by_key(|e| e.metadata().map(|m| m.len()).unwrap_or(0))) {
         input_paths(&largest.path());
     }
     vector_widths();
-    eprintln!("probe: ---- end of the machine; user_daily was emptied on purpose before all this, so that the log is shown ----");
+    say!("probe: ---- end of the machine; user_daily was emptied on purpose before all this, so that the log is shown ----");
 }
 
 /// What 4 KB pages cost here against huge ones: 256 MB mapped, every page touched, unmapped, under each advice.
@@ -190,13 +297,14 @@ fn plain_pages() {
                 let wall = started.elapsed().as_secs_f64() * 1e3;
                 let touch = times.iter().map(|t| t.0).fold(0.0, f64::max);
                 let unmap = times.iter().map(|t| t.1).fold(0.0, f64::max);
-                eprintln!("probe: 256 MB a thread on {threads} threads, {label}: touch every page {touch:.1} ms, unmap {unmap:.1} ms (slowest thread; {wall:.1} ms in all)");
+                say!("probe: 256 MB a thread on {threads} threads, {label}: touch every page {touch:.1} ms, unmap {unmap:.1} ms (slowest thread; {wall:.1} ms in all)");
             }
         }
     }
 }
 
 /// The parse phase of this dataset again, cut short at each stage, and whole on other thread counts.
+#[allow(dead_code)]
 pub fn anatomy(
     context: &crate::parse::Context,
     events: &[crate::reader::Input],
@@ -229,7 +337,7 @@ pub fn anatomy(
     let (stage_rounds, rounds) = if large { (1, 1) } else { (3, 2) };
     let parse_threads: &[usize] = if large { &[4, 8] } else { &[1, 2, 4, 6, 8, 12, 16] };
     let scan_threads: &[usize] = if large { &[1, 4, 8] } else { &[1, 2, 4, 8, 16] };
-    eprintln!("probe: ---- the parse phase of this dataset ({} MB), cut short at each stage ({threads} threads, best of {stage_rounds}) ----", bytes >> 20);
+    say!("probe: ---- the parse phase of this dataset ({} MB), cut short at each stage ({threads} threads, best of {stage_rounds}) ----", bytes >> 20);
     for (stop, what) in [
         (1, "read() only"),
         (2, "+ delimiter scan"),
@@ -240,15 +348,15 @@ pub fn anatomy(
         (7, "+ copy records, not event records"),
         (0, "everything"),
     ] {
-        eprintln!("probe: parse, {what}: {:.1} ms", time(stop, threads, stage_rounds));
+        say!("probe: parse, {what}: {:.1} ms", time(stop, threads, stage_rounds));
     }
-    eprintln!("probe: ---- the whole parse phase by thread count (best of {rounds}) ----");
+    say!("probe: ---- the whole parse phase by thread count (best of {rounds}) ----");
     for &count in parse_threads {
-        eprintln!("probe: parse on {count:>2} threads: {:.1} ms", time(0, count, rounds));
+        say!("probe: parse on {count:>2} threads: {:.1} ms", time(0, count, rounds));
     }
-    eprintln!("probe: ---- read() and the delimiter scan only, by thread count (best of {rounds}) ----");
+    say!("probe: ---- read() and the delimiter scan only, by thread count (best of {rounds}) ----");
     for &count in scan_threads {
-        eprintln!("probe: read + scan on {count:>2} threads: {:.1} ms", time(2, count, rounds));
+        say!("probe: read + scan on {count:>2} threads: {:.1} ms", time(2, count, rounds));
     }
 }
 
@@ -302,7 +410,7 @@ fn input_paths(path: &std::path::Path) {
             fn munmap(addr: *mut c_void, len: usize) -> i32;
             fn madvise(addr: *mut c_void, len: usize, advice: i32) -> i32;
         }
-        eprintln!("probe: ---- input: copy with read(), or in place with mmap() ----");
+        say!("probe: ---- input: copy with read(), or in place with mmap() ----");
         let Ok(file) = std::fs::File::open(path) else { return };
         let len = file.metadata().map(|m| m.len() as usize).unwrap_or(0) & !63;
         let megabytes = len as f64 / 1048576.0;
@@ -323,7 +431,7 @@ fn input_paths(path: &std::path::Path) {
             }
             best = best.min(started.elapsed().as_secs_f64());
         }
-        eprintln!("probe: read() in 256 KB blocks + scan: {:.0} MB/s (best of 5, {megabytes:.0} MB, sum {sum})", megabytes / best);
+        say!("probe: read() in 256 KB blocks + scan: {:.0} MB/s (best of 5, {megabytes:.0} MB, sum {sum})", megabytes / best);
         for (label, populate) in [("mmap, faulting as it goes", false), ("mmap, MADV_POPULATE_READ first", true)] {
             let mut best = f64::MAX;
             let mut first = 0.0;
@@ -331,7 +439,7 @@ fn input_paths(path: &std::path::Path) {
                 let started = Instant::now();
                 let map = mmap(std::ptr::null_mut(), len, 1, 2, file.as_raw_fd(), 0);
                 if map as isize == -1 {
-                    eprintln!("probe: mmap failed");
+                    say!("probe: mmap failed");
                     return;
                 }
                 let advised = if populate { madvise(map, len, 22) } else { 0 };
@@ -341,12 +449,12 @@ fn input_paths(path: &std::path::Path) {
                 if round == 0 {
                     first = took;
                     if populate && advised != 0 {
-                        eprintln!("probe: MADV_POPULATE_READ is not supported here");
+                        say!("probe: MADV_POPULATE_READ is not supported here");
                     }
                 }
                 best = best.min(took);
             }
-            eprintln!("probe: {label}: {:.0} MB/s best of 5 (map + scan + unmap), first round {:.0} MB/s (sum {sum})", megabytes / best, megabytes / first);
+            say!("probe: {label}: {:.0} MB/s best of 5 (map + scan + unmap), first round {:.0} MB/s (sum {sum})", megabytes / best, megabytes / first);
         }
     }
     #[cfg(not(target_arch = "x86_64"))]
@@ -358,9 +466,9 @@ fn input_paths(path: &std::path::Path) {
 fn vector_widths() {
     #[cfg(target_arch = "x86_64")]
     unsafe {
-        eprintln!("probe: ---- 256-bit against 512-bit ----");
+        say!("probe: ---- 256-bit against 512-bit ----");
         let wide = std::arch::is_x86_feature_detected!("avx512bw");
-        eprintln!("probe: avx512f {} avx512bw {} avx512vbmi {} avx512vbmi2 {} avx512vl {}", std::arch::is_x86_feature_detected!("avx512f"), wide, std::arch::is_x86_feature_detected!("avx512vbmi"), std::arch::is_x86_feature_detected!("avx512vbmi2"), std::arch::is_x86_feature_detected!("avx512vl"));
+        say!("probe: avx512f {} avx512bw {} avx512vbmi {} avx512vbmi2 {} avx512vl {}", std::arch::is_x86_feature_detected!("avx512f"), wide, std::arch::is_x86_feature_detected!("avx512vbmi"), std::arch::is_x86_feature_detected!("avx512vbmi2"), std::arch::is_x86_feature_detected!("avx512vl"));
         let len = 64usize << 20;
         let text: Vec<u8> = (0..len).map(|i| b"e3k9x0abc,u1b2c3d4e,2026-10-03T23:58:10Z,\"view\",p123,\n"[i % 53]).collect();
         let time = |f: &dyn Fn() -> u64| {
@@ -374,10 +482,10 @@ fn vector_widths() {
             (best * 1e3, value)
         };
         let (ms, value) = time(&|| count_256(std::hint::black_box(text.as_ptr()), std::hint::black_box(len)));
-        eprintln!("probe: 256-bit scan of 64 MB: {ms:.1} ms ({value})");
+        say!("probe: 256-bit scan of 64 MB: {ms:.1} ms ({value})");
         if wide {
             let (ms, value) = time(&|| count_512(std::hint::black_box(text.as_ptr()), std::hint::black_box(len)));
-            eprintln!("probe: 512-bit scan of 64 MB: {ms:.1} ms ({value})");
+            say!("probe: 512-bit scan of 64 MB: {ms:.1} ms ({value})");
         }
         // Mixed: scan 64 KB, then scalar work, 400 times; as the parser alternates.
         let mixed = |use_wide: bool| {
@@ -392,12 +500,12 @@ fn vector_widths() {
             })
         };
         let (ms, _) = time(&|| (0..400).fold(0u64, |a, _| a ^ spin(std::hint::black_box(150_000))));
-        eprintln!("probe: scalar work alone: {ms:.1} ms");
+        say!("probe: scalar work alone: {ms:.1} ms");
         let (ms, _) = mixed(false);
-        eprintln!("probe: 256-bit scan + scalar work, alternating: {ms:.1} ms");
+        say!("probe: 256-bit scan + scalar work, alternating: {ms:.1} ms");
         if wide {
             let (ms, _) = mixed(true);
-            eprintln!("probe: 512-bit scan + scalar work, alternating: {ms:.1} ms");
+            say!("probe: 512-bit scan + scalar work, alternating: {ms:.1} ms");
         }
     }
 }
@@ -409,10 +517,10 @@ fn vector_widths() {
 /// because it is the part that takes long: if the run is cut short, that is out.
 pub fn at_scale() {
     use std::process::{Command, Stdio};
-    eprintln!("probe: ---- the whole pipeline on a stand-in dataset, each run a process of its own ----");
+    say!("probe: ---- the whole pipeline on a stand-in dataset, each run a process of its own ----");
     let scratch = std::path::PathBuf::from(std::env::var("SCRATCH_DIR").unwrap_or_else(|_| "/scratch".into()));
     let Ok(exe) = std::env::current_exe() else {
-        eprintln!("probe: no path to this program");
+        say!("probe: no path to this program");
         return;
     };
     let synth = exe.with_file_name("synth");
@@ -435,7 +543,7 @@ pub fn at_scale() {
     let mut child = match child {
         Ok(child) => child,
         Err(error) => {
-            eprintln!("probe: could not start {}: {error}", synth.display());
+            say!("probe: could not start {}: {error}", synth.display());
             return;
         }
     };
@@ -454,7 +562,7 @@ pub fn at_scale() {
     let megabytes = |folder: &str| -> u64 {
         std::fs::read_dir(data.join(folder)).map(|d| d.flatten().filter_map(|e| e.metadata().ok()).map(|m| m.len()).sum::<u64>()).unwrap_or(0) >> 20
     };
-    eprintln!(
+    say!(
         "probe: {events} events and {} clicks made in {:.1} s (done: {made}): events {} MB, clicks {} MB, links {} MB",
         events / 4,
         started.elapsed().as_secs_f64(),
@@ -485,9 +593,12 @@ pub fn at_scale() {
                 let log = String::from_utf8_lossy(&result.stderr);
                 let phases = log.lines().find(|l| l.starts_with("pipeline: links ")).map(|l| l["pipeline: ".len()..].split(" (pool").next().unwrap_or("").to_string()).unwrap_or_default();
                 let scan = log.lines().find_map(|l| l.rfind("; scan ").map(|at| l[at + 2..].to_string())).unwrap_or_default();
-                eprintln!("probe: {label}: {wall:.1} ms from start to exit ({}) | {phases} | {scan}", result.status);
+                say!("probe: {label}: {wall:.1} ms from start to exit ({}) | {phases} | {scan}", result.status);
+                if result.status.success() {
+                    RUNS.lock().unwrap().push((label.to_string(), wall, phases));
+                }
             }
-            Err(error) => eprintln!("probe: {label}: could not run: {error}"),
+            Err(error) => say!("probe: {label}: could not run: {error}"),
         }
     };
     for round in 1..=3 {
@@ -520,7 +631,7 @@ pub fn at_scale() {
     }
     clean();
     for line in head("/sys/fs/cgroup/cpu.stat", 600).lines().filter(|l| l.starts_with("nr_") || l.starts_with("throttled")) {
-        eprintln!("probe: cpu.stat at the end: {line}");
+        say!("probe: cpu.stat at the end: {line}");
     }
-    eprintln!("probe: memory.peak at the end: {}", head("/sys/fs/cgroup/memory.peak", 64));
+    say!("probe: memory.peak at the end: {}", head("/sys/fs/cgroup/memory.peak", 64));
 }

@@ -27,6 +27,17 @@ jobs:
           echo "docker run took $(echo "$(date +%s.%N) - $start" | bc) s; the log is $(wc -l < probe.log) lines, $(wc -c < probe.log) bytes"
           cat probe.log
           ls -la out/user_daily
+          pip install --quiet polars
+          python3 - <<'PY'
+          import polars as pl
+          df = pl.read_parquet("out/user_daily/*.parquet").sort(["user_id", "day"])
+          print(df.shape)
+          for row in df.head(6).iter_rows(named=True):
+              text = row["top_category"]
+              print(row["user_id"], row["day"], row["sessions"], row["events"], row["revenue_cents"], len(text) if text else None)
+              if text:
+                  print("   ", text)
+          PY
   native:
     runs-on: ubuntu-latest
     steps:
