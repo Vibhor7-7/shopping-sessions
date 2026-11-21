@@ -68,11 +68,12 @@ struct Pending<T> {
 ///
 /// A thread pushes to a couple of thousand partitions in no order, and every
 /// push reads one state and writes into one buffer. Mapped on their own, the
-/// buffers and states of the three streams are about 125 pages of 4 KB at 2^10
-/// partitions, twice the entries the first-level TLB has for both threads of a
-/// core together, so the address of nearly every one had to be looked up again
-/// in the second level, and the prefetch that announces a push waited for it
-/// (BENCH.md, experiment 32). On one huge page they are a single entry.
+/// buffers and states of the three streams were about 125 pages of 4 KB at
+/// 2^10 partitions, and a first-level TLB has 64 to 96 entries for the two
+/// threads of a core together. On one huge page they are a single entry.
+/// Measured (BENCH.md, experiment 32): parse 1 to 2% faster with two threads
+/// to a core, no different with one. That the TLB is why is a reading of
+/// those two numbers and of the profile, not something counted.
 pub struct Arena {
     next: usize,
     end: usize,
