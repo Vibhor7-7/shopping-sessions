@@ -158,6 +158,18 @@ fn is_pointer(word: u64) -> bool {
     word & 15 == POINTER
 }
 
+/// The most edges between giving an edge's IDs their slots and joining them.
+const RING: usize = 64;
+
+/// How many edges lie between an edge's steps in `Forest::join_all`: from
+/// claiming its slots to joining them (a power of two, at most `RING`), and
+/// from asking for its home lines to claiming. `SS_JOIN_NEAR` and `SS_JOIN_FAR`
+/// are measuring knobs.
+fn join_distances() -> (usize, usize) {
+    let setting = |name: &str, default: usize| std::env::var(name).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default);
+    (setting("SS_JOIN_NEAR", 8).clamp(1, RING).next_power_of_two(), setting("SS_JOIN_FAR", 8).min(1 << 16))
+}
+
 /// The slot a pointer points to.
 #[inline(always)]
 fn pointed(word: u64) -> usize {
@@ -232,6 +244,49 @@ impl Forest<'_> {
             let (small, large) = if key::compare(ka, kb).is_lt() { (a, b) } else { (b, a) };
             if self.parent(large).compare_exchange(0, pointer_to(small), Ordering::AcqRel, Ordering::Relaxed).is_ok() {
                 return;
+            }
+        }
+    }
+
+    /// Asks for the line of the slot that `at`'s pointer leads to, the one line
+    /// `find(at)` reads that nobody has asked for yet. A root has no pointer and
+    /// asks for its own line, which it is in: whether a slot is a root is as good
+    /// as random from edge to edge, so the address is selected, not branched on.
+    #[inline(always)]
+    fn ask_for_parent(&self, at: usize) {
+        let word = self.parent(at).load(Ordering::Relaxed);
+        sys::prefetch(self.id(std::hint::select_unpredictable(word == 0, at, pointed(word))));
+    }
+
+    /// Joins the two IDs of every edge in `edges`.
+    ///
+    /// The table is far larger than the cache and every step of a join lands
+    /// somewhere new, so an edge goes through three steps, each `near` or `far`
+    /// edges after the one before, with the lines the next step reads on their
+    /// way meanwhile: the two IDs' home lines are asked for; `far` edges later
+    /// the IDs are given their slots there, and the lines of those slots'
+    /// parents are asked for; `near` edges later the two are joined. The joins
+    /// may be made in any order (a tree's root is its smallest ID whatever the
+    /// order), and a slot claimed early is a root nobody has joined yet, which
+    /// is what it would be if its edge came later in the file.
+    fn join_all(&self, edges: &[(Key, Key)], near: usize, far: usize) {
+        debug_assert!(near.is_power_of_two() && near <= RING);
+        let mut ring = [(0usize, 0usize); RING];
+        for at in 0..edges.len() + near {
+            if let Some(&(a, b)) = edges.get(at + far) {
+                sys::prefetch(self.id(home(a, self.shift)));
+                sys::prefetch(self.id(home(b, self.shift)));
+            }
+            let turn = at & (near - 1);
+            if at >= near {
+                let (a, b) = unsafe { *ring.get_unchecked(turn) }; // the edge `near` before this one
+                self.join(a, b);
+            }
+            if let Some(&(a, b)) = edges.get(at) {
+                let (a, b) = (self.slot(a), self.slot(b));
+                self.ask_for_parent(a);
+                self.ask_for_parent(b);
+                unsafe { *ring.get_unchecked_mut(turn) = (a, b) };
             }
         }
     }
@@ -339,9 +394,7 @@ fn join_and_name(edge_lists: &[Vec<(Key, Key)>], threads: usize) -> Links {
         return Links { table: sys::Shared(table), mask, shift, ids: 0, timing: [0.0; 3] };
     }
     let shared = sys::Shared(table);
-    /// The table is far larger than the cache and every step lands somewhere new,
-    /// so the join asks for the lines it will need this many edges ahead.
-    const AHEAD: usize = 8;
+    let (near, far) = join_distances();
     let joining = std::time::Instant::now();
 
     // Join. The table is all zeros: every slot empty, every node a root.
@@ -352,14 +405,7 @@ fn join_and_name(edge_lists: &[Vec<(Key, Key)>], threads: usize) -> Links {
             shift,
         };
         for list in edge_lists.iter().skip(me).step_by(threads) {
-            for (at, &(a, b)) in list.iter().enumerate() {
-                if let Some(&(next_a, next_b)) = list.get(at + AHEAD) {
-                    sys::prefetch(forest.id(home(next_a, shift)));
-                    sys::prefetch(forest.id(home(next_b, shift)));
-                }
-                let (a, b) = (forest.slot(a), forest.slot(b));
-                forest.join(a, b);
-            }
+            forest.join_all(list, near, far);
         }
     });
     let joined = since(joining);
