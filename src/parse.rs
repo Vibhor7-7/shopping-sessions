@@ -115,8 +115,8 @@ struct PendingClick {
 
 struct Sink<'a> {
     context: &'a Context<'a>,
-    copies: Combine<'a, Copy_, 4>,
-    events: Combine<'a, Event, 4>,
+    copies: Combine<'a, Copy_, 8>,
+    events: Combine<'a, Event, 8>,
     clicks: Combine<'a, Click, 8>,
     waiting_events: [PendingEvent; RING],
     event_count: usize,
