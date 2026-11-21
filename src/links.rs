@@ -196,9 +196,38 @@ impl Forest<'_> {
     }
 
     /// The slot of `id`, claiming an empty one if it is new.
-    #[inline]
+    ///
+    /// Whether an ID is new is as good as random from edge to edge, and so is
+    /// how far down its home line it sits, so neither is branched on: the four
+    /// slots of the line are compared at once, and the first that holds the ID
+    /// or is free is claimed for it either way. On a slot that already holds
+    /// the ID the claim fails and says so, which is the answer. Only a full
+    /// line, or a free slot another thread took for another ID in between,
+    /// goes on to the search slot by slot.
+    #[inline(always)]
     fn slot(&self, id: Key) -> usize {
-        let mut at = home(id, self.shift);
+        let home = home(id, self.shift);
+        let mut stop = 0u32;
+        for slot in 0..4 {
+            let held = self.id(home + slot).load(Ordering::Relaxed);
+            stop |= u32::from((held == id) | (held == 0)) << slot;
+        }
+        if stop != 0 {
+            let at = home + stop.trailing_zeros() as usize;
+            match self.id(at).compare_exchange(0, id, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return at,
+                Err(held) if held == id => return at,
+                Err(_) => {}
+            }
+        }
+        self.slot_from(id, home)
+    }
+
+    /// The same, searching slot by slot from `at`: no slot before `at` in the
+    /// ID's search order holds it or is free.
+    #[cold]
+    #[inline(never)]
+    fn slot_from(&self, id: Key, mut at: usize) -> usize {
         loop {
             let seen = self.id(at).load(Ordering::Relaxed);
             if seen == id {
@@ -215,7 +244,21 @@ impl Forest<'_> {
         }
     }
 
-    #[inline]
+    /// The root of `at`'s tree. Four times in five `at` is the root itself and
+    /// nearly always otherwise its parent is; which, is as good as random, so
+    /// the slot to look at is selected and one predictable branch asks whether
+    /// it is a root. A longer path takes `find`.
+    #[inline(always)]
+    fn root(&self, at: usize) -> usize {
+        let parent = self.parent(at).load(Ordering::Acquire);
+        let up = std::hint::select_unpredictable(parent == 0, at, pointed(parent));
+        if self.parent(up).load(Ordering::Acquire) == 0 {
+            return up;
+        }
+        self.find(at)
+    }
+
+    #[inline(never)]
     fn find(&self, mut at: usize) -> usize {
         loop {
             let parent = self.parent(at).load(Ordering::Acquire);
@@ -235,13 +278,16 @@ impl Forest<'_> {
 
     fn join(&self, a: usize, b: usize) {
         loop {
-            let (a, b) = (self.find(a), self.find(b));
+            let (a, b) = (self.root(a), self.root(b));
             if a == b {
                 return;
             }
             let (ka, kb) = (self.id(a).load(Ordering::Relaxed), self.id(b).load(Ordering::Relaxed));
-            // The root with the larger ID goes under the one with the smaller.
-            let (small, large) = if key::compare(ka, kb).is_lt() { (a, b) } else { (b, a) };
+            // The root with the larger ID goes under the one with the smaller:
+            // which that is, is a coin toss.
+            let a_is_smaller = key::compare(ka, kb).is_lt();
+            let small = std::hint::select_unpredictable(a_is_smaller, a, b);
+            let large = std::hint::select_unpredictable(a_is_smaller, b, a);
             if self.parent(large).compare_exchange(0, pointer_to(small), Ordering::AcqRel, Ordering::Relaxed).is_ok() {
                 return;
             }
