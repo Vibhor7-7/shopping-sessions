@@ -272,32 +272,29 @@ static HOURS: [u32; 256] = clock_table(23, 3_600);
 static MINUTES: [u32; 256] = clock_table(59, 60);
 
 /// Two texts of eight bytes side by side, each to be read as `HH:MM:SS`: for
-/// each, a number in the low half of its 64 bits, and eight bits (the first
-/// text's are the low eight). A text is a real time of day exactly when its
-/// eight bits are all set and its number is under 86,400, and then the number
-/// is its seconds since midnight.
+/// each, its seconds since midnight in the low half of its 64 bits, and all of
+/// its 64 bits set if it is a real time of day (none if it is not).
 ///
 /// After an XOR with `00:00:00` a digit is 0 to 9 and a colon 0. Two
 /// multiply-adds then weigh the six digits (10 and 1 for a pair, then 3,600,
-/// 60 and 1), which is all the arithmetic there is. A bit is set for a byte
-/// that is no more than the largest digit its place allows; that leaves hours
-/// up to 29, and with minutes and seconds under 60 those are the numbers from
-/// 86,400 on.
+/// 60 and 1), which is all the arithmetic there is; a byte over the largest
+/// digit its place allows, or an hour over 23, makes it no time of day.
 /// One pass for two texts costs what it costs for one, so an event line's `ts`
 /// and `ingest_ts` share it (BENCH.md, experiment 42; until then each went
 /// through a `pext` and three table reads of its own).
 #[cfg(all(target_arch = "x86_64", target_feature = "sse4.1"))]
 #[inline(always)]
-unsafe fn clocks(texts: std::arch::x86_64::__m128i) -> (std::arch::x86_64::__m128i, u32) {
+unsafe fn clocks(texts: std::arch::x86_64::__m128i) -> (std::arch::x86_64::__m128i, std::arch::x86_64::__m128i) {
     use std::arch::x86_64::*;
     let digits = _mm_xor_si128(texts, _mm_set1_epi64x(i64::from_le_bytes(*b"00:00:00")));
     // H H : M M : S S, the most each place may hold.
-    let most = _mm_set1_epi64x(i64::from_le_bytes([2, 9, 0, 5, 9, 0, 5, 9]));
-    let within = _mm_cmpeq_epi8(_mm_max_epu8(digits, most), most);
+    let over = _mm_subs_epu8(digits, _mm_set1_epi64x(i64::from_le_bytes([2, 9, 0, 5, 9, 0, 5, 9])));
     // Words: HH, ten times the minutes' first digit, their second digit, SS.
     let pairs = _mm_maddubs_epi16(digits, _mm_set1_epi64x(i64::from_le_bytes([10, 1, 0, 10, 1, 0, 10, 1])));
+    let late = _mm_cmpgt_epi16(pairs, _mm_setr_epi16(23, i16::MAX, i16::MAX, i16::MAX, 23, i16::MAX, i16::MAX, i16::MAX));
     let halves = _mm_madd_epi16(pairs, _mm_setr_epi16(3_600, 60, 60, 1, 3_600, 60, 60, 1));
-    (_mm_add_epi32(halves, _mm_srli_epi64(halves, 32)), _mm_movemask_epi8(within) as u32)
+    let seconds = _mm_add_epi32(halves, _mm_srli_epi64(halves, 32));
+    (seconds, _mm_cmpeq_epi64(_mm_or_si128(over, late), _mm_setzero_si128()))
 }
 
 /// `HH:MM:SS` at `p` as seconds since midnight, and whether it is a real time of day. Never branches.
@@ -305,9 +302,8 @@ unsafe fn clocks(texts: std::arch::x86_64::__m128i) -> (std::arch::x86_64::__m12
 #[inline(always)]
 unsafe fn time_of_day(p: *const u8) -> (i64, bool) {
     use std::arch::x86_64::*;
-    let (numbers, within) = clocks(_mm_loadl_epi64(p as *const __m128i));
-    let seconds = _mm_cvtsi128_si32(numbers) as u32;
-    (i64::from(seconds), (within as u8 == u8::MAX) & (seconds < 86_400))
+    let (seconds, real) = clocks(_mm_loadl_epi64(p as *const __m128i));
+    (i64::from(_mm_cvtsi128_si32(seconds) as u32), _mm_cvtsi128_si32(real) != 0)
 }
 
 #[cfg(not(all(target_arch = "x86_64", target_feature = "sse4.1")))]
@@ -327,11 +323,11 @@ unsafe fn time_of_day(p: *const u8) -> (i64, bool) {
 unsafe fn times_of_day(a: *const u8, b: *const u8) -> ((i64, bool), (i64, bool)) {
     use std::arch::x86_64::*;
     let texts = _mm_insert_epi64(_mm_loadl_epi64(a as *const __m128i), (b as *const i64).read_unaligned(), 1);
-    let (numbers, within) = clocks(texts);
-    let (first, second) = (_mm_cvtsi128_si32(numbers) as u32, _mm_extract_epi32(numbers, 2) as u32);
+    let (seconds, real) = clocks(texts);
+    let real = _mm_movemask_epi8(real) as u32;
     (
-        (i64::from(first), (within as u8 == u8::MAX) & (first < 86_400)),
-        (i64::from(second), ((within >> 8) as u8 == u8::MAX) & (second < 86_400)),
+        (i64::from(_mm_cvtsi128_si32(seconds) as u32), real & 1 != 0),
+        (i64::from(_mm_extract_epi32(seconds, 2) as u32), real & 0x100 != 0),
     )
 }
 
