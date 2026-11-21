@@ -281,11 +281,6 @@ impl InPlace {
         Self(bytes)
     }
 
-    /// The same byte 32 times.
-    pub const fn splat(byte: u8) -> Self {
-        Self([byte; 32])
-    }
-
     /// Sixteen bytes, twice.
     pub const fn twice(half: [u8; 16]) -> Self {
         let mut bytes = [0u8; 32];
