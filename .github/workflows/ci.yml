@@ -27,8 +27,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Unit tests
-        run: cargo test --release
+      - name: Unit tests, baseline x86-64 and the scorer's AVX2 build
+        run: |
+          cargo test --release
+          RUSTFLAGS="-C target-cpu=x86-64-v3" cargo test --release
       - name: Fixtures, pipeline and reference, with tiny read blocks too
         run: |
           pip install --quiet polars

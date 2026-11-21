@@ -23,9 +23,12 @@ pub struct Links {
 }
 
 impl Links {
+    /// Where the search for `id` starts: always the first of the four slots that
+    /// share a cache line, so a lookup nearly always ends in the line it started
+    /// in, the one line `prefetch` asked for.
     #[inline(always)]
     fn home(&self, id: Key) -> usize {
-        (sys::mix(id) >> self.shift) as usize
+        home(id, self.shift)
     }
 
     /// Asks the CPU to fetch the slot `person(id)` will look at.
@@ -62,6 +65,11 @@ impl Links {
     }
 }
 
+#[inline(always)]
+fn home(id: Key, shift: u32) -> usize {
+    (sys::mix(id) >> shift) as usize & !3
+}
+
 struct LinkLines {
     edges: Vec<(Key, Key)>,
 }
@@ -96,7 +104,7 @@ impl Forest<'_> {
     /// The slot of `id`, claiming an empty one if it is new.
     #[inline]
     fn slot(&self, id: Key) -> usize {
-        let mut at = (sys::mix(id) >> self.shift) as usize;
+        let mut at = home(id, self.shift);
         loop {
             let seen = self.slots[at][0].load(Ordering::Relaxed);
             if seen == id {
@@ -165,7 +173,8 @@ pub fn build(inputs: &[Input], threads: usize) -> Links {
     });
     let edges: usize = edge_lists.iter().map(Vec::len).sum();
 
-    // Every edge names at most two new IDs; keep the table under three quarters full.
+    // Every edge names at most two new IDs; keep the table under three quarters
+    // full (in practice about a third, since most IDs are named by several lines).
     let capacity = (edges * 2 * 4 / 3).max(16).next_power_of_two();
     let table = sys::map::<[u64; 2]>(capacity);
     let (mask, shift) = (capacity - 1, 64 - capacity.trailing_zeros());
