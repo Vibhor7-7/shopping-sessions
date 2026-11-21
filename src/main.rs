@@ -45,26 +45,20 @@ fn plain(values: impl Iterator<Item = impl AsRef<[u8]>>, out: &mut Vec<u8>) {
     }
 }
 
-/// Writes one thread's user_daily rows as a Parquet file of their own.
+/// Writes one thread's user_daily rows as a Parquet file of their own. The
+/// columns are already what the file's pages hold; only top_category, which few
+/// rows have, is put together here.
 fn write_user_daily(folder: &Path, catalog: &catalog::Catalog, part: usize, rows: person::UserRows) -> usize {
-    let count = rows.person.len();
+    let count = rows.day.len();
     if count == 0 && part != 0 {
         return 0; // the checker needs at least one file, not one per thread
-    }
-    let mut ids = Vec::with_capacity(count * 14 + 16);
-    for &person in &rows.person {
-        let at = ids.len();
-        ids.extend_from_slice(&[0; 4]);
-        key::write_id(person, &mut ids);
-        let len = (ids.len() - at - 4) as u32;
-        ids[at..at + 4].copy_from_slice(&len.to_le_bytes());
     }
     let present: Vec<bool> = rows.top.iter().map(|&top| top != 0).collect();
     let mut tops = Vec::new();
     plain(rows.top.iter().filter(|&&top| top != 0).map(|&top| &catalog.categories[top as usize - 1]), &mut tops);
 
-    let mut file = parquet::File::new(count, ids.len() + tops.len() + count * 21);
-    file.text("user_id", &ids);
+    let mut file = parquet::File::new(count);
+    file.text("user_id", &rows.ids);
     file.int32("day", Kind::Date, &rows.day);
     file.counts("sessions", &rows.sessions);
     file.counts("events", &rows.events);
@@ -107,7 +101,7 @@ fn write_campaign_daily(folder: &Path, catalog: &catalog::Catalog, cells: &[pers
         }
     }
     let rows = day_column.len();
-    let mut file = parquet::File::new(rows, ids.len() + channels.len() + rows * 36);
+    let mut file = parquet::File::new(rows);
     file.text("campaign_id", &ids);
     file.text("channel", &channels);
     file.int32("day", Kind::Date, &day_column);

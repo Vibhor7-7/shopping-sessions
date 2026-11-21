@@ -244,6 +244,77 @@ pub fn write_id(key: Key, out: &mut Vec<u8>) {
     }
 }
 
+/// The characters of a packed key, written as 16 bytes at `out`: the ID, then
+/// bytes that mean nothing.
+///
+/// `squeeze` backwards: the first eight characters' codes are spread one to a
+/// byte, and all ten are turned into characters at once. The codes rise with
+/// the characters (1 to 10 the digits, 11 to 36 the capitals, 37 `_`, 38 to 63
+/// the small letters), so a code's character is the code plus 47, plus the gaps
+/// of the alphabet it has passed.
+#[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+#[inline(always)]
+unsafe fn spell(key: Key, out: *mut u8) {
+    use std::arch::x86_64::*;
+    let first = _pdep_u64(key >> 16, 0x3f3f_3f3f_3f3f_3f3f).swap_bytes();
+    let last = ((key >> 10) & 63) | (((key >> 4) & 63) << 8);
+    let codes = _mm_set_epi64x(last as i64, first as i64);
+    let above = |code: i8| _mm_cmpgt_epi8(codes, _mm_set1_epi8(code));
+    let mut text = _mm_add_epi8(codes, _mm_set1_epi8((b'0' - 1) as i8));
+    text = _mm_add_epi8(text, _mm_and_si128(above(10), _mm_set1_epi8((b'A' - b'9' - 1) as i8)));
+    text = _mm_add_epi8(text, _mm_and_si128(above(36), _mm_set1_epi8((b'_' - b'Z' - 1) as i8)));
+    text = _mm_add_epi8(text, _mm_and_si128(above(37), _mm_set1_epi8((b'a' - b'_' - 1) as i8)));
+    _mm_storeu_si128(out as *mut __m128i, text);
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+#[inline(always)]
+unsafe fn spell(key: Key, out: *mut u8) {
+    let mut text = [0u8; 16];
+    for (at, byte) in text.iter_mut().take(10).enumerate() {
+        *byte = DECODE[((key >> (58 - 6 * at)) & 63) as usize];
+    }
+    (out as *mut [u8; 16]).write_unaligned(text);
+}
+
+/// Appends the ID a key stands for the way a PLAIN Parquet page holds a string:
+/// its length in four bytes, then its characters. `write_id` with the length
+/// in front, and for a packed key without a loop over the characters: a row of
+/// user_daily is a handful of instructions to name.
+#[inline(always)]
+pub fn push_plain(key: Key, out: &mut Vec<u8>) {
+    if !is_packed(key) {
+        return push_plain_exotic(key, out);
+    }
+    // Twenty bytes are written whatever the length; the ones past it are overwritten by the next ID.
+    if out.capacity() - out.len() < 20 {
+        make_room(out);
+    }
+    // The last character holds the key's lowest set bit, and characters are six bits each from bit 63 down.
+    let len = (69 - key.trailing_zeros() as usize) / 6;
+    unsafe {
+        let at = out.as_mut_ptr().add(out.len());
+        (at as *mut u32).write_unaligned((len as u32).to_le());
+        spell(key, at.add(4));
+        out.set_len(out.len() + 4 + len);
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn make_room(out: &mut Vec<u8>) {
+    out.reserve(20);
+}
+
+#[cold]
+#[inline(never)]
+fn push_plain_exotic(key: Key, out: &mut Vec<u8>) {
+    let exotic = EXOTIC.lock().unwrap();
+    let id = &exotic.ids[(key >> 4) as usize];
+    out.extend_from_slice(&(id.len() as u32).to_le_bytes());
+    out.extend_from_slice(id);
+}
+
 #[cold]
 #[inline(never)]
 fn compare_slow(a: Key, b: Key) -> Ordering {
@@ -317,6 +388,59 @@ mod tests {
             assert_eq!(unsafe { pack_padded(buffer.as_ptr(), 10) }, pack(&buffer[..10]), "byte {byte} last");
         }
         assert!(packed > 100_000, "{packed} packed");
+    }
+
+    /// `push_plain` against `write_id`: every length, every character in every
+    /// place, exotic IDs in between, and a buffer that starts with no room.
+    #[test]
+    fn plain_spelling_is_write_id() {
+        let mut state = 7u64;
+        let mut next = move || {
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        };
+        let alphabet = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz";
+        let mut ids: Vec<Vec<u8>> = Vec::new();
+        for &character in alphabet {
+            for len in 1..=10 {
+                for place in 0..len {
+                    let mut id = vec![b'u'; len];
+                    id[place] = character;
+                    ids.push(id);
+                }
+                ids.push(vec![character; len]);
+            }
+        }
+        for round in 0..200_000 {
+            let len = 1 + (next() % 10) as usize;
+            let mut id: Vec<u8> = (0..len).map(|_| alphabet[(next() >> 8) as usize % alphabet.len()]).collect();
+            match round % 500 {
+                0 => id.extend_from_slice(b"_longer_than_ten"),
+                1 => id[0] = b' ',
+                2 => id = b"\xd9\xa2".to_vec(),
+                _ => {}
+            }
+            ids.push(id);
+        }
+        let (mut got, mut expected) = (Vec::new(), Vec::new());
+        let mut packed = 0;
+        for id in &ids {
+            let key = key_of(id);
+            packed += usize::from(is_packed(key));
+            push_plain(key, &mut got);
+            let at = expected.len();
+            expected.extend_from_slice(&[0; 4]);
+            write_id(key, &mut expected);
+            let len = (expected.len() - at - 4) as u32;
+            expected[at..at + 4].copy_from_slice(&len.to_le_bytes());
+            assert_eq!(&expected[at + 4..], &id[..], "write_id of {id:?}");
+            assert_eq!(got.len(), expected.len(), "after {id:?}");
+        }
+        assert!(got == expected);
+        assert!(packed > 200_000 && packed < ids.len(), "{packed} packed of {}", ids.len());
     }
 
     #[test]

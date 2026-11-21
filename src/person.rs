@@ -32,10 +32,12 @@ const SLIDING_MIN: usize = 16;
 const FEW: usize = SLIDING_MIN;
 const ABSENT: u32 = u32::MAX;
 
-/// One thread's user_daily rows, as columns.
+/// One thread's user_daily rows, as columns: each as its page of the Parquet
+/// file will hold it, so that writing the file copies none of them.
 #[derive(Default)]
 pub struct UserRows {
-    pub person: Vec<Key>,
+    /// user_id, each row's as a length in four bytes and then the characters (`key::push_plain`).
+    pub ids: Vec<u8>,
     pub day: Vec<i32>,
     pub sessions: Vec<u32>,
     pub events: Vec<u32>,
@@ -47,7 +49,8 @@ pub struct UserRows {
 impl UserRows {
     fn with_capacity(rows: usize) -> Self {
         Self {
-            person: Vec::with_capacity(rows),
+            // The generator's IDs are 9 or 10 characters; longer ones make the buffer grow.
+            ids: Vec::with_capacity(rows * 14 + 64),
             day: Vec::with_capacity(rows),
             sessions: Vec::with_capacity(rows),
             events: Vec::with_capacity(rows),
@@ -413,7 +416,7 @@ impl Tally {
             }
         }
         self.category_touched.clear();
-        self.rows.person.push(name);
+        key::push_plain(name, &mut self.rows.ids);
         self.rows.day.push((self.first_day + i64::from(day)) as i32);
         self.rows.sessions.push(sessions);
         self.rows.events.push(events);
