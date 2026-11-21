@@ -134,8 +134,7 @@ impl Lines for LinkLines {
         if quotes != 2 * (w0 + w1) || a0 == a1 || b0 == b1 {
             return true; // malformed, or a side is empty
         }
-        let a = key::key_of_padded(data.add(a0), a1 - a0);
-        let b = key::key_of_padded(data.add(b0), b1 - b0);
+        let (a, b) = key::keys_of_two_padded(data.add(a0), a1 - a0, data.add(b0), b1 - b0);
         if a != b {
             self.edges.push((a, b)); // a self-link changes nothing
         }

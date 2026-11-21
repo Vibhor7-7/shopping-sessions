@@ -257,7 +257,8 @@ impl Lines for EventLines<'_, '_> {
         if quotes != 2 * wrapped || id == id_end {
             return true;
         }
-        let event = key::key_of_padded(data.add(id), id_end - id);
+        // Both IDs at once. An empty user_id, which no line survives, has the key 0.
+        let (event, user_key) = key::keys_of_two_padded(data.add(id), id_end - id, data.add(user_at), user_end - user_at);
         let (ingest_seconds, ingest) = ts::parse_utc(data.add(ingest_at), ingest_end - ingest_at, &mut sink.dates);
         let at_ms = ts::parse(data.add(ts_at), ts_end - ts_at, &mut sink.dates);
         let catalog = context.catalog;
@@ -289,7 +290,7 @@ impl Lines for EventLines<'_, '_> {
         }
         let (mut user, mut home) = (0, 0);
         if alive {
-            user = key::key_of_padded(data.add(user_at), user_end - user_at);
+            user = user_key;
             home = context.links.prefetch(user);
         }
         let ingest = if ingest == ts::BAD {
@@ -340,7 +341,7 @@ impl Lines for ClickLines<'_, '_> {
         if campaign == catalog::NONE {
             return true;
         }
-        let user = key::key_of_padded(data.add(user_at), user_end - user_at);
+        let (click, user) = key::keys_of_two_padded(data.add(id), id_end - id, data.add(user_at), user_end - user_at);
         let home = context.links.prefetch(user);
         let slot = sink.click_count & (RING - 1);
         if sink.click_count >= RING {
@@ -351,7 +352,7 @@ impl Lines for ClickLines<'_, '_> {
             sink.look_up_click((sink.click_count - LOOK) & (RING - 1));
         }
         sink.waiting_clicks[slot] =
-            PendingClick { user, click: key::key_of_padded(data.add(id), id_end - id), ts: (at_ms - context.epoch) as u32, campaign, home };
+            PendingClick { user, click, ts: (at_ms - context.epoch) as u32, campaign, home };
         sink.click_count += 1;
         true
     }
