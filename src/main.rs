@@ -223,7 +223,9 @@ fn main() {
     let parsed = parse::run(&context, &pools, &events, &clicks, threads, 1 << person_bits, 1 << dedup_bits, chunks);
     let parsed_at = started.elapsed();
 
-    let dropped = dedup::run(&pools.copies, &pools.events, &parsed, 1 << dedup_bits, 64 - dedup_bits, threads);
+    // Slots in dedup's filter for every copy in a partition (a measuring knob; see dedup.rs).
+    let filter_slots = setting("SS_DEDUP_SLOTS").unwrap_or(16).clamp(1, 256);
+    let dropped = dedup::run(&pools.copies, &pools.events, &parsed, 1 << dedup_bits, 64 - dedup_bits, threads, filter_slots);
     let deduped_at = started.elapsed();
 
     let user_folder = output.join("user_daily");
