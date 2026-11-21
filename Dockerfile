@@ -15,6 +15,9 @@ RUN set -eu; \
 
 # At run time the root filesystem is read-only, the user is 1000:1000 and there
 # is no network. The binary is static and writes only to $OUTPUT_DIR.
-FROM alpine:3.22
+# The base is the starters' Debian, not scratch or Alpine, on purpose: the
+# organizers' scripts/docker_run.sh runs `chmod -R` from inside the image to
+# clean up, and BusyBox's chmod gives up where GNU's carries on.
+FROM debian:bookworm-slim
 COPY --from=build /pipeline /app/pipeline
 CMD ["/app/pipeline"]

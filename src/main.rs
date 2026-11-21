@@ -21,6 +21,7 @@ mod scan;
 mod sys;
 mod ts;
 
+use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Instant;
@@ -210,8 +211,9 @@ fn main() {
 
     let user_folder = output.join("user_daily");
     let campaign_folder = output.join("campaign_daily");
+    sys::open_permissions();
     for folder in [&user_folder, &campaign_folder] {
-        if let Err(e) = std::fs::create_dir_all(folder) {
+        if let Err(e) = std::fs::DirBuilder::new().recursive(true).mode(0o777).create(folder) {
             eprintln!("pipeline: cannot create {}: {e}", folder.display());
             std::process::exit(1);
         }

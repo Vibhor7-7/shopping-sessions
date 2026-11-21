@@ -297,7 +297,14 @@ impl File {
         let footer_len = (self.bytes.len() - footer) as u32;
         self.bytes.extend_from_slice(&footer_len.to_le_bytes());
         self.bytes.extend_from_slice(b"PAR1");
-        let written = std::fs::File::create(path).and_then(|mut file| file.write_all(&self.bytes));
+        use std::os::unix::fs::OpenOptionsExt;
+        let written = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o666)
+            .open(path)
+            .and_then(|mut file| file.write_all(&self.bytes));
         if let Err(e) = written {
             eprintln!("pipeline: cannot write {}: {e}", path.display());
             std::process::exit(1);

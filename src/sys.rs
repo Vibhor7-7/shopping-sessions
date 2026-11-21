@@ -24,6 +24,22 @@ const MADV_HUGEPAGE: i32 = 14;
 
 const HUGE: usize = 2 << 20;
 
+extern "C" {
+    #[cfg(target_os = "linux")]
+    fn umask(mask: u32) -> u32;
+    #[cfg(not(target_os = "linux"))]
+    fn umask(mask: u16) -> u16;
+}
+
+/// Lets everything this process creates be read, written and removed by anyone.
+/// The process runs as uid 1000 and the scorer that collects and clears the
+/// output is someone else; nothing it has to do should depend on a chmod.
+pub fn open_permissions() {
+    unsafe {
+        umask(0);
+    }
+}
+
 /// `count` zeroed `T`s, never freed. The memory is committed page by page as it
 /// is first written, so reserving far more than is used costs nothing. Large
 /// blocks are aligned to 2 MB and advised for transparent huge pages, which
