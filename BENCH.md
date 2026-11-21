@@ -45,8 +45,11 @@ Rows 1 to 15 were run before this log existed and are reconstructed from the ben
 | — | Sweep on top of 18: read block 16K/32K/64K/128K (default 256K); partition bits 9/9 and 11/10 (default 10/10) | `476a8a8` | defaults 791 (Zen 4); 16K 813, 32K 804, 64K 791, 128K 798; bits 9/9 797, 11/10 800 | n/a | n/a | nothing changed: the defaults are the best or tied |
 | 19 | Click records through write-combining buffers too (8 records, three cache lines) | `daa71f5` | 1249 → 1240 (Zen 3), −0.7%; one thread: parse −2.5% | with 20 | yes | kept |
 | 20 | Eight records to a buffer for the 16-byte streams: half the flush branches, twice the buffer | `35d159d` | 1239 → 1227 (Zen 3), −0.9%; one thread: parse −2.2% | 374 / 455, peak 1267 MB | yes | kept |
+| — | 18 to 20 together against the last submitted commit, at 20M and at 60M | `c5b2dfd` vs `e03e2c3` | 20M: **756 → 708 (Zen 4), −6.4%**; parse −10%; one thread −15.5%. 60M: 3819 → 3759 (Zen 3), −1.3% | as 20 | yes | measurement only. The gain depends on the CPU: −12% on Ice Lake (18 alone), −6% on Zen 4, about −1% on Zen 3 |
+| — | 60M sweep of partition bits (default 11/11): 10/10, 10/11, 11/10, 9/9 | `e03e2c3` | defaults 4028 (Ice Lake); 3989, 3999, 4017, 4027 | n/a | n/a | nothing changed: all within 1%, which is the noise. Fewer partitions make parse faster and people slower by the same amount |
+| 21 | At 60M, four records to a buffer again for the 16-byte streams (0.5 MB of buffers a thread instead of 0.9 MB) | branch, deleted | 60M: 3738 → 3789 (Zen 3), +1.4% | n/a | fixtures and dev check | **reverted** (never merged): the larger buffers are better at 60M too |
 
-## The probe (branch `probe`, commit `20969e6`)
+## The probe (branch `probe`, commit `3c84905`)
 
 Not for scoring. It runs the pipeline, logs a description of the machine (CPU model and AVX-512 subsets, whether it is a virtual machine, cgroup CPU and memory limits, huge-page settings, every mount, when the sandbox's files were created, how many threads really run at once, memory and disk speed, `read()` against `mmap()`, 256-bit against 512-bit scans) and then writes an empty `user_daily` so that the dev check fails: a failed dev check is the only case in which the track page shows a submission its log. A rejected submission does not change the best score; it does use one of the two submissions an hour.
 
@@ -62,16 +65,18 @@ What its answers decide:
 | Commit | Clean image build | Fixtures (image, scorer flags) | check-dev | diff seeds 2 to 5 | 60M: time | 60M: peak memory | Image |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `c5b2dfd` | yes, `--no-cache`, amd64 | 36/36 (locally under emulation and on CI's real amd64) | MATCH (native build, and the image's output) | 16/16 runs match | x86 CI, Docker `--cpus 4 --memory 12g` (the runner has no more): **4.06 to 4.34 s** per `docker run`, 3.07 s inside the process. Mac, native: 4.4 s best of 3, on a machine short of memory and disk | **3.4 GB** (x86, 4 threads); 3.1 to 3.4 GB on the Mac | 2.3 MB root filesystem, 3 layers |
+| `e03e2c3` | yes, `--no-cache`, amd64 | 36/36 (locally under emulation and on CI's real amd64) | MATCH (native build, x86-64 build, and the image's output) | 16/16 runs match, on both builds | x86 CI, Docker `--cpus 4 --memory 12g`: **4.21 to 4.28 s** per `docker run` on Zen 3 (3.75 to 3.81 s inside the process), 4.47 to 4.58 s on Ice Lake (4.05 to 4.16 s inside). Not run on the Mac this time: 7 GB of free disk is not enough for the 5.4 GB dataset and its output without distorting the run | **3.5 GB** (x86, 4 threads) | 2.3 MB root filesystem (the binary is 0.8 MB), 3 layers |
 
 Notes on the 60M runs:
 - No machine at hand has 8 CPUs and 24 GB for a container: the Mac's Docker VM has 8 GB, the CI runner 4 CPUs and 16 GB. The numbers above are under the largest limits each allows.
 - The reference cannot run at 60M (it would need tens of GB), so correctness at that size rests on: two runs with different thread and partition counts (8 threads, 2^11/2^11 partitions; 3 threads, 2^8/2^12) giving identical tables (6,623,558 user rows; digests equal); `sessions` and `revenue_cents` summing to the same in both tables (10,012,569 and 19,153,547,521); and the diff against the reference at up to 3M events.
-- On the CI runner, `docker run` at 60M takes about 1.0 s longer than the process inside it; at 20M the difference is 0.2 s (0.13 s of that is an empty container). What the extra 0.8 s is has not been found yet; see the list below.
+- On the CI runner, `docker run` at 60M takes 0.4 to 0.5 s longer than the process inside it; at 20M the difference is 0.4 s on some runners and 0.2 s on others. An empty container is 0.13 to 0.19 s of that (experiment 17). The first run after a build is far slower, once.
 
 ## To try, most promising first
 
-1. **Read the scorer**: the score of `c5b2dfd` (experiment 16) and, if spent, the probe's log. Most of what follows depends on them.
+1. **Read the scorer**: the score of `e03e2c3` (experiments 16 and 18 to 20 together) and, if spent, the probe's log. Most of what follows depends on them.
 2. **`mmap` again, if the scorer is bare metal.** It lost on virtual machines because of page-table walks (experiment 10); on bare metal those are cheap and the copy it saves is 6% of the run.
 3. **AVX-512 stage one**, if the probe shows it does not slow the scalar code around it.
-4. **Smaller output.** `user_daily` is 78 MB of PLAIN Parquet at 20M events. Dictionary and run-length encodings would cut it to about a third. Worth 1% under Docker (experiment 17); more only if the scorer's `/output` is slow.
-5. **Instruction-level cuts** in timestamps, keys and the quote check: 1 to 3% each (callgrind lists them).
+4. **More of what experiment 18 did**: memory the pipeline writes once and reads later. The people phase's staging arrays and the output buffers are the candidates.
+5. **Smaller output.** `user_daily` is 78 MB of PLAIN Parquet at 20M events. Dictionary and run-length encodings would cut it to about a third. Worth 1% under Docker (experiment 17); more only if the scorer's `/output` is slow.
+6. **Instruction-level cuts** in timestamps, keys and the quote check: 1 to 3% each (callgrind lists them).
