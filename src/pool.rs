@@ -1,9 +1,9 @@
 //! Partitioned record streams.
 //!
 //! While parsing, each thread appends records to one of P partitions. A
-//! partition is a list of fixed-size chunks carved out of 4 MB slabs; a record
-//! never moves once written, and every record has a global 32-bit index, so a
-//! later phase can point at one (the dedup phase does, to drop the losing
+//! partition is a list of fixed-size chunks carved out of slabs; a record never
+//! moves once it is in its chunk, and every record has a global 32-bit index,
+//! so a later phase can point at one (the dedup phase does, to drop the losing
 //! copies of an event).
 
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
@@ -51,18 +51,31 @@ impl<T> Pool<T> {
     }
 }
 
-struct Tail<T> {
-    cur: *mut T,
-    end: *mut T,
-    /// Global index one past the chunk's last slot.
+/// What a thread leaves behind: per partition, its chunks as (global index of the first record, records).
+pub type Chunks = Vec<Vec<(u32, u32)>>;
+
+/// Where a partition's buffered records will go.
+struct Pending<T> {
+    /// The buffer's place in the chunk; null before the partition's first record.
+    line: *mut T,
+    /// Global index of the next record pushed, and one past the chunk's last.
+    index: u32,
     end_index: u32,
 }
 
-/// One thread's write side: a tail per partition.
-pub struct Scatter<'p, T> {
+/// One thread's write side: for each partition, a write-combining buffer of `N` records.
+///
+/// A thread appends to a couple of thousand partitions in turn, each into
+/// memory nothing has touched yet. Written directly, every new cache line of
+/// every partition is first fetched from memory (only to be overwritten), and
+/// with that many streams no prefetcher sees them coming. Here `N` records, a
+/// whole number of cache lines, collect in a small buffer that stays in cache
+/// and then go out in non-temporal stores, which fetch nothing.
+pub struct Combine<'p, T, const N: usize> {
     pool: &'p Pool<T>,
-    tails: Vec<Tail<T>>,
-    /// Finished chunks per partition: (global index of the first record, records).
+    /// `N` buffered records per partition, each buffer starting on a cache line.
+    buffers: *mut [T; N],
+    states: Vec<Pending<T>>,
     chunks: Vec<Vec<(u32, u32)>>,
     chunk: u32,
     slab: *mut T,
@@ -70,18 +83,39 @@ pub struct Scatter<'p, T> {
     slab_left: u32,
 }
 
-/// What a thread leaves behind: per partition, its chunks.
-pub type Chunks = Vec<Vec<(u32, u32)>>;
+/// Copies `lines` 64-byte lines (both ends 64-byte aligned) without reading the destination into cache first.
+#[inline(always)]
+unsafe fn stream_lines(from: *const u8, to: *mut u8, lines: usize) {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx"))]
+    {
+        use std::arch::x86_64::*;
+        for half in 0..2 * lines {
+            _mm256_stream_si256(to.add(32 * half) as *mut __m256i, _mm256_load_si256(from.add(32 * half) as *const __m256i));
+        }
+    }
+    #[cfg(all(target_arch = "x86_64", not(target_feature = "avx")))]
+    {
+        use std::arch::x86_64::*;
+        for part in 0..4 * lines {
+            _mm_stream_si128(to.add(16 * part) as *mut __m128i, _mm_load_si128(from.add(16 * part) as *const __m128i));
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    std::ptr::copy_nonoverlapping(from, to, 64 * lines);
+}
 
-impl<'p, T: Copy> Scatter<'p, T> {
-    /// `chunk` records per chunk, a power of two no larger than a slab.
+impl<'p, T: Copy, const N: usize> Combine<'p, T, N> {
+    /// Cache lines in a full buffer.
+    const LINES: usize = N * std::mem::size_of::<T>() / 64;
+
+    /// `chunk` records per chunk: a power of two, at least `N`, no larger than a slab.
     pub fn new(pool: &'p Pool<T>, partitions: usize, chunk: usize) -> Self {
-        assert!(chunk.is_power_of_two() && chunk <= SLAB_RECORDS);
+        assert!(N.is_power_of_two() && (N * std::mem::size_of::<T>()) % 64 == 0 && std::mem::align_of::<T>() <= 64);
+        assert!(chunk.is_power_of_two() && chunk >= N && chunk <= SLAB_RECORDS);
         Self {
             pool,
-            tails: (0..partitions)
-                .map(|_| Tail { cur: std::ptr::null_mut(), end: std::ptr::null_mut(), end_index: 0 })
-                .collect(),
+            buffers: sys::map::<[T; N]>(partitions.max(64)), // page-aligned, so every buffer starts on a cache line
+            states: (0..partitions).map(|_| Pending { line: std::ptr::null_mut(), index: 0, end_index: 0 }).collect(),
             chunks: vec![Vec::new(); partitions],
             chunk: chunk as u32,
             slab: std::ptr::null_mut(),
@@ -90,26 +124,34 @@ impl<'p, T: Copy> Scatter<'p, T> {
         }
     }
 
-    /// Appends `record` to `partition` and returns its global index.
+    /// Appends `record` to `partition` and returns its global index. The record
+    /// is only in its final place once its buffer has filled, or after `finish`.
     #[inline(always)]
     pub fn push(&mut self, partition: usize, record: T) -> u32 {
         unsafe {
-            if (*self.tails.as_ptr().add(partition)).cur == (*self.tails.as_ptr().add(partition)).end {
+            if (*self.states.as_ptr().add(partition)).index == (*self.states.as_ptr().add(partition)).end_index {
                 self.refill(partition);
             }
-            let tail = &mut *self.tails.as_mut_ptr().add(partition);
-            tail.cur.write(record);
-            let index = tail.end_index - tail.end.offset_from(tail.cur) as u32;
-            tail.cur = tail.cur.add(1);
+            let state = &mut *self.states.as_mut_ptr().add(partition);
+            let index = state.index;
+            let slot = index as usize & (N - 1);
+            let buffer = self.buffers.add(partition) as *mut T;
+            buffer.add(slot).write(record);
+            state.index = index + 1;
+            if slot == N - 1 {
+                stream_lines(buffer as *const u8, state.line as *mut u8, Self::LINES);
+                state.line = state.line.add(N);
+            }
             index
         }
     }
 
+    /// A new chunk for `partition`. Its last one is full, so its buffer is empty.
     #[cold]
     #[inline(never)]
     fn refill(&mut self, partition: usize) {
-        if !self.tails[partition].cur.is_null() {
-            self.chunks[partition].push((self.tails[partition].end_index - self.chunk, self.chunk));
+        if !self.states[partition].line.is_null() {
+            self.chunks[partition].push((self.states[partition].end_index - self.chunk, self.chunk));
         }
         if self.slab_left == 0 {
             let (index, slab) = self.pool.grab();
@@ -117,25 +159,33 @@ impl<'p, T: Copy> Scatter<'p, T> {
             self.slab_index = index;
             self.slab_left = SLAB_RECORDS as u32;
         }
-        let tail = &mut self.tails[partition];
-        tail.cur = self.slab;
-        unsafe {
-            tail.end = self.slab.add(self.chunk as usize);
-            self.slab = tail.end;
-        }
+        let state = &mut self.states[partition];
+        state.line = self.slab;
+        state.index = self.slab_index;
+        state.end_index = self.slab_index + self.chunk;
+        self.slab = unsafe { self.slab.add(self.chunk as usize) };
         self.slab_index += self.chunk;
-        tail.end_index = self.slab_index;
         self.slab_left -= self.chunk;
     }
 
+    /// Puts the records still in buffers in their places and returns the chunks.
     pub fn finish(mut self) -> Chunks {
-        for (tail, chunks) in self.tails.iter().zip(&mut self.chunks) {
-            if !tail.cur.is_null() {
-                let free = unsafe { tail.end.offset_from(tail.cur) } as u32;
-                if free < self.chunk {
-                    chunks.push((tail.end_index - self.chunk, self.chunk - free));
-                }
+        for partition in 0..self.states.len() {
+            let state = &self.states[partition];
+            if state.line.is_null() {
+                continue;
             }
+            let buffered = state.index as usize & (N - 1);
+            unsafe { std::ptr::copy_nonoverlapping(self.buffers.add(partition) as *const T, state.line, buffered) };
+            let used = state.index - (state.end_index - self.chunk);
+            if used > 0 {
+                self.chunks[partition].push((state.end_index - self.chunk, used));
+            }
+        }
+        // Non-temporal stores are only ordered with everything else once fenced.
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            std::arch::x86_64::_mm_sfence();
         }
         self.chunks
     }
