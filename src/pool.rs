@@ -16,7 +16,7 @@ const MAX_SLABS: usize = (1 << (32 - SLAB_BITS)) - 1;
 
 /// Whether `Combine::prefetch` asks for the partition's state as well as its
 /// buffer. The states of a stream are 4 KB at 2^10 partitions.
-const STATE_AHEAD: bool = false;
+const STATE_AHEAD: bool = true;
 
 /// Slabs of `T`, shared by all threads.
 pub struct Pool<T> {
