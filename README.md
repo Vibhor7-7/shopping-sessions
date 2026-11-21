@@ -30,7 +30,7 @@ The test scripts need `uv` (they run `uv run --with polars`); set `PY=python3` i
 | Phase | What happens | File |
 | --- | --- | --- |
 | links | `links/` is parsed in parallel into edges and joined with a lock-free union-find. A root always adopts the byte-wise smaller ID, so each tree's root is the person's name. | `src/links.rs` |
-| parse | Files are cut into ranges; each thread reads a range in 256 KB blocks, finds every delimiter (comma or newline) and every quote 64 bytes at a time (AVX2), splits each line into its fields with a handful of vector instructions (which also tell it whether the line has the right number of fields), then validates it. A surviving event is filed under its person; every parsed copy also leaves a small dedup record keyed by `event_id`. | `src/reader.rs`, `src/scan.rs`, `src/parse.rs`, `src/ts.rs`, `src/key.rs` |
+| parse | Files are cut into ranges; each thread reads a range in 256 KB blocks, finds every delimiter (comma or newline) and every quote 64 bytes at a time (AVX2, or AVX-512 on 256-bit registers where the CPU has it: chosen when the process starts), splits each line into its fields with a handful of vector instructions (which also tell it whether the line has the right number of fields), then validates it. A surviving event is filed under its person; every parsed copy also leaves a small dedup record keyed by `event_id`. | `src/reader.rs`, `src/scan.rs`, `src/parse.rs`, `src/ts.rs`, `src/key.rs` |
 | dedup | Per partition, a table of two-bit counters finds the few `event_id`s seen twice; only those copies are sorted, and every copy but the earliest has its event dropped. | `src/dedup.rs` |
 | people | Per partition, events are put in half-hour-bin order by two counting passes (never sorted: events under 30 minutes apart always share a session) and walked once per person: sessions, the crediting click, the assisting campaigns. Each thread writes its own `user_daily` file. | `src/person.rs` |
 | output | `campaign_daily`, and a minimal Parquet writer (PLAIN, uncompressed). | `src/main.rs`, `src/parquet.rs` |
@@ -80,3 +80,4 @@ Environment variables, for experiments; the defaults are what the scorer runs.
 | `NCPU` | Threads (the scorer sets 8) |
 | `SS_PERSON_BITS`, `SS_DEDUP_BITS` | log2 of the partition counts |
 | `SS_JOB_BYTES`, `SS_BLOCK_BYTES` | File range and read block sizes; tiny values are for tests |
+| `SS_SCAN` | `narrow` keeps the delimiter scan on the AVX2 loop on a CPU that would get the AVX-512 one; the log's `scan` says which ran |

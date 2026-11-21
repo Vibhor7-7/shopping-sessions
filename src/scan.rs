@@ -53,16 +53,14 @@ impl Index {
         self.build_with(chosen(), data, len)
     }
 
-    /// `build` by one particular loop. All of them leave the same index; the
-    /// wide ones may only be asked for on a CPU that has their instructions
-    /// (`chosen` and `available` never name one it has not).
+    /// `build` by one particular loop. Both leave the same index; the wide one
+    /// may only be asked for on a CPU that has its instructions (`chosen` and
+    /// `available` never name it on one that has not).
     pub unsafe fn build_with(&mut self, level: Level, data: *const u8, len: usize) {
         debug_assert!(len <= self.capacity());
         match level {
             #[cfg(target_arch = "x86_64")]
-            Level::Wide256 => wide::build_256(self, data, len),
-            #[cfg(target_arch = "x86_64")]
-            Level::Wide512 => wide::build_512(self, data, len),
+            Level::Wide => wide::build(self, data, len),
             _ => self.build_narrow(data, len),
         }
     }
@@ -114,18 +112,15 @@ impl Index {
 pub enum Level {
     /// What the build's own target allows (AVX2 on the scorer's build, NEON on ARM).
     Narrow,
-    /// AVX-512 instructions on 256-bit registers.
-    Wide256,
-    /// AVX-512 instructions on 512-bit registers.
-    Wide512,
+    /// AVX-512 instructions, on 256-bit registers.
+    Wide,
 }
 
 impl Level {
     pub fn name(self) -> &'static str {
         match self {
             Level::Narrow => "narrow",
-            Level::Wide256 => "avx512-256",
-            Level::Wide512 => "avx512-512",
+            Level::Wide => "avx512",
         }
     }
 }
@@ -137,15 +132,14 @@ pub fn available() -> Vec<Level> {
     let mut levels = vec![Level::Narrow];
     #[cfg(target_arch = "x86_64")]
     if wide::supported() {
-        levels.push(Level::Wide256);
-        levels.push(Level::Wide512);
+        levels.push(Level::Wide);
     }
     levels
 }
 
 /// The loop `build` uses: decided once, from the CPU the process finds itself
-/// on. `SS_SCAN=narrow`, `256` or `512` asks for one of them, for experiments;
-/// a wide one this CPU cannot run is not used whatever is asked.
+/// on. The wide one wherever it runs, unless `SS_SCAN=narrow` asks for the
+/// other (for measuring one against the other on one machine).
 #[inline(always)]
 pub fn chosen() -> Level {
     #[cfg(target_arch = "x86_64")]
@@ -262,25 +256,29 @@ unsafe fn masks_plain(p: *const u8) -> (u64, u64) {
 }
 
 /// Stage one with AVX-512, for the CPUs that have it (Ice Lake and later, Zen 4
-/// and later). The build targets x86-64-v3, so these loops are compiled with
-/// their own instruction set and chosen when the process starts.
+/// and later). The build targets x86-64-v3, so this loop is compiled with its
+/// own instruction set and chosen when the process starts.
 ///
 /// Two things are shorter than in the narrow loop. A compare leaves its bitmap
 /// in a mask register directly, with no `movemask`; and `vpcompressb` (VBMI2)
 /// turns a delimiter bitmap into the offsets of its set bits at once, where the
 /// narrow loop takes them out one at a time, eight to a block whether or not
 /// the block has eight.
+///
+/// It works on 256-bit registers. The same loop on 512-bit registers has half
+/// the instructions and was no faster where it was measured (Ice Lake, BENCH.md
+/// experiment 29), and some CPUs lower their clock for 512-bit registers, for
+/// everything that runs after as well.
 #[cfg(target_arch = "x86_64")]
 mod wide {
     use super::{Index, Level};
     use std::arch::x86_64::*;
     use std::sync::atomic::{AtomicU8, Ordering};
 
-    /// 0 until the choice is made, then 1 + the level.
+    /// 0 until the choice is made, then 1 for the narrow loop and 2 for this one.
     static CHOSEN: AtomicU8 = AtomicU8::new(0);
-    const LEVELS: [Level; 3] = [Level::Narrow, Level::Wide256, Level::Wide512];
 
-    /// Whether this CPU, and the kernel under it, run both wide loops.
+    /// Whether this CPU, and the kernel under it, run the wide loop.
     pub fn supported() -> bool {
         is_x86_feature_detected!("avx512f")
             && is_x86_feature_detected!("avx512bw")
@@ -294,26 +292,19 @@ mod wide {
     pub fn chosen() -> Level {
         match CHOSEN.load(Ordering::Relaxed) {
             0 => choose(),
-            level => LEVELS[level as usize - 1],
+            1 => Level::Narrow,
+            _ => Level::Wide,
         }
     }
 
     #[cold]
     #[inline(never)]
     fn choose() -> Level {
-        let asked = std::env::var("SS_SCAN").ok();
-        let level = match (supported(), asked.as_deref().map(str::trim)) {
-            (false, _) | (true, Some("narrow")) => Level::Narrow,
-            (true, Some("512")) => Level::Wide512,
-            (true, Some("256")) => Level::Wide256,
-            (true, _) => DEFAULT,
-        };
-        CHOSEN.store(1 + LEVELS.iter().position(|&l| l == level).unwrap() as u8, Ordering::Relaxed);
+        let narrow_asked = std::env::var("SS_SCAN").is_ok_and(|asked| asked.trim() == "narrow");
+        let level = if supported() && !narrow_asked { Level::Wide } else { Level::Narrow };
+        CHOSEN.store(if level == Level::Wide { 2 } else { 1 }, Ordering::Relaxed);
         level
     }
-
-    /// What a CPU with AVX-512 gets when nothing is asked for.
-    const DEFAULT: Level = Level::Wide256;
 
     /// By low nibble, the delimiter that has it: `\n` is 0x0a and `,` is 0x2c.
     /// `pshufb` with a byte as its own index gives this table's entry for the
@@ -323,68 +314,16 @@ mod wide {
     static DELIMITER_BY_LOW_NIBBLE: [u8; 16] =
         [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, b'\n', 0xff, b',', 0xff, 0xff, 0xff];
 
-    /// 0, 1, 2, ... 63: compressed under a bitmap, the offsets of its set bits.
-    static OFFSETS: [u8; 64] = {
-        let mut offsets = [0u8; 64];
+    /// 0, 1, 2, ... 31: compressed under a bitmap, the offsets of its set bits.
+    static OFFSETS: [u8; 32] = {
+        let mut offsets = [0u8; 32];
         let mut at = 0;
-        while at < 64 {
+        while at < 32 {
             offsets[at] = at as u8;
             at += 1;
         }
         offsets
     };
-
-    /// 64 bytes at a time. A block's first 16 delimiters are written without a
-    /// branch (a block of CSV seldom has more than 8); the slots past the last
-    /// are garbage that the next block overwrites, as in the narrow loop.
-    #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi2,avx2,popcnt")]
-    pub unsafe fn build_512(index: &mut Index, data: *const u8, len: usize) {
-        let table = _mm512_broadcast_i32x4(_mm_loadu_si128(DELIMITER_BY_LOW_NIBBLE.as_ptr() as *const __m128i));
-        let quote = _mm512_set1_epi8(b'"' as i8);
-        let offsets = _mm512_loadu_si512(OFFSETS.as_ptr() as *const __m512i);
-        let quotes_before = index.quotes_before.as_mut_ptr();
-        let quote_bits_out = index.quote_bits.as_mut_ptr();
-        let mut out = index.delims.as_mut_ptr().add(1);
-        let mut quotes = 0u32;
-        // One block; `$keep` clears the bits of bytes that are not data.
-        macro_rules! block {
-            ($block:expr, $keep:expr) => {{
-                let block: usize = $block;
-                let bytes = _mm512_loadu_si512(data.add(block * 64) as *const __m512i);
-                let delims: u64 = _mm512_cmpeq_epi8_mask(_mm512_shuffle_epi8(table, bytes), bytes) & $keep;
-                let quote_bits: u64 = _mm512_cmpeq_epi8_mask(bytes, quote) & $keep;
-                *quotes_before.add(block) = quotes;
-                *quote_bits_out.add(block) = quote_bits;
-                quotes += quote_bits.count_ones();
-                let found = _mm512_maskz_compress_epi8(delims, offsets);
-                let base = _mm512_set1_epi32((block * 64) as u32 as i32);
-                // Sixteen of the offsets found, from bytes in the block to offsets in the buffer.
-                macro_rules! sixteen {
-                    ($part:expr) => {
-                        _mm512_add_epi32(_mm512_cvtepu8_epi32($part), base)
-                    };
-                }
-                _mm512_storeu_si512(out as *mut __m512i, sixteen!(_mm512_castsi512_si128(found)));
-                let count = delims.count_ones() as usize;
-                if count > 16 {
-                    _mm512_storeu_si512(out.add(16) as *mut __m512i, sixteen!(_mm512_extracti32x4_epi32::<1>(found)));
-                    _mm512_storeu_si512(out.add(32) as *mut __m512i, sixteen!(_mm512_extracti32x4_epi32::<2>(found)));
-                    _mm512_storeu_si512(out.add(48) as *mut __m512i, sixteen!(_mm512_extracti32x4_epi32::<3>(found)));
-                }
-                out = out.add(count);
-            }};
-        }
-        let whole = len / 64;
-        for block in 0..whole {
-            block!(block, u64::MAX);
-        }
-        let mut blocks = whole;
-        if len & 63 != 0 {
-            block!(whole, (1u64 << (len & 63)) - 1);
-            blocks += 1;
-        }
-        index.finish(blocks, quotes, out);
-    }
 
     /// `bits`, with the compiler kept from knowing where they came from.
     #[inline(always)]
@@ -393,11 +332,11 @@ mod wide {
         bits
     }
 
-    /// The same on 256-bit registers, 32 bytes at a time: a CPU that lowers its
-    /// clock for 512-bit registers does not for these. A half's first 8
-    /// delimiters are written without a branch.
+    /// 32 bytes at a time. A half-block's first 8 delimiters are written without
+    /// a branch (32 bytes of CSV seldom hold more); the slots past the last are
+    /// garbage that the next half overwrites, as in the narrow loop.
     #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi2,avx2,popcnt")]
-    pub unsafe fn build_256(index: &mut Index, data: *const u8, len: usize) {
+    pub unsafe fn build(index: &mut Index, data: *const u8, len: usize) {
         let table = _mm256_broadcastsi128_si256(_mm_loadu_si128(DELIMITER_BY_LOW_NIBBLE.as_ptr() as *const __m128i));
         let quote = _mm256_set1_epi8(b'"' as i8);
         let offsets = _mm256_loadu_si256(OFFSETS.as_ptr() as *const __m256i);
@@ -405,7 +344,8 @@ mod wide {
         let quote_bits_out = index.quote_bits.as_mut_ptr();
         let mut out = index.delims.as_mut_ptr().add(1);
         let mut quotes = 0u32;
-        // The 32 bytes at offset `$at`: lists their delimiters, gives their quote bitmap.
+        // The 32 bytes at offset `$at`: lists their delimiters, gives their quote
+        // bitmap. `$keep` clears the bits of bytes that are not data.
         macro_rules! half {
             ($at:expr, $keep:expr) => {{
                 let at: usize = $at;
@@ -414,6 +354,7 @@ mod wide {
                 let quote_bits: u32 = _mm256_cmpeq_epi8_mask(bytes, quote) & $keep;
                 let found = _mm256_maskz_compress_epi8(delims, offsets);
                 let base = _mm256_set1_epi32(at as u32 as i32);
+                // Eight of the offsets found, from bytes in the half to offsets in the buffer.
                 macro_rules! eight {
                     ($part:expr) => {
                         _mm256_add_epi32(_mm256_cvtepu8_epi32($part), base)
@@ -439,7 +380,7 @@ mod wide {
                 let low = half!(block * 64, keep as u32);
                 let high = half!(block * 64 + 32, (keep >> 32) as u32);
                 // Left to itself the compiler sees two bitmaps joined and makes them
-                // one 512-bit compare, the one thing this loop exists to avoid.
+                // one 512-bit compare, the one thing this loop is there to avoid.
                 let quote_bits = u64::from(apart(low)) | u64::from(high) << 32;
                 *quotes_before.add(block) = quotes;
                 *quote_bits_out.add(block) = quote_bits;
@@ -450,6 +391,7 @@ mod wide {
         for block in 0..whole {
             block!(block, u64::MAX);
         }
+        // The bytes past `len` in a last, partial block are not data.
         let mut blocks = whole;
         if len & 63 != 0 {
             block!(whole, (1u64 << (len & 63)) - 1);
@@ -536,10 +478,10 @@ mod tests {
         }
     }
 
-    /// Every loop against the definition on what the narrow test does not reach:
-    /// blocks with more delimiters than are written without a branch (up to all
-    /// 64), every byte value, every length around the block sizes, and an index
-    /// with exactly the room it was asked for.
+    /// Every loop against the definition on what the test above does not reach:
+    /// stretches with more delimiters than are written without a branch (up to
+    /// nothing else), every byte value, every length around the block sizes, and
+    /// an index with exactly the room it was asked for.
     #[test]
     fn every_loop_lists_every_delimiter() {
         let mut state = 29;
