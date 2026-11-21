@@ -94,6 +94,13 @@ const RING: usize = 16;
 /// names the person, so the partitions the records go to; those are asked for
 /// then, `RING - LOOK` lines before they are written.
 const LOOK: usize = 12;
+/// Slots in the ring the waiting lines are kept in: twice `RING`, so the slot
+/// a line is put in is never the one about to be settled. A line is stored
+/// first and the old ones are settled and looked up after it, when nothing of
+/// the new line is left in a register: the other way round, everything the
+/// line had worked out was kept on the stack across both and fetched back
+/// (BENCH.md, experiment 38).
+const SLOTS: usize = 2 * RING;
 
 /// A parsed event copy on its way to its partitions.
 #[derive(Clone, Copy, Default)]
@@ -126,9 +133,9 @@ struct Sink<'a> {
     copies: Combine<'a, Copy_, 8>,
     events: Combine<'a, Event, 8>,
     clicks: Combine<'a, Click, 8>,
-    waiting_events: [PendingEvent; RING],
+    waiting_events: [PendingEvent; SLOTS],
     event_count: usize,
-    waiting_clicks: [PendingClick; RING],
+    waiting_clicks: [PendingClick; SLOTS],
     click_count: usize,
     dates: ts::Dates,
 }
@@ -185,17 +192,17 @@ impl Sink<'_> {
         let count = self.event_count;
         for line in count.saturating_sub(RING)..count {
             if line + LOOK >= count {
-                self.look_up_event(line & (RING - 1));
+                self.look_up_event(line & (SLOTS - 1));
             }
-            self.settle_event(self.waiting_events[line & (RING - 1)]);
+            self.settle_event(self.waiting_events[line & (SLOTS - 1)]);
         }
         self.event_count = 0;
         let count = self.click_count;
         for line in count.saturating_sub(RING)..count {
             if line + LOOK >= count {
-                self.look_up_click(line & (RING - 1));
+                self.look_up_click(line & (SLOTS - 1));
             }
-            self.settle_click(self.waiting_clicks[line & (RING - 1)]);
+            self.settle_click(self.waiting_clicks[line & (SLOTS - 1)]);
         }
         self.click_count = 0;
     }
@@ -298,17 +305,19 @@ impl Lines for EventLines<'_, '_> {
         } else {
             (ingest_seconds - context.ingest_epoch).clamp(0, i64::from(u32::MAX) - 1) as u32
         };
-        let slot = sink.event_count & (RING - 1);
-        if sink.event_count >= RING {
-            let ready = sink.waiting_events[slot];
+        // The line first, into a slot nothing is waiting in; then the line `RING`
+        // before it is filed and the one `LOOK` before it looked up.
+        let count = sink.event_count;
+        sink.waiting_events[count & (SLOTS - 1)] =
+            PendingEvent { user, event, ts: at_ms.wrapping_sub(context.epoch) as u32, purchase, ingest, home };
+        sink.event_count = count + 1;
+        if count >= RING {
+            let ready = sink.waiting_events[(count - RING) & (SLOTS - 1)];
             sink.settle_event(ready);
         }
-        if sink.event_count >= LOOK {
-            sink.look_up_event((sink.event_count - LOOK) & (RING - 1));
+        if count >= LOOK {
+            sink.look_up_event((count - LOOK) & (SLOTS - 1));
         }
-        sink.waiting_events[slot] =
-            PendingEvent { user, event, ts: at_ms.wrapping_sub(context.epoch) as u32, purchase, ingest, home };
-        sink.event_count += 1;
         true
     }
 }
@@ -343,17 +352,17 @@ impl Lines for ClickLines<'_, '_> {
         }
         let (click, user) = key::keys_of_two_padded(data.add(id), id_end - id, data.add(user_at), user_end - user_at);
         let home = context.links.prefetch(user);
-        let slot = sink.click_count & (RING - 1);
-        if sink.click_count >= RING {
-            let ready = sink.waiting_clicks[slot];
+        let count = sink.click_count;
+        sink.waiting_clicks[count & (SLOTS - 1)] =
+            PendingClick { user, click, ts: (at_ms - context.epoch) as u32, campaign, home };
+        sink.click_count = count + 1;
+        if count >= RING {
+            let ready = sink.waiting_clicks[(count - RING) & (SLOTS - 1)];
             sink.settle_click(ready);
         }
-        if sink.click_count >= LOOK {
-            sink.look_up_click((sink.click_count - LOOK) & (RING - 1));
+        if count >= LOOK {
+            sink.look_up_click((count - LOOK) & (SLOTS - 1));
         }
-        sink.waiting_clicks[slot] =
-            PendingClick { user, click, ts: (at_ms - context.epoch) as u32, campaign, home };
-        sink.click_count += 1;
         true
     }
 }
@@ -408,9 +417,9 @@ pub fn run(
             copies: Combine::new(&pools.copies, &mut arena, dedup_partitions, chunks.copies),
             events: Combine::new(&pools.events, &mut arena, person_partitions, chunks.events),
             clicks: Combine::new(&pools.clicks, &mut arena, person_partitions, chunks.clicks),
-            waiting_events: [PendingEvent::default(); RING],
+            waiting_events: [PendingEvent::default(); SLOTS],
             event_count: 0,
-            waiting_clicks: [PendingClick::default(); RING],
+            waiting_clicks: [PendingClick::default(); SLOTS],
             click_count: 0,
             dates: ts::Dates::new(),
         };
