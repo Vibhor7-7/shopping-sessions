@@ -170,8 +170,11 @@ fn main() {
     let click_bytes: u64 = clicks.iter().map(|i| i.len).sum();
 
     // The small files on one thread while the others join the linked IDs.
-    let (catalog, links) = std::thread::scope(|scope| {
-        let catalog = scope.spawn(|| catalog::load(&data));
+    let ((catalog, catalog_ms), links) = std::thread::scope(|scope| {
+        let catalog = scope.spawn(|| {
+            let catalog = catalog::load(&data);
+            (catalog, started.elapsed().as_secs_f64() * 1e3)
+        });
         let links = links::build(&link_files, threads);
         (catalog.join().expect("catalog thread"), links)
     });
@@ -256,6 +259,10 @@ fn main() {
         "pipeline: links {:.1} ms, parse {:.1} ms, dedup {:.1} ms, people {:.1} ms, total {:.1} ms (pool slabs: {} records)",
         ms(linked), ms(parsed_at - linked), ms(deduped_at - parsed_at), ms(people_at - deduped_at), ms(started.elapsed()),
         pools.copies.records() + pools.events.records() + pools.clicks.records(),
+    );
+    eprintln!(
+        "pipeline: inside links: catalog done at {catalog_ms:.1} ms; link parse {:.1}, join {:.1}, name {:.1} ms",
+        links.timing[0], links.timing[1], links.timing[2],
     );
     if cfg!(target_os = "linux") && event_bytes < (256 << 20) {
         describe_machine();

@@ -53,14 +53,15 @@ struct IdMap {
 }
 
 impl IdMap {
-    fn new(entries: &[(Vec<u8>, u32)]) -> Self {
+    fn new(entries: impl ExactSizeIterator<Item = (impl AsRef<[u8]>, u32)>) -> Self {
         let mut map = Self { packed: KeyMap::new(entries.len()), other: HashMap::new() };
         for (id, value) in entries {
+            let id = id.as_ref();
             let packed = key::pack(id);
             if packed != 0 {
-                map.packed.insert(packed, *value);
+                map.packed.insert(packed, value);
             } else {
-                map.other.entry(id.clone()).or_insert(*value);
+                map.other.entry(id.to_vec()).or_insert(value);
             }
         }
         map
@@ -116,15 +117,15 @@ impl Catalog {
 }
 
 /// The two fields of each data line of a two-column file, by the CSV dialect.
-fn two_columns(content: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
-    let mut rows = Vec::new();
+fn two_columns(content: &[u8]) -> Vec<(&[u8], &[u8])> {
+    let mut rows = Vec::with_capacity(content.len() / 12);
     let mut lines = content.split(|&b| b == b'\n');
     lines.next(); // header
     for line in lines {
         let mut parts = line.split(|&b| b == b',');
         let (Some(a), Some(b), None) = (parts.next(), parts.next(), parts.next()) else { continue };
         let (Some(a), Some(b)) = (unquoted(a), unquoted(b)) else { continue };
-        rows.push((a.to_vec(), b.to_vec()));
+        rows.push((a, b));
     }
     rows
 }
@@ -166,27 +167,45 @@ pub fn load(data: &Path) -> Catalog {
     let window_start = manifest_time(&manifest, "window_start");
     let window_end = manifest_time(&manifest, "window_end");
 
-    let products = two_columns(&read(&data.join("products.csv")));
-    let mut names: BTreeSet<&[u8]> = products.iter().map(|(_, category)| category.as_slice()).collect();
-    names.insert(b"unknown");
-    let categories: Vec<Vec<u8>> = names.iter().map(|n| n.to_vec()).collect();
-    let rank: HashMap<&[u8], u32> = names.iter().enumerate().map(|(i, n)| (*n, i as u32)).collect();
-    let product_entries: Vec<(Vec<u8>, u32)> =
-        products.iter().map(|(id, category)| (id.clone(), rank[category.as_slice()])).collect();
-    let unknown = rank[b"unknown".as_slice()];
+    let product_file = read(&data.join("products.csv"));
+    let products = two_columns(&product_file);
+    // Few categories, many products: number each name as it first appears, then rank the names.
+    let mut seen: HashMap<&[u8], u32> = HashMap::new();
+    let mut names: Vec<&[u8]> = Vec::new();
+    let mut last: (&[u8], u32) = (b"", u32::MAX);
+    let first_seen: Vec<u32> = products
+        .iter()
+        .map(|&(_, category)| {
+            if last.1 == u32::MAX || last.0 != category {
+                let number = *seen.entry(category).or_insert_with(|| {
+                    names.push(category);
+                    names.len() as u32 - 1
+                });
+                last = (category, number);
+            }
+            last.1
+        })
+        .collect();
+    let mut sorted: BTreeSet<&[u8]> = names.iter().copied().collect();
+    sorted.insert(b"unknown");
+    let categories: Vec<Vec<u8>> = sorted.iter().map(|n| n.to_vec()).collect();
+    let rank_of = |name: &[u8]| sorted.iter().position(|n| *n == name).unwrap() as u32;
+    let rank: Vec<u32> = names.iter().map(|n| rank_of(n)).collect();
+    let unknown = rank_of(b"unknown");
+    let product_map = IdMap::new(products.iter().zip(&first_seen).map(|(&(id, _), &number)| (id, rank[number as usize])));
 
-    let campaigns = two_columns(&read(&data.join("campaigns.csv")));
-    let campaign_entries: Vec<(Vec<u8>, u32)> =
-        campaigns.iter().enumerate().map(|(i, (id, _))| (id.clone(), i as u32)).collect();
+    let campaign_file = read(&data.join("campaigns.csv"));
+    let campaigns = two_columns(&campaign_file);
+    let campaign_map = IdMap::new(campaigns.iter().enumerate().map(|(i, &(id, _))| (id, i as u32)));
 
     Catalog {
         window_start,
         window_end,
-        products: IdMap::new(&product_entries),
+        products: product_map,
         categories,
         unknown,
-        campaigns: IdMap::new(&campaign_entries),
-        campaign_ids: campaigns.iter().map(|(id, _)| id.clone()).collect(),
-        channels: campaigns.iter().map(|(_, channel)| channel.clone()).collect(),
+        campaigns: campaign_map,
+        campaign_ids: campaigns.iter().map(|(id, _)| id.to_vec()).collect(),
+        channels: campaigns.iter().map(|(_, channel)| channel.to_vec()).collect(),
     }
 }

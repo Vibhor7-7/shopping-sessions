@@ -85,6 +85,21 @@ pub fn parallel<R: Send>(count: usize, work: impl Fn(usize) -> R + Sync) -> Vec<
     })
 }
 
+/// Asks the CPU to start fetching the cache line at `at`. Never faults.
+#[inline(always)]
+pub fn prefetch<T>(at: *const T) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        std::arch::x86_64::_mm_prefetch(at as *const i8, std::arch::x86_64::_MM_HINT_T0);
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        std::arch::asm!("prfm pldl1keep, [{at}]", at = in(reg) at, options(nostack, preserves_flags, readonly));
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    let _ = at;
+}
+
 /// One multiply, all 64 bits mixed: the two halves of a 128-bit product folded together.
 #[inline(always)]
 pub fn mix(key: u64) -> u64 {

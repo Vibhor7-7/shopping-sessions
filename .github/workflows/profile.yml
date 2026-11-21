@@ -1,0 +1,34 @@
+name: profile
+# Counts the instructions each source line executes, on the scorer's kind of
+# build (x86-64-v3), with callgrind. It simulates the CPU, so the counts are
+# exact and repeatable where timings on a shared runner are not. Start it by hand:
+#   gh workflow run profile.yml [-f events=1000000]
+on:
+  workflow_dispatch:
+    inputs:
+      events:
+        description: Events in the dataset (callgrind is about 50 times slower than a real run)
+        default: "1000000"
+      lines:
+        description: How many source lines to list
+        default: "110"
+
+jobs:
+  profile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build with line tables
+        run: |
+          sudo apt-get install -y -qq valgrind > /dev/null
+          RUSTFLAGS="-C target-cpu=x86-64-v3 -C debuginfo=1" cargo build --release --bin pipeline --bin synth 2>&1 | tail -1
+          target/release/synth --events ${{ inputs.events }} --clicks $(( ${{ inputs.events }} / 4 )) --seed 9 --output data
+      - name: Profile, one thread
+        run: |
+          NCPU=1 valgrind --tool=callgrind --branch-sim=yes --cache-sim=yes --compress-strings=no --compress-pos=no \
+            --callgrind-out-file=callgrind.out target/release/pipeline data out 2>&1 | grep -E "pipeline:|Collected|refs|rate" || true
+          python3 scripts/hot_lines.py callgrind.out ${{ inputs.lines }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: callgrind
+          path: callgrind.out

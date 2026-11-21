@@ -20,6 +20,8 @@ pub struct Links {
     mask: usize,
     shift: u32,
     pub ids: usize,
+    /// Milliseconds spent parsing, joining and naming, for the log.
+    pub timing: [f64; 3],
 }
 
 impl Links {
@@ -34,18 +36,7 @@ impl Links {
     /// Asks the CPU to fetch the slot `person(id)` will look at.
     #[inline(always)]
     pub fn prefetch(&self, id: Key) {
-        #[cfg(target_arch = "x86_64")]
-        unsafe {
-            use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
-            _mm_prefetch(self.table.0.add(self.home(id)) as *const i8, _MM_HINT_T0);
-        }
-        #[cfg(target_arch = "aarch64")]
-        unsafe {
-            let slot = self.table.0.add(self.home(id));
-            std::arch::asm!("prfm pldl1keep, [{slot}]", slot = in(reg) slot, options(nostack, preserves_flags, readonly));
-        }
-        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-        let _ = id;
+        sys::prefetch(unsafe { self.table.0.add(self.home(id)) });
     }
 
     /// The name of the person `id` belongs to.
@@ -156,6 +147,8 @@ impl Forest<'_> {
 }
 
 pub fn build(inputs: &[Input], threads: usize) -> Links {
+    let started = std::time::Instant::now();
+    let since = |from: std::time::Instant| from.elapsed().as_secs_f64() * 1e3;
     // Parse.
     let total: u64 = inputs.iter().map(|i| i.len).sum();
     let target = reader::job_bytes().unwrap_or((total / (threads as u64 * 4)).clamp(1 << 16, 1 << 22));
@@ -178,11 +171,16 @@ pub fn build(inputs: &[Input], threads: usize) -> Links {
     let capacity = (edges * 2 * 4 / 3).max(16).next_power_of_two();
     let table = sys::map::<[u64; 2]>(capacity);
     let (mask, shift) = (capacity - 1, 64 - capacity.trailing_zeros());
+    let parsed = since(started);
     if edges == 0 {
-        return Links { table: sys::Shared(table), mask, shift, ids: 0 };
+        return Links { table: sys::Shared(table), mask, shift, ids: 0, timing: [parsed, 0.0, 0.0] };
     }
     let shared = sys::Shared(table);
     let join_threads = if edges < 20_000 { 1 } else { threads };
+    /// The table is far larger than the cache and every step lands somewhere new,
+    /// so each loop asks for the lines it will need this many steps ahead.
+    const AHEAD: usize = 8;
+    let joining = std::time::Instant::now();
 
     // Join. The table is all zeros: every slot empty, every node a root.
     sys::parallel(join_threads, |me| {
@@ -192,12 +190,18 @@ pub fn build(inputs: &[Input], threads: usize) -> Links {
             shift,
         };
         for list in edge_lists.iter().skip(me).step_by(join_threads) {
-            for &(a, b) in list {
+            for (at, &(a, b)) in list.iter().enumerate() {
+                if let Some(&(next_a, next_b)) = list.get(at + AHEAD) {
+                    sys::prefetch(&forest.slots[home(next_a, shift)]);
+                    sys::prefetch(&forest.slots[home(next_b, shift)]);
+                }
                 let (a, b) = (forest.slot(a), forest.slot(b));
                 forest.join(a, b);
             }
         }
     });
+    let joined = since(joining);
+    let naming = std::time::Instant::now();
 
     // Point every ID straight at its root...
     let ranges = |me: usize| (capacity * me / join_threads, capacity * (me + 1) / join_threads);
@@ -209,6 +213,12 @@ pub fn build(inputs: &[Input], threads: usize) -> Links {
         };
         let (from, to) = ranges(me);
         for at in from..to {
+            if at + AHEAD < to {
+                let parent = forest.slots[at + AHEAD][1].load(Ordering::Relaxed);
+                if parent != 0 {
+                    sys::prefetch(&forest.slots[(parent - 1) as usize]);
+                }
+            }
             if forest.slots[at][0].load(Ordering::Relaxed) != 0 {
                 let root = forest.find(at);
                 if root != at {
@@ -225,6 +235,12 @@ pub fn build(inputs: &[Input], threads: usize) -> Links {
         let (from, to) = ranges(me);
         let mut ids = 0usize;
         for at in from..to {
+            if at + AHEAD < to {
+                let parent = slots[at + AHEAD][1].load(Ordering::Relaxed);
+                if parent != 0 {
+                    sys::prefetch(&slots[(parent - 1) as usize]);
+                }
+            }
             let id = slots[at][0].load(Ordering::Relaxed);
             if id != 0 {
                 ids += 1;
@@ -235,5 +251,5 @@ pub fn build(inputs: &[Input], threads: usize) -> Links {
         }
         ids
     });
-    Links { table: shared, mask, shift, ids: counts.iter().sum() }
+    Links { table: shared, mask, shift, ids: counts.iter().sum(), timing: [parsed, joined, since(naming)] }
 }
