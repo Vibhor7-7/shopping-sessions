@@ -1,10 +1,16 @@
 //! Sessions, credit and assists, one partition of people at a time.
 //!
-//! A partition's event and click records are grouped by person with a small
-//! hash table and a counting sort, so each person's events end up contiguous.
-//! Each person is then one pass over their events in time order with two
-//! cursors into their clicks: the clicks at or before the session start, and
-//! those more than 7 days before it.
+//! A partition's events are never sorted. Two events less than 30 minutes apart
+//! are in one session whatever lies between them, so events are dropped into
+//! half-hour bins and only the bins are walked in order: a session ends where
+//! the first event of one occupied bin is more than 30 minutes after the last
+//! event of the one before. Getting each person's events into bin order is two
+//! counting passes over the partition (by bin, then by person, the second one
+//! stable), with no comparison whose outcome the CPU has to guess.
+//!
+//! Each person is then one pass over their events with two cursors into their
+//! clicks: the clicks at or before the session start, and those more than 7
+//! days before it.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -52,6 +58,8 @@ pub struct Setup<'a> {
     /// Epoch day of the window's first day.
     pub first_day: i64,
     pub days: usize,
+    /// Half-hour bins from the timestamp epoch to the end of the window.
+    pub bins: usize,
     pub wide: Option<&'a WidePurchases>,
 }
 
@@ -70,7 +78,12 @@ struct Group {
     click_start: Vec<u32>,
     event_person: Vec<u32>,
     click_person: Vec<u32>,
-    /// `ts << 32 | purchase`, each person's together.
+    /// Where each bin's events go in the staging arrays.
+    bin_cursor: Vec<u32>,
+    /// The partition's events in bin order: `ts << 32 | purchase`, and whose each is.
+    staged: Vec<u64>,
+    staged_person: Vec<u32>,
+    /// `ts << 32 | purchase`, each person's together, in bin order.
     events: Vec<u64>,
     /// `[ts << 32 | campaign, click_id]`, each person's together.
     clicks: Vec<[u64; 2]>,
@@ -172,25 +185,50 @@ impl Group {
         self.reset(event_count / 12);
         self.event_person.clear();
         self.event_person.reserve(event_count);
+        self.bin_cursor.clear();
+        self.bin_cursor.resize(setup.bins + 1, 0);
+        // Pass 1: number the people, count events per person and per bin.
+        let mut seen = 0;
         for chunks in events {
             for &(start, len) in &chunks[partition] {
                 let records: &[Event] = unsafe { std::slice::from_raw_parts(setup.pools.events.at(start), len as usize) };
                 for record in records {
-                    if record.ts == DROPPED {
-                        self.event_person.push(ABSENT);
+                    let number = if record.ts == DROPPED {
+                        ABSENT
                     } else {
                         let number = self.find_or_add(record.person);
-                        unsafe { *self.event_cursor.get_unchecked_mut(number as usize) += 1 };
-                        self.event_person.push(number);
-                    }
+                        unsafe {
+                            *self.event_cursor.get_unchecked_mut(number as usize) += 1;
+                            *self.bin_cursor.get_unchecked_mut((record.ts / SESSION_GAP_MS) as usize) += 1;
+                        }
+                        number
+                    };
+                    unsafe { *self.event_person.as_mut_ptr().add(seen) = number };
+                    seen += 1;
                 }
             }
         }
+        unsafe { self.event_person.set_len(seen) };
         let live = Self::offsets(&mut self.event_cursor, &mut self.event_start);
-        // Every slot is written below, exactly once: no need to zero them first.
+        let mut total = 0u32;
+        for count in self.bin_cursor.iter_mut() {
+            let n = *count;
+            *count = total;
+            total += n;
+        }
+        // Every slot of these three is written below, exactly once: no need to zero them first.
+        self.staged.clear();
+        self.staged.reserve(live);
+        self.staged_person.clear();
+        self.staged_person.reserve(live);
         self.events.clear();
         self.events.reserve(live);
-        unsafe { self.events.set_len(live) };
+        unsafe {
+            self.staged.set_len(live);
+            self.staged_person.set_len(live);
+            self.events.set_len(live);
+        }
+        // Pass 2: into bin order.
         let mut at = 0;
         for chunks in events {
             for &(start, len) in &chunks[partition] {
@@ -200,12 +238,21 @@ impl Group {
                     at += 1;
                     if number != ABSENT {
                         unsafe {
-                            let cursor = self.event_cursor.get_unchecked_mut(number as usize);
-                            *self.events.get_unchecked_mut(*cursor as usize) = (u64::from(record.ts) << 32) | u64::from(record.purchase);
+                            let cursor = self.bin_cursor.get_unchecked_mut((record.ts / SESSION_GAP_MS) as usize);
+                            *self.staged.get_unchecked_mut(*cursor as usize) = (u64::from(record.ts) << 32) | u64::from(record.purchase);
+                            *self.staged_person.get_unchecked_mut(*cursor as usize) = number;
                             *cursor += 1;
                         }
                     }
                 }
+            }
+        }
+        // Pass 3: to each person, keeping the bin order.
+        for at in 0..live {
+            unsafe {
+                let cursor = self.event_cursor.get_unchecked_mut(*self.staged_person.get_unchecked(at) as usize);
+                *self.events.get_unchecked_mut(*cursor as usize) = *self.staged.get_unchecked(at);
+                *cursor += 1;
             }
         }
 
@@ -263,9 +310,18 @@ struct Tally {
     window_count: Vec<u32>,
     window_place: Vec<u32>,
     window: Vec<u32>,
+    /// Purchases of the bin being read, until the day they count on is known.
+    bin_purchases: Vec<u32>,
     rows: UserRows,
     cells: Cells,
     sessions: u64,
+}
+
+/// The clicks within reach of the session being closed: `clicks[oldest..upto]`.
+struct Reach {
+    oldest: usize,
+    upto: usize,
+    sliding: bool,
 }
 
 impl Tally {
@@ -322,97 +378,126 @@ impl Tally {
         self.rows.top.push(top);
     }
 
-    fn person(&mut self, name: Key, events: &mut [u64], clicks: &mut [[u64; 2]]) {
-        events.sort_unstable();
+    /// Credits a finished session to a campaign and counts the campaigns that assisted it.
+    #[inline(always)]
+    fn credit(&mut self, clicks: &[[u64; 2]], reach: &mut Reach, start: u32, day: u32, revenue: i64, purchased: bool) {
+        self.sessions += 1;
+        while reach.upto < clicks.len() && (clicks[reach.upto][0] >> 32) as u32 <= start {
+            if reach.sliding {
+                self.window_add(clicks[reach.upto][0] as u32);
+            }
+            reach.upto += 1;
+        }
+        let earliest = start.saturating_sub(REACH);
+        while reach.oldest < reach.upto && ((clicks[reach.oldest][0] >> 32) as u32) < earliest {
+            if reach.sliding {
+                self.window_remove(clicks[reach.oldest][0] as u32);
+            }
+            reach.oldest += 1;
+        }
+        let row = day as usize * self.width;
+        let credited = if reach.upto > reach.oldest { clicks[reach.upto - 1][0] as u32 as usize } else { self.organic };
+        let cell = &mut self.cells.credited[row + credited];
+        cell[0] += 1;
+        cell[1] += u64::from(purchased);
+        cell[2] += revenue as u64;
+        if reach.sliding {
+            for &campaign in &self.window {
+                self.cells.assisted[row + campaign as usize] += 1;
+            }
+        } else {
+            for a in reach.oldest..reach.upto {
+                let campaign = clicks[a][0] as u32;
+                if !clicks[reach.oldest..a].iter().any(|c| c[0] as u32 == campaign) {
+                    self.cells.assisted[row + campaign as usize] += 1;
+                }
+            }
+        }
+    }
+
+    /// One person: `events` in bin order (any order within a bin), `clicks` in any order.
+    fn person(&mut self, name: Key, events: &[u64], clicks: &mut [[u64; 2]]) {
         if clicks.len() > 1 {
             // By time; at one instant the smallest click_id last, so the credited click is always the last one at or before the start.
             clicks.sort_unstable_by(|a, b| (a[0] >> 32).cmp(&(b[0] >> 32)).then_with(|| key::compare(b[1], a[1])));
         }
-        let sliding = clicks.len() > SLIDING_MIN;
-        let (count, click_count) = (events.len(), clicks.len());
-        // Clicks [oldest, upto) are the ones within reach of the current session.
-        let (mut oldest, mut upto) = (0usize, 0usize);
+        let mut reach = Reach { oldest: 0, upto: 0, sliding: clicks.len() > SLIDING_MIN };
+        let count = events.len();
         let mut day = u32::MAX;
         let (mut day_sessions, mut day_events, mut day_revenue) = (0u32, 0u32, 0i64);
+        // The session being built: it is closed when a later bin starts too long after `last`.
+        let (mut start, mut last, mut size, mut revenue, mut purchased) = (0u32, 0u32, 0u32, 0i64, false);
+        let mut open = false;
         let mut at = 0;
         while at < count {
-            let start = (events[at] >> 32) as u32;
-            let this_day = ((i64::from(start) + self.day_offset) / DAY_MS) as u32;
-            if this_day != day {
-                if day != u32::MAX {
-                    self.row(name, day, day_sessions, day_events, day_revenue);
-                }
-                day = this_day;
-                day_sessions = 0;
-                day_events = 0;
-                day_revenue = 0;
-            }
-            let mut last = start;
-            let mut end = at;
-            let mut revenue = 0i64;
-            let mut purchased = false;
+            // One bin: its first and last instants, and its purchases.
+            let first = at;
+            let mut time = (events[at] >> 32) as u32;
+            let bin = time / SESSION_GAP_MS;
+            let (mut low, mut high) = (time, time);
             loop {
-                let packed = events[end] as u32;
+                let packed = events[at] as u32;
                 if packed != 0 {
-                    let (price, category) = self.purchase(packed);
-                    revenue += i64::from(price);
-                    purchased = true;
-                    let sum = &mut self.category_sum[category as usize];
-                    if *sum == 0 {
-                        self.category_touched.push(category);
-                    }
-                    *sum += i64::from(price);
+                    self.bin_purchases.push(packed);
                 }
-                end += 1;
-                if end == count {
+                at += 1;
+                if at == count {
                     break;
                 }
-                let next = (events[end] >> 32) as u32;
-                if next - last > SESSION_GAP_MS {
+                time = (events[at] >> 32) as u32;
+                if time / SESSION_GAP_MS != bin {
                     break;
                 }
-                last = next;
+                low = low.min(time);
+                high = high.max(time);
             }
-            day_sessions += 1;
-            day_events += (end - at) as u32;
-            day_revenue += revenue;
-            self.sessions += 1;
-
-            while upto < click_count && (clicks[upto][0] >> 32) as u32 <= start {
-                if sliding {
-                    self.window_add(clicks[upto][0] as u32);
-                }
-                upto += 1;
+            // Everything in a bin is within 30 minutes, so the only gap that can
+            // end a session is the one from the last bin to this one.
+            if open && low - last > SESSION_GAP_MS {
+                day_sessions += 1;
+                day_events += size;
+                day_revenue += revenue;
+                self.credit(clicks, &mut reach, start, day, revenue, purchased);
+                open = false;
             }
-            let reach = start.saturating_sub(REACH);
-            while oldest < upto && ((clicks[oldest][0] >> 32) as u32) < reach {
-                if sliding {
-                    self.window_remove(clicks[oldest][0] as u32);
-                }
-                oldest += 1;
-            }
-            let row = this_day as usize * self.width;
-            let credited = if upto > oldest { clicks[upto - 1][0] as u32 as usize } else { self.organic };
-            let cell = &mut self.cells.credited[row + credited];
-            cell[0] += 1;
-            cell[1] += u64::from(purchased);
-            cell[2] += revenue as u64;
-            if sliding {
-                for &campaign in &self.window {
-                    self.cells.assisted[row + campaign as usize] += 1;
-                }
-            } else {
-                for a in oldest..upto {
-                    let campaign = clicks[a][0] as u32;
-                    if !clicks[oldest..a].iter().any(|c| c[0] as u32 == campaign) {
-                        self.cells.assisted[row + campaign as usize] += 1;
+            if !open {
+                open = true;
+                start = low;
+                size = 0;
+                revenue = 0;
+                purchased = false;
+                let this_day = ((i64::from(start) + self.day_offset) / DAY_MS) as u32;
+                if this_day != day {
+                    if day != u32::MAX {
+                        self.row(name, day, day_sessions, day_events, day_revenue);
                     }
+                    day = this_day;
+                    day_sessions = 0;
+                    day_events = 0;
+                    day_revenue = 0;
                 }
             }
-            at = end;
+            last = high;
+            size += (at - first) as u32;
+            // The bin's purchases count on the day its session started.
+            for i in 0..self.bin_purchases.len() {
+                let (price, category) = self.purchase(self.bin_purchases[i]);
+                revenue += i64::from(price);
+                purchased = true;
+                let sum = &mut self.category_sum[category as usize];
+                if *sum == 0 {
+                    self.category_touched.push(category);
+                }
+                *sum += i64::from(price);
+            }
+            self.bin_purchases.clear();
         }
+        day_sessions += 1;
+        day_events += size;
+        day_revenue += revenue;
+        self.credit(clicks, &mut reach, start, day, revenue, purchased);
         self.row(name, day, day_sessions, day_events, day_revenue);
-        if sliding {
+        if reach.sliding {
             for &campaign in &self.window {
                 self.window_count[campaign as usize] = 0;
             }
@@ -447,6 +532,7 @@ pub fn run<R: Send>(
             window_count: vec![0; campaigns],
             window_place: vec![0; campaigns],
             window: Vec::new(),
+            bin_purchases: Vec::new(),
             rows: UserRows::default(),
             cells: Cells { credited: vec![[0; 3]; width * setup.days], assisted: vec![0; width * setup.days] },
             sessions: 0,
@@ -463,7 +549,7 @@ pub fn run<R: Send>(
             for number in 0..group.people.len() {
                 let (e0, e1) = (group.event_start[number] as usize, group.event_start[number + 1] as usize);
                 let (c0, c1) = (group.click_start[number] as usize, group.click_start[number + 1] as usize);
-                tally.person(group.people[number], &mut group.events[e0..e1], &mut group.clicks[c0..c1]);
+                tally.person(group.people[number], &group.events[e0..e1], &mut group.clicks[c0..c1]);
             }
         }
         let sessions = tally.sessions;

@@ -230,6 +230,7 @@ fn main() {
         epoch,
         first_day,
         days,
+        bins: ((catalog.window_end - epoch) / 1_800_000) as usize + 1,
         wide: wide.as_ref(),
     };
     let (cells, user_rows, sessions) =
