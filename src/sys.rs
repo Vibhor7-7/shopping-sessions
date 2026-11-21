@@ -22,7 +22,8 @@ const MAP_NORESERVE: i32 = 0;
 #[cfg(target_os = "linux")]
 const MADV_HUGEPAGE: i32 = 14;
 
-const HUGE: usize = 2 << 20;
+/// A huge page: what a mapping must be aligned to, and at least as large as, to be given one.
+pub const HUGE: usize = 2 << 20;
 
 extern "C" {
     #[cfg(target_os = "linux")]

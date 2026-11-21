@@ -8,9 +8,12 @@
 //! counting passes over the partition (by bin, then by person, the second one
 //! stable), with no comparison whose outcome the CPU has to guess.
 //!
-//! Each person is then one pass over their events with two cursors into their
-//! clicks: the clicks at or before the session start, and those more than 7
-//! days before it.
+//! Each person is then one pass over their events, their clicks sorted first. Most people have a handful
+//! of clicks, and for them every session asks the same two questions of all of
+//! them at once (how many are at or before the start, how many are more than 7
+//! days before it), with no loop whose length depends on the answer: how many
+//! clicks lie between two sessions is exactly what a CPU cannot guess. People
+//! with many clicks keep two cursors and a running set of campaigns instead.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -25,12 +28,16 @@ const SESSION_GAP_MS: u32 = 1_800_000;
 const REACH: u32 = CLICK_REACH_MS as u32;
 /// People with more clicks than this keep a running set of the campaigns in the 7-day window.
 const SLIDING_MIN: usize = 16;
+/// Every other person's clicks fit in a `Few`.
+const FEW: usize = SLIDING_MIN;
 const ABSENT: u32 = u32::MAX;
 
-/// One thread's user_daily rows, as columns.
+/// One thread's user_daily rows, as columns: each as its page of the Parquet
+/// file will hold it, so that writing the file copies none of them.
 #[derive(Default)]
 pub struct UserRows {
-    pub person: Vec<Key>,
+    /// user_id, each row's as a length in four bytes and then the characters (`key::push_plain`).
+    pub ids: Vec<u8>,
     pub day: Vec<i32>,
     pub sessions: Vec<u32>,
     pub events: Vec<u32>,
@@ -42,7 +49,8 @@ pub struct UserRows {
 impl UserRows {
     fn with_capacity(rows: usize) -> Self {
         Self {
-            person: Vec::with_capacity(rows),
+            // The generator's IDs are 9 or 10 characters; longer ones make the buffer grow.
+            ids: Vec::with_capacity(rows * 14 + 64),
             day: Vec::with_capacity(rows),
             sessions: Vec::with_capacity(rows),
             events: Vec::with_capacity(rows),
@@ -53,10 +61,26 @@ impl UserRows {
 }
 
 /// campaign_daily, indexed by `day * (campaigns + 1) + campaign`; `organic` is the last campaign.
+/// Both arrays are one slot longer than the table: the last is scratch (`Tally::spare`), never read.
+///
+/// The campaign a session is credited to assists it too (rules.md, clicks, step 7),
+/// so its `assisted_sessions` is written a moment before its `sessions`: the two
+/// lie side by side, and crediting a session fetches nothing of its own. What
+/// only a session with a purchase adds to is kept apart, out of their way.
 pub struct Cells {
-    /// sessions, purchasing_sessions, revenue_cents
-    pub credited: Vec<[u64; 3]>,
-    pub assisted: Vec<u32>,
+    /// `[assisted_sessions, sessions]`
+    pub counts: Vec<[u32; 2]>,
+    /// `[purchasing_sessions, revenue_cents]`
+    pub bought: Vec<[u64; 2]>,
+}
+
+impl Cells {
+    pub const ASSISTED: usize = 0;
+    pub const SESSIONS: usize = 1;
+
+    fn new(cells: usize) -> Self {
+        Self { counts: vec![[0; 2]; cells + 1], bought: vec![[0; 2]; cells + 1] }
+    }
 }
 
 pub struct Setup<'a> {
@@ -102,6 +126,28 @@ struct Group {
     clicks: Vec<[u64; 2]>,
 }
 
+/// The table that numbers a partition's people, as a loop over records holds
+/// it: in registers. Read through `&self` instead, every probe fetched the two
+/// arrays' addresses, the mask and the shifts from memory again, because a
+/// store through a raw pointer may, for all the compiler knows, have changed
+/// them (BENCH.md, experiment 41).
+#[derive(Clone, Copy)]
+struct Probe {
+    keys: *const Key,
+    values: *const u32,
+    mask: usize,
+    shift: u32,
+    bits: u32,
+}
+
+impl Probe {
+    /// Where the search for `person` starts.
+    #[inline(always)]
+    fn home(&self, person: Key) -> usize {
+        ((sys::mix(person) << self.bits) >> self.shift) as usize
+    }
+}
+
 impl Group {
     fn reset(&mut self, expected_people: usize) {
         let capacity = (expected_people * 2).max(64).next_power_of_two();
@@ -119,35 +165,15 @@ impl Group {
         ((sys::mix(person) << self.bits) >> self.shift) as usize
     }
 
-    /// The person's number in this partition, or ABSENT.
-    #[inline(always)]
-    fn find(&self, person: Key) -> u32 {
-        let mut at = self.home(person);
-        loop {
-            let seen = unsafe { *self.keys.get_unchecked(at) };
-            if seen == person {
-                return unsafe { *self.values.get_unchecked(at) };
-            }
-            if seen == 0 {
-                return ABSENT;
-            }
-            at = (at + 1) & self.mask;
-        }
+    /// Where the table is, to be held in registers by a loop over records.
+    fn probe(&self) -> Probe {
+        Probe { keys: self.keys.as_ptr(), values: self.values.as_ptr(), mask: self.mask, shift: self.shift, bits: self.bits }
     }
 
-    #[inline(always)]
-    fn find_or_add(&mut self, person: Key) -> u32 {
-        let mut at = self.home(person);
-        loop {
-            let seen = unsafe { *self.keys.get_unchecked(at) };
-            if seen == person {
-                return unsafe { *self.values.get_unchecked(at) };
-            }
-            if seen == 0 {
-                break;
-            }
-            at = (at + 1) & self.mask;
-        }
+    /// A person not seen before, into the free slot their search ended at.
+    /// Returns their number. The table may have moved: `probe` again.
+    #[inline(never)]
+    fn add(&mut self, at: usize, person: Key) -> u32 {
         let number = self.people.len() as u32;
         self.keys[at] = person;
         self.values[at] = number;
@@ -193,6 +219,11 @@ impl Group {
         total as usize
     }
 
+    /// Every loop below keeps the addresses it reads and writes through in
+    /// registers (raw pointers taken once), and reads a cursor once for each
+    /// record it places: indexed through `self`, each array's address was
+    /// fetched again for every record, about 18 loads an event over the three
+    /// passes, and a cursor was read three times (BENCH.md, experiment 41).
     fn load(&mut self, setup: &Setup, events: &[&Chunks], clicks: &[&Chunks], partition: usize) {
         let event_count: usize = events.iter().map(|c| c[partition].iter().map(|x| x.1 as usize).sum::<usize>()).sum();
         self.reset(event_count / 12);
@@ -202,22 +233,43 @@ impl Group {
         self.bin_cursor.resize(setup.bins + 1, 0);
         // Pass 1: number the people, count events per person and per bin.
         let mut seen = 0;
-        for chunks in events {
-            for &(start, len) in &chunks[partition] {
-                let records: &[Event] = unsafe { std::slice::from_raw_parts(setup.pools.events.at(start), len as usize) };
-                for record in records {
-                    let number = if record.ts == DROPPED {
-                        ABSENT
-                    } else {
-                        let number = self.find_or_add(record.person);
-                        unsafe {
-                            *self.event_cursor.get_unchecked_mut(number as usize) += 1;
-                            *self.bin_cursor.get_unchecked_mut((record.ts / SESSION_GAP_MS) as usize) += 1;
-                        }
-                        number
-                    };
-                    unsafe { *self.event_person.as_mut_ptr().add(seen) = number };
-                    seen += 1;
+        {
+            let event_person = self.event_person.as_mut_ptr();
+            let bin_cursor = self.bin_cursor.as_mut_ptr();
+            let mut probe = self.probe();
+            let mut event_cursor = self.event_cursor.as_mut_ptr();
+            for chunks in events {
+                for &(start, len) in &chunks[partition] {
+                    let records: &[Event] = unsafe { std::slice::from_raw_parts(setup.pools.events.at(start), len as usize) };
+                    for record in records {
+                        let number = if record.ts == DROPPED {
+                            ABSENT
+                        } else {
+                            unsafe {
+                                let person = record.person;
+                                let mut at = probe.home(person);
+                                let number = loop {
+                                    let held = *probe.keys.add(at);
+                                    if held == person {
+                                        break *probe.values.add(at);
+                                    }
+                                    if held == 0 {
+                                        // A new person. Their counter is pushed, and the table may grow: both can move.
+                                        let number = self.add(at, person);
+                                        probe = self.probe();
+                                        event_cursor = self.event_cursor.as_mut_ptr();
+                                        break number;
+                                    }
+                                    at = (at + 1) & probe.mask;
+                                };
+                                *event_cursor.add(number as usize) += 1;
+                                *bin_cursor.add((record.ts / SESSION_GAP_MS) as usize) += 1;
+                                number
+                            }
+                        };
+                        unsafe { *event_person.add(seen) = number };
+                        seen += 1;
+                    }
                 }
             }
         }
@@ -242,72 +294,133 @@ impl Group {
             self.events.set_len(live);
         }
         // Pass 2: into bin order.
-        let mut at = 0;
-        for chunks in events {
-            for &(start, len) in &chunks[partition] {
-                let records: &[Event] = unsafe { std::slice::from_raw_parts(setup.pools.events.at(start), len as usize) };
-                for record in records {
-                    let number = unsafe { *self.event_person.get_unchecked(at) };
-                    at += 1;
-                    if number != ABSENT {
-                        unsafe {
-                            let cursor = self.bin_cursor.get_unchecked_mut((record.ts / SESSION_GAP_MS) as usize);
-                            *self.staged.get_unchecked_mut(*cursor as usize) = (u64::from(record.ts) << 32) | u64::from(record.purchase);
-                            *self.staged_person.get_unchecked_mut(*cursor as usize) = number;
-                            *cursor += 1;
+        {
+            let event_person = self.event_person.as_ptr();
+            let bin_cursor = self.bin_cursor.as_mut_ptr();
+            let staged = self.staged.as_mut_ptr();
+            let staged_person = self.staged_person.as_mut_ptr();
+            let mut at = 0;
+            for chunks in events {
+                for &(start, len) in &chunks[partition] {
+                    let records: &[Event] = unsafe { std::slice::from_raw_parts(setup.pools.events.at(start), len as usize) };
+                    for record in records {
+                        let number = unsafe { *event_person.add(at) };
+                        at += 1;
+                        if number != ABSENT {
+                            unsafe {
+                                let cursor = bin_cursor.add((record.ts / SESSION_GAP_MS) as usize);
+                                let place = *cursor;
+                                *staged.add(place as usize) = (u64::from(record.ts) << 32) | u64::from(record.purchase);
+                                *staged_person.add(place as usize) = number;
+                                *cursor = place + 1;
+                            }
                         }
                     }
                 }
             }
         }
         // Pass 3: to each person, keeping the bin order.
-        for at in 0..live {
-            unsafe {
-                let cursor = self.event_cursor.get_unchecked_mut(*self.staged_person.get_unchecked(at) as usize);
-                *self.events.get_unchecked_mut(*cursor as usize) = *self.staged.get_unchecked(at);
-                *cursor += 1;
+        {
+            let staged = self.staged.as_ptr();
+            let staged_person = self.staged_person.as_ptr();
+            let event_cursor = self.event_cursor.as_mut_ptr();
+            let sorted = self.events.as_mut_ptr();
+            for at in 0..live {
+                unsafe {
+                    let cursor = event_cursor.add(*staged_person.add(at) as usize);
+                    let place = *cursor;
+                    *sorted.add(place as usize) = *staged.add(at);
+                    *cursor = place + 1;
+                }
             }
         }
 
         // Clicks of people with no surviving event credit nothing: they are left out.
+        let click_count: usize = clicks.iter().map(|c| c[partition].iter().map(|x| x.1 as usize).sum::<usize>()).sum();
         self.click_cursor.clear();
         self.click_cursor.resize(self.people.len(), 0);
         self.click_person.clear();
-        for chunks in clicks {
-            for &(start, len) in &chunks[partition] {
-                let records: &[Click] = unsafe { std::slice::from_raw_parts(setup.pools.clicks.at(start), len as usize) };
-                for record in records {
-                    let number = self.find(record.person);
-                    if number != ABSENT {
-                        unsafe { *self.click_cursor.get_unchecked_mut(number as usize) += 1 };
+        self.click_person.reserve(click_count);
+        let mut seen = 0;
+        {
+            let probe = self.probe();
+            let click_cursor = self.click_cursor.as_mut_ptr();
+            let click_person = self.click_person.as_mut_ptr();
+            for chunks in clicks {
+                for &(start, len) in &chunks[partition] {
+                    let records: &[Click] = unsafe { std::slice::from_raw_parts(setup.pools.clicks.at(start), len as usize) };
+                    for record in records {
+                        unsafe {
+                            let person = record.person;
+                            let mut at = probe.home(person);
+                            let number = loop {
+                                let held = *probe.keys.add(at);
+                                if held == person {
+                                    let number = *probe.values.add(at);
+                                    *click_cursor.add(number as usize) += 1;
+                                    break number;
+                                }
+                                if held == 0 {
+                                    break ABSENT;
+                                }
+                                at = (at + 1) & probe.mask;
+                            };
+                            *click_person.add(seen) = number;
+                        }
+                        seen += 1;
                     }
-                    self.click_person.push(number);
                 }
             }
         }
+        unsafe { self.click_person.set_len(seen) };
         let kept = Self::offsets(&mut self.click_cursor, &mut self.click_start);
         self.clicks.clear();
         self.clicks.reserve(kept);
         unsafe { self.clicks.set_len(kept) };
-        let mut at = 0;
-        for chunks in clicks {
-            for &(start, len) in &chunks[partition] {
-                let records: &[Click] = unsafe { std::slice::from_raw_parts(setup.pools.clicks.at(start), len as usize) };
-                for record in records {
-                    let number = unsafe { *self.click_person.get_unchecked(at) };
-                    at += 1;
-                    if number != ABSENT {
-                        unsafe {
-                            let cursor = self.click_cursor.get_unchecked_mut(number as usize);
-                            *self.clicks.get_unchecked_mut(*cursor as usize) =
-                                [(u64::from(record.ts) << 32) | u64::from(record.campaign), record.click];
-                            *cursor += 1;
+        {
+            let click_person = self.click_person.as_ptr();
+            let click_cursor = self.click_cursor.as_mut_ptr();
+            let sorted = self.clicks.as_mut_ptr();
+            let mut at = 0;
+            for chunks in clicks {
+                for &(start, len) in &chunks[partition] {
+                    let records: &[Click] = unsafe { std::slice::from_raw_parts(setup.pools.clicks.at(start), len as usize) };
+                    for record in records {
+                        let number = unsafe { *click_person.add(at) };
+                        at += 1;
+                        if number != ABSENT {
+                            unsafe {
+                                let cursor = click_cursor.add(number as usize);
+                                let place = *cursor;
+                                *sorted.add(place as usize) = [(u64::from(record.ts) << 32) | u64::from(record.campaign), record.click];
+                                *cursor = place + 1;
+                            }
                         }
                     }
                 }
             }
         }
     }
+}
+
+/// The order a person's clicks are consulted in: by time, and at one instant
+/// the smallest click_id last, so the click a session is credited to is always
+/// the last one at or before its start.
+#[inline(always)]
+fn click_order(a: &[u64; 2], b: &[u64; 2]) -> std::cmp::Ordering {
+    (a[0] >> 32).cmp(&(b[0] >> 32)).then_with(|| key::compare(b[1], a[1]))
+}
+
+/// The clicks of a person with at most `FEW` of them, in `click_order`, laid
+/// out so that a session can ask all of them a question at once.
+struct Few {
+    /// When each was; `u32::MAX`, later than any session, past the last.
+    ts: [u32; FEW],
+    /// Click i's campaign, at `i + 1`: "the last click at or before the start"
+    /// is then at the number of such clicks, whatever that number is.
+    campaign: [u32; FEW + 1],
+    /// One more than the place of the click before it with the same campaign; 0 if there is none.
+    earlier: [u32; FEW],
 }
 
 /// Everything a thread accumulates while walking people.
@@ -318,8 +431,13 @@ struct Tally {
     first_day: i64,
     width: usize,
     organic: usize,
+    /// The scratch slot at the end of both arrays of `cells`.
+    spare: usize,
     category_sum: Vec<i64>,
     category_touched: Vec<u32>,
+    /// Per campaign, all zeros between people. For a person with many clicks: how
+    /// many of the campaign's clicks are in the 7-day window. For one with few:
+    /// one more than the place of the campaign's latest click so far (`few`).
     window_count: Vec<u32>,
     window_place: Vec<u32>,
     window: Vec<u32>,
@@ -330,11 +448,10 @@ struct Tally {
     sessions: u64,
 }
 
-/// The clicks within reach of the session being closed: `clicks[oldest..upto]`.
+/// For a person with many clicks, those within reach of the session being closed: `clicks[oldest..upto]`.
 struct Reach {
     oldest: usize,
     upto: usize,
-    sliding: bool,
 }
 
 impl Tally {
@@ -383,7 +500,7 @@ impl Tally {
             }
         }
         self.category_touched.clear();
-        self.rows.person.push(name);
+        key::push_plain(name, &mut self.rows.ids);
         self.rows.day.push((self.first_day + i64::from(day)) as i32);
         self.rows.sessions.push(sessions);
         self.rows.events.push(events);
@@ -391,50 +508,113 @@ impl Tally {
         self.rows.top.push(top);
     }
 
-    /// Credits a finished session to a campaign and counts the campaigns that assisted it.
+    /// Lays out the clicks of a person with at most `FEW` of them, already in `click_order`.
+    #[inline(always)]
+    fn few(&mut self, clicks: &[[u64; 2]]) -> Few {
+        debug_assert!(clicks.len() <= FEW);
+        let mut few = Few { ts: [u32::MAX; FEW], campaign: [0; FEW + 1], earlier: [0; FEW] };
+        for (at, click) in clicks.iter().enumerate() {
+            let campaign = click[0] as u32;
+            unsafe {
+                *few.ts.get_unchecked_mut(at) = (click[0] >> 32) as u32;
+                *few.campaign.get_unchecked_mut(at + 1) = campaign;
+                let latest = self.window_count.get_unchecked_mut(campaign as usize);
+                *few.earlier.get_unchecked_mut(at) = *latest;
+                *latest = at as u32 + 1;
+            }
+        }
+        for click in clicks.iter() {
+            unsafe { *self.window_count.get_unchecked_mut(click[0] as u32 as usize) = 0 };
+        }
+        few
+    }
+
+    /// Counts a session for the cell it is credited to, after its assists: the
+    /// cell is `organic`'s, one of 14 or so, or one an assist has just written.
+    /// A session without a purchase adds its nothing to the scratch slot instead
+    /// of branching around the cell.
+    #[inline(always)]
+    fn credited(&mut self, cell: usize, revenue: i64, purchased: bool) {
+        self.cells.counts[cell][Cells::SESSIONS] += 1;
+        let bought = &mut self.cells.bought[std::hint::select_unpredictable(purchased, cell, self.spare)];
+        bought[0] += 1;
+        bought[1] += revenue as u64;
+    }
+
+    /// Credits a finished session of a person with few clicks (`count` of them,
+    /// in `few`) and counts the campaigns that assisted it.
+    ///
+    /// The clicks within reach are those from `oldest` up to `upto`, both found
+    /// by counting: the clicks are in time order, so the ones at or before the
+    /// start are the first so many, and so are the ones too old. One of them
+    /// assists if no click of its campaign lies between `oldest` and itself,
+    /// which is what `earlier` says. Every click is asked, in reach or not, and
+    /// those that do not assist add their 1 to a scratch slot: the loop runs
+    /// `count` times for every session of the person, and nothing in it branches.
+    #[inline(always)]
+    fn credit_few(&mut self, few: &Few, count: usize, start: u32, day: u32, revenue: i64, purchased: bool) {
+        self.sessions += 1;
+        let row = day as usize * self.width;
+        let mut credited = self.organic;
+        if count != 0 {
+            let earliest = start.saturating_sub(REACH);
+            let upto = few.ts.iter().map(|&at| u32::from(at <= start)).sum::<u32>() as usize;
+            let oldest = few.ts.iter().map(|&at| u32::from(at < earliest)).sum::<u32>() as usize;
+            debug_assert!(oldest <= upto && upto <= count);
+            unsafe {
+                credited = std::hint::select_unpredictable(upto > oldest, *few.campaign.get_unchecked(upto) as usize, self.organic);
+                for at in 0..count {
+                    let assists = (at >= oldest) & (at < upto) & (*few.earlier.get_unchecked(at) as usize <= oldest);
+                    let cell = std::hint::select_unpredictable(assists, row + *few.campaign.get_unchecked(at + 1) as usize, self.spare);
+                    self.cells.counts.get_unchecked_mut(cell)[Cells::ASSISTED] += 1;
+                }
+            }
+        }
+        self.credited(row + credited, revenue, purchased);
+    }
+
+    /// Credits a finished session of a person with many clicks, in `click_order`,
+    /// and counts the campaigns that assisted it: the ones in the running set.
     #[inline(always)]
     fn credit(&mut self, clicks: &[[u64; 2]], reach: &mut Reach, start: u32, day: u32, revenue: i64, purchased: bool) {
         self.sessions += 1;
         while reach.upto < clicks.len() && (clicks[reach.upto][0] >> 32) as u32 <= start {
-            if reach.sliding {
-                self.window_add(clicks[reach.upto][0] as u32);
-            }
+            self.window_add(clicks[reach.upto][0] as u32);
             reach.upto += 1;
         }
         let earliest = start.saturating_sub(REACH);
         while reach.oldest < reach.upto && ((clicks[reach.oldest][0] >> 32) as u32) < earliest {
-            if reach.sliding {
-                self.window_remove(clicks[reach.oldest][0] as u32);
-            }
+            self.window_remove(clicks[reach.oldest][0] as u32);
             reach.oldest += 1;
         }
         let row = day as usize * self.width;
         let credited = if reach.upto > reach.oldest { clicks[reach.upto - 1][0] as u32 as usize } else { self.organic };
-        let cell = &mut self.cells.credited[row + credited];
-        cell[0] += 1;
-        cell[1] += u64::from(purchased);
-        cell[2] += revenue as u64;
-        if reach.sliding {
-            for &campaign in &self.window {
-                self.cells.assisted[row + campaign as usize] += 1;
-            }
+        for &campaign in &self.window {
+            self.cells.counts[row + campaign as usize][Cells::ASSISTED] += 1;
+        }
+        self.credited(row + credited, revenue, purchased);
+    }
+
+    /// Closes a session: `credit_few` or `credit`, by how many clicks the person has.
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    fn close(&mut self, clicks: &[[u64; 2]], few: &Few, reach: &mut Reach, start: u32, day: u32, revenue: i64, purchased: bool) {
+        if clicks.len() > FEW {
+            self.credit(clicks, reach, start, day, revenue, purchased);
         } else {
-            for a in reach.oldest..reach.upto {
-                let campaign = clicks[a][0] as u32;
-                if !clicks[reach.oldest..a].iter().any(|c| c[0] as u32 == campaign) {
-                    self.cells.assisted[row + campaign as usize] += 1;
-                }
-            }
+            self.credit_few(few, clicks.len(), start, day, revenue, purchased);
         }
     }
 
     /// One person: `events` in bin order (any order within a bin), `clicks` in any order.
     fn person(&mut self, name: Key, events: &[u64], clicks: &mut [[u64; 2]]) {
         if clicks.len() > 1 {
-            // By time; at one instant the smallest click_id last, so the credited click is always the last one at or before the start.
-            clicks.sort_unstable_by(|a, b| (a[0] >> 32).cmp(&(b[0] >> 32)).then_with(|| key::compare(b[1], a[1])));
+            clicks.sort_unstable_by(click_order);
         }
-        let mut reach = Reach { oldest: 0, upto: 0, sliding: clicks.len() > SLIDING_MIN };
+        let sliding = clicks.len() > SLIDING_MIN;
+        let few = if sliding { Few { ts: [u32::MAX; FEW], campaign: [0; FEW + 1], earlier: [0; FEW] } } else { self.few(clicks) };
+        let clicks = &*clicks;
+        let mut reach = Reach { oldest: 0, upto: 0 };
         let count = events.len();
         let mut day = u32::MAX;
         let (mut day_sessions, mut day_events, mut day_revenue) = (0u32, 0u32, 0i64);
@@ -470,7 +650,7 @@ impl Tally {
                 day_sessions += 1;
                 day_events += size;
                 day_revenue += revenue;
-                self.credit(clicks, &mut reach, start, day, revenue, purchased);
+                self.close(clicks, &few, &mut reach, start, day, revenue, purchased);
                 open = false;
             }
             if !open {
@@ -508,9 +688,9 @@ impl Tally {
         day_sessions += 1;
         day_events += size;
         day_revenue += revenue;
-        self.credit(clicks, &mut reach, start, day, revenue, purchased);
+        self.close(clicks, &few, &mut reach, start, day, revenue, purchased);
         self.row(name, day, day_sessions, day_events, day_revenue);
-        if reach.sliding {
+        if sliding {
             for &campaign in &self.window {
                 self.window_count[campaign as usize] = 0;
             }
@@ -543,6 +723,7 @@ pub fn run<R: Send>(
             first_day: setup.first_day,
             width,
             organic: campaigns,
+            spare: width * setup.days,
             category_sum: vec![0; setup.catalog.categories.len()],
             category_touched: Vec::new(),
             window_count: vec![0; campaigns],
@@ -550,7 +731,7 @@ pub fn run<R: Send>(
             window: Vec::new(),
             bin_purchases: Vec::new(),
             rows: UserRows::with_capacity(expected_rows),
-            cells: Cells { credited: vec![[0; 3]; width * setup.days], assisted: vec![0; width * setup.days] },
+            cells: Cells::new(width * setup.days),
             sessions: 0,
         };
         loop {

@@ -39,7 +39,7 @@ jobs:
       - name: Machine
         run: |
           lscpu | grep -E 'Model name|^CPU\(s\)|Thread|Core|L1d|L2|L3|Flags' | sed -E 's/(Flags:).*/\1 (see below)/'
-          grep -m1 -o -w -E 'avx2|bmi2|avx512f|avx512bw|avx512vbmi2' /proc/cpuinfo | sort -u | tr '\n' ' '; echo
+          grep -m1 -o -w -E 'avx2|bmi2|avx512f|avx512bw|avx512_vbmi2' /proc/cpuinfo | sort -u | tr '\n' ' '; echo
           cat /sys/kernel/mm/transparent_hugepage/enabled; free -g | sed -n 2p; df -h . | tail -1
       - name: Build both the way the scorer does
         run: |
@@ -65,6 +65,16 @@ jobs:
             echo "$side: $(python3 scripts/compare_exact.py out ref | tail -1)"
           done
           rm -rf out; bin/head small out 2>/dev/null; python3 scripts/compare_exact.py out ref | tail -1 | grep -q MATCH
+      - name: Both scan loops give the same tables on the whole dataset
+        # The wide loop (src/scan.rs) only runs on CPUs with AVX-512 VBMI2, and no
+        # reference can check a dataset this size: the narrow loop is the check.
+        # On a runner without those instructions this compares the narrow loop with itself, and says so.
+        run: |
+          SS_SCAN=narrow NCPU=4 bin/head data out_narrow 2> narrow.log
+          NCPU=3 bin/head data out_default 2> default.log
+          echo "compared: $(grep -o 'scan [a-z0-9-]*$' narrow.log) against $(grep -o 'scan [a-z0-9-]*$' default.log)"
+          python3 scripts/same_output.py out_narrow out_default
+          rm -rf out_narrow out_default
       - name: A/B, 4 threads
         env:
           NCPU: 4

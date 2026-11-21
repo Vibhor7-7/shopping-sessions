@@ -12,9 +12,10 @@ COPY ref ./ref
 # The scorers are Cascade Lake or newer: x86-64-v3 (AVX2, BMI2) is always there.
 RUN set -eu; \
     case "$(uname -m)" in x86_64) export RUSTFLAGS="-C target-cpu=x86-64-v3" ;; esac; \
-    cargo build --release --locked --offline --bin pipeline; \
+    cargo build --release --locked --offline --bin pipeline --bin synth; \
     mkdir -p /rootfs/app /rootfs/data /rootfs/output /rootfs/scratch; \
-    cp target/release/pipeline /rootfs/app/pipeline
+    cp target/release/pipeline /rootfs/app/pipeline; \
+    cp target/release/synth /rootfs/app/synth
 
 # At run time the root filesystem is read-only, the user is 1000:1000 and there
 # is no network. The binary is static and writes only to $OUTPUT_DIR.

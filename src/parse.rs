@@ -16,7 +16,7 @@ use std::sync::Mutex;
 use crate::catalog::{self, Catalog};
 use crate::key::{self, Key};
 use crate::links::Links;
-use crate::pool::{Chunks, Combine, Pool};
+use crate::pool::{Arena, Chunks, Combine, Pool};
 use crate::reader::{self, Fields, Input, Job, Lines, ReadBuf};
 use crate::sys;
 use crate::ts;
@@ -94,6 +94,13 @@ const RING: usize = 16;
 /// names the person, so the partitions the records go to; those are asked for
 /// then, `RING - LOOK` lines before they are written.
 const LOOK: usize = 12;
+/// Slots in the ring the waiting lines are kept in: twice `RING`, so the slot
+/// a line is put in is never the one about to be settled. A line is stored
+/// first and the old ones are settled and looked up after it, when nothing of
+/// the new line is left in a register: the other way round, everything the
+/// line had worked out was kept on the stack across both and fetched back
+/// (BENCH.md, experiment 38).
+const SLOTS: usize = 2 * RING;
 
 /// A parsed event copy on its way to its partitions.
 #[derive(Clone, Copy, Default)]
@@ -126,9 +133,9 @@ struct Sink<'a> {
     copies: Combine<'a, Copy_, 8>,
     events: Combine<'a, Event, 8>,
     clicks: Combine<'a, Click, 8>,
-    waiting_events: [PendingEvent; RING],
+    waiting_events: [PendingEvent; SLOTS],
     event_count: usize,
-    waiting_clicks: [PendingClick; RING],
+    waiting_clicks: [PendingClick; SLOTS],
     click_count: usize,
     dates: ts::Dates,
     /// PROBE BUILD ONLY: see `reader::STOP`.
@@ -202,17 +209,17 @@ impl Sink<'_> {
         let count = self.event_count;
         for line in count.saturating_sub(RING)..count {
             if line + LOOK >= count {
-                self.look_up_event(line & (RING - 1));
+                self.look_up_event(line & (SLOTS - 1));
             }
-            self.settle_event(self.waiting_events[line & (RING - 1)]);
+            self.settle_event(self.waiting_events[line & (SLOTS - 1)]);
         }
         self.event_count = 0;
         let count = self.click_count;
         for line in count.saturating_sub(RING)..count {
             if line + LOOK >= count {
-                self.look_up_click(line & (RING - 1));
+                self.look_up_click(line & (SLOTS - 1));
             }
-            self.settle_click(self.waiting_clicks[line & (RING - 1)]);
+            self.settle_click(self.waiting_clicks[line & (SLOTS - 1)]);
         }
         self.click_count = 0;
     }
@@ -255,15 +262,18 @@ impl Lines for EventLines<'_, '_> {
     const COMMAS: usize = 6;
 
     #[inline(always)]
-    unsafe fn line(&mut self, data: *const u8, delims: *const u32, quotes: u32) {
+    unsafe fn line(&mut self, data: *const u8, delims: *const u32, quotes: u32) -> bool {
         let sink = &mut *self.0;
         let context = sink.context;
         if sink.stop == 3 {
             sink.checksum = sink.checksum.wrapping_add(u64::from(*delims.add(7)) ^ u64::from(quotes));
-            return;
+            return reader::is_line::<7>(data, delims);
         }
         let mut fields = Fields::new();
-        let wrapped = reader::split::<7>(data, delims, &mut fields);
+        let (wrapped, is_line) = reader::split::<7>(data, delims, &mut fields);
+        if !is_line {
+            return false; // not seven fields
+        }
         let (id, id_end) = (fields.at(0), fields.at(0) + fields.len(0));
         let (user_at, user_end) = (fields.at(1), fields.at(1) + fields.len(1));
         let (ts_at, ts_end) = (fields.at(2), fields.at(2) + fields.len(2));
@@ -273,11 +283,13 @@ impl Lines for EventLines<'_, '_> {
         let (price_at, price_end) = (fields.at(6), fields.at(6) + fields.len(6));
         // Quotes anywhere but around whole fields make the line malformed; so does an empty event_id.
         if quotes != 2 * wrapped || id == id_end {
-            return;
+            return true;
         }
-        let event = key::key_of_padded(data.add(id), id_end - id);
-        let (ingest_seconds, ingest) = ts::parse_utc(data.add(ingest_at), ingest_end - ingest_at, &mut sink.dates);
-        let at_ms = ts::parse(data.add(ts_at), ts_end - ts_at, &mut sink.dates);
+        // Both IDs at once. An empty user_id, which no line survives, has the key 0.
+        let (event, user_key) = key::keys_of_two_padded(data.add(id), id_end - id, data.add(user_at), user_end - user_at);
+        // Both timestamps, their times of day in one pass (ts::times_of_day).
+        let (at_ms, (ingest_seconds, ingest)) =
+            ts::parse_both(data.add(ts_at), ts_end - ts_at, data.add(ingest_at), ingest_end - ingest_at, &mut sink.dates);
         let catalog = context.catalog;
 
         let mut alive = user_end != user_at
@@ -307,31 +319,34 @@ impl Lines for EventLines<'_, '_> {
         }
         let (mut user, mut home) = (0, 0);
         if alive {
-            user = key::key_of_padded(data.add(user_at), user_end - user_at);
+            user = user_key;
             if sink.stop != 4 {
                 home = context.links.prefetch(user);
             }
         }
         if sink.stop == 4 {
             sink.checksum ^= user ^ event ^ (ingest_seconds as u64) ^ (at_ms as u64) ^ u64::from(purchase);
-            return;
+            return true;
         }
         let ingest = if ingest == ts::BAD {
             u32::MAX
         } else {
             (ingest_seconds - context.ingest_epoch).clamp(0, i64::from(u32::MAX) - 1) as u32
         };
-        let slot = sink.event_count & (RING - 1);
-        if sink.event_count >= RING {
-            let ready = sink.waiting_events[slot];
+        // The line first, into a slot nothing is waiting in; then the line `RING`
+        // before it is filed and the one `LOOK` before it looked up.
+        let count = sink.event_count;
+        sink.waiting_events[count & (SLOTS - 1)] =
+            PendingEvent { user, event, ts: at_ms.wrapping_sub(context.epoch) as u32, purchase, ingest, home };
+        sink.event_count = count + 1;
+        if count >= RING {
+            let ready = sink.waiting_events[(count - RING) & (SLOTS - 1)];
             sink.settle_event(ready);
         }
-        if sink.event_count >= LOOK {
-            sink.look_up_event((sink.event_count - LOOK) & (RING - 1));
+        if count >= LOOK {
+            sink.look_up_event((count - LOOK) & (SLOTS - 1));
         }
-        sink.waiting_events[slot] =
-            PendingEvent { user, event, ts: at_ms.wrapping_sub(context.epoch) as u32, purchase, ingest, home };
-        sink.event_count += 1;
+        true
     }
 }
 
@@ -339,48 +354,52 @@ impl Lines for ClickLines<'_, '_> {
     const COMMAS: usize = 3;
 
     #[inline(always)]
-    unsafe fn line(&mut self, data: *const u8, delims: *const u32, quotes: u32) {
+    unsafe fn line(&mut self, data: *const u8, delims: *const u32, quotes: u32) -> bool {
         let sink = &mut *self.0;
         let context = sink.context;
         if sink.stop == 3 {
             sink.checksum = sink.checksum.wrapping_add(u64::from(*delims.add(4)) ^ u64::from(quotes));
-            return;
+            return reader::is_line::<4>(data, delims);
         }
         let mut fields = Fields::new();
-        let wrapped = reader::split::<4>(data, delims, &mut fields);
+        let (wrapped, is_line) = reader::split::<4>(data, delims, &mut fields);
+        if !is_line {
+            return false; // not four fields
+        }
         let (id, id_end) = (fields.at(0), fields.at(0) + fields.len(0));
         let (user_at, user_end) = (fields.at(1), fields.at(1) + fields.len(1));
         let (campaign_at, campaign_end) = (fields.at(2), fields.at(2) + fields.len(2));
         let (ts_at, ts_end) = (fields.at(3), fields.at(3) + fields.len(3));
         if quotes != 2 * wrapped || id == id_end || user_at == user_end {
-            return; // malformed, no click_id, or no user_id
+            return true; // malformed, no click_id, or no user_id
         }
         let at_ms = ts::parse(data.add(ts_at), ts_end - ts_at, &mut sink.dates);
         let catalog = context.catalog;
         if at_ms == ts::BAD || at_ms < context.epoch || at_ms >= catalog.window_end {
-            return;
+            return true;
         }
         let campaign = catalog.campaign(data.add(campaign_at), campaign_end - campaign_at);
         if campaign == catalog::NONE {
-            return;
+            return true;
         }
-        let user = key::key_of_padded(data.add(user_at), user_end - user_at);
+        let (click, user) = key::keys_of_two_padded(data.add(id), id_end - id, data.add(user_at), user_end - user_at);
         if sink.stop == 4 {
-            sink.checksum ^= user ^ key::key_of_padded(data.add(id), id_end - id) ^ (at_ms as u64) ^ u64::from(campaign);
-            return;
+            sink.checksum ^= user ^ click ^ (at_ms as u64) ^ u64::from(campaign);
+            return true;
         }
         let home = context.links.prefetch(user);
-        let slot = sink.click_count & (RING - 1);
-        if sink.click_count >= RING {
-            let ready = sink.waiting_clicks[slot];
+        let count = sink.click_count;
+        sink.waiting_clicks[count & (SLOTS - 1)] =
+            PendingClick { user, click, ts: (at_ms - context.epoch) as u32, campaign, home };
+        sink.click_count = count + 1;
+        if count >= RING {
+            let ready = sink.waiting_clicks[(count - RING) & (SLOTS - 1)];
             sink.settle_click(ready);
         }
-        if sink.click_count >= LOOK {
-            sink.look_up_click((sink.click_count - LOOK) & (RING - 1));
+        if count >= LOOK {
+            sink.look_up_click((count - LOOK) & (SLOTS - 1));
         }
-        sink.waiting_clicks[slot] =
-            PendingClick { user, click: key::key_of_padded(data.add(id), id_end - id), ts: (at_ms - context.epoch) as u32, campaign, home };
-        sink.click_count += 1;
+        true
     }
 }
 
@@ -423,14 +442,20 @@ pub fn run(
     let next = AtomicUsize::new(0);
     sys::parallel(threads, |_| {
         let mut buf = ReadBuf::new();
+        // The three streams' buffers and states side by side on one huge page (pool::Arena).
+        let mut arena = Arena::new(
+            Combine::<Copy_, 8>::arena_bytes(dedup_partitions)
+                + Combine::<Event, 8>::arena_bytes(person_partitions)
+                + Combine::<Click, 8>::arena_bytes(person_partitions),
+        );
         let mut sink = Sink {
             context,
-            copies: Combine::new(&pools.copies, dedup_partitions, chunks.copies),
-            events: Combine::new(&pools.events, person_partitions, chunks.events),
-            clicks: Combine::new(&pools.clicks, person_partitions, chunks.clicks),
-            waiting_events: [PendingEvent::default(); RING],
+            copies: Combine::new(&pools.copies, &mut arena, dedup_partitions, chunks.copies),
+            events: Combine::new(&pools.events, &mut arena, person_partitions, chunks.events),
+            clicks: Combine::new(&pools.clicks, &mut arena, person_partitions, chunks.clicks),
+            waiting_events: [PendingEvent::default(); SLOTS],
             event_count: 0,
-            waiting_clicks: [PendingClick::default(); RING],
+            waiting_clicks: [PendingClick::default(); SLOTS],
             click_count: 0,
             dates: ts::Dates::new(),
             stop: buf.stop,

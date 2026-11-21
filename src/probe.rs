@@ -53,8 +53,12 @@ pub fn run(data: &std::path::Path, output: &std::path::Path) {
     for line in head("/proc/meminfo", 4096).lines().filter(|l| ["MemTotal", "MemFree", "MemAvailable", "Cached", "Dirty", "AnonHugePages", "HugePages_Total", "Hugepagesize", "SwapTotal"].iter().any(|k| l.starts_with(k))) {
         eprintln!("probe: meminfo: {line}");
     }
-    show("/proc/self/mountinfo", 6000);
-    show("/proc/self/limits", 2000);
+    for line in head("/proc/self/mountinfo", 16000).lines().filter(|l| [" / ", " /data ", " /output ", " /scratch ", " /tmp ", " /app "].iter().any(|k| l.contains(k))).take(10) {
+        eprintln!("probe: mount: {}", line.chars().take(200).collect::<String>());
+    }
+    for line in head("/proc/self/limits", 2000).lines().filter(|l| ["Max locked memory", "Max address space", "Max open files", "Max processes", "Max stack size"].iter().any(|k| l.starts_with(k))) {
+        eprintln!("probe: limit: {}", line.split_whitespace().collect::<Vec<_>>().join(" "));
+    }
     eprintln!("probe: ---- environment (values only for the documented ones) ----");
     for (name, value) in std::env::vars() {
         if ["DATA_DIR", "OUTPUT_DIR", "SCRATCH_DIR", "HOME", "NCPU", "MEM_GB", "PATH", "TMPDIR", "HOSTNAME"].contains(&name.as_str()) {
@@ -217,7 +221,15 @@ pub fn anatomy(
         crate::reader::STOP.store(0, Ordering::Relaxed);
         best
     };
-    eprintln!("probe: ---- the parse phase of this dataset, cut short at each stage ({threads} threads, best of 5) ----");
+    // No run here gives its records back (the pools never free), so on a large
+    // dataset every setting is run once and the thread counts are fewer: about
+    // 5 GB at 20M events where the full list would be past the 24 GB allowed.
+    let bytes: u64 = events.iter().chain(clicks).map(|input| input.len).sum();
+    let large = bytes > (512 << 20);
+    let (stage_rounds, rounds) = if large { (1, 1) } else { (3, 2) };
+    let parse_threads: &[usize] = if large { &[4, 8] } else { &[1, 2, 4, 6, 8, 12, 16] };
+    let scan_threads: &[usize] = if large { &[1, 4, 8] } else { &[1, 2, 4, 8, 16] };
+    eprintln!("probe: ---- the parse phase of this dataset ({} MB), cut short at each stage ({threads} threads, best of {stage_rounds}) ----", bytes >> 20);
     for (stop, what) in [
         (1, "read() only"),
         (2, "+ delimiter scan"),
@@ -228,15 +240,15 @@ pub fn anatomy(
         (7, "+ copy records, not event records"),
         (0, "everything"),
     ] {
-        eprintln!("probe: parse, {what}: {:.1} ms", time(stop, threads, 5));
+        eprintln!("probe: parse, {what}: {:.1} ms", time(stop, threads, stage_rounds));
     }
-    eprintln!("probe: ---- the whole parse phase by thread count (best of 3) ----");
-    for count in [1usize, 2, 4, 6, 8, 12, 16] {
-        eprintln!("probe: parse on {count:>2} threads: {:.1} ms", time(0, count, 3));
+    eprintln!("probe: ---- the whole parse phase by thread count (best of {rounds}) ----");
+    for &count in parse_threads {
+        eprintln!("probe: parse on {count:>2} threads: {:.1} ms", time(0, count, rounds));
     }
-    eprintln!("probe: ---- read() and the delimiter scan only, by thread count (best of 3) ----");
-    for count in [1usize, 2, 4, 8, 16] {
-        eprintln!("probe: read + scan on {count:>2} threads: {:.1} ms", time(2, count, 3));
+    eprintln!("probe: ---- read() and the delimiter scan only, by thread count (best of {rounds}) ----");
+    for &count in scan_threads {
+        eprintln!("probe: read + scan on {count:>2} threads: {:.1} ms", time(2, count, rounds));
     }
 }
 
@@ -388,4 +400,116 @@ fn vector_widths() {
             eprintln!("probe: 512-bit scan + scalar work, alternating: {ms:.1} ms");
         }
     }
+}
+
+/// The whole pipeline on a stand-in dataset the size of the practice set (the
+/// one the bench workflow times, `src/bin/synth.rs`), each run a process of its
+/// own: what the scorer's machine makes of the real thing, from start to exit,
+/// on its own thread count and on others. Last in the log, because it is the
+/// part that takes long: if the run is cut short, everything else is out.
+pub fn at_scale() {
+    use std::process::{Command, Stdio};
+    eprintln!("probe: ---- the whole pipeline on a stand-in dataset, each run a process of its own ----");
+    let scratch = std::path::PathBuf::from(std::env::var("SCRATCH_DIR").unwrap_or_else(|_| "/scratch".into()));
+    let Ok(exe) = std::env::current_exe() else {
+        eprintln!("probe: no path to this program");
+        return;
+    };
+    let synth = exe.with_file_name("synth");
+    let events: u64 = std::env::var("SS_PROBE_EVENTS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(20_000_000);
+    let (data, out, empty) = (scratch.join("probe-data"), scratch.join("probe-out"), scratch.join("probe-empty"));
+    let clean = || {
+        for folder in [&data, &out, &empty] {
+            let _ = std::fs::remove_dir_all(folder);
+        }
+    };
+    clean();
+    let started = Instant::now();
+    let child = Command::new(&synth)
+        .args(["--events", &events.to_string(), "--clicks", &(events / 4).to_string(), "--seed", "9", "--output"])
+        .arg(&data)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+    let mut child = match child {
+        Ok(child) => child,
+        Err(error) => {
+            eprintln!("probe: could not start {}: {error}", synth.display());
+            return;
+        }
+    };
+    // Given up on after a minute, rather than run into whatever limit the run has.
+    let made = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status.success(),
+            Ok(None) if started.elapsed().as_secs() < 60 => std::thread::sleep(std::time::Duration::from_millis(10)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break false;
+            }
+        }
+    };
+    let megabytes = |folder: &str| -> u64 {
+        std::fs::read_dir(data.join(folder)).map(|d| d.flatten().filter_map(|e| e.metadata().ok()).map(|m| m.len()).sum::<u64>()).unwrap_or(0) >> 20
+    };
+    eprintln!(
+        "probe: {events} events and {} clicks made in {:.1} s (done: {made}): events {} MB, clicks {} MB, links {} MB",
+        events / 4,
+        started.elapsed().as_secs_f64(),
+        megabytes("events"),
+        megabytes("clicks"),
+        megabytes("links"),
+    );
+    if !made {
+        clean();
+        return;
+    }
+    let _ = std::fs::create_dir_all(&empty);
+    let run = |label: &str, settings: &[(&str, &str)], folder: &std::path::Path| {
+        let _ = std::fs::remove_dir_all(&out);
+        let started = Instant::now();
+        let result = Command::new(&exe)
+            .arg(folder)
+            .arg(&out)
+            .env("SS_PROBE_CHILD", "1")
+            .envs(settings.iter().copied())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output();
+        let wall = started.elapsed().as_secs_f64() * 1e3;
+        match result {
+            Ok(result) => {
+                let log = String::from_utf8_lossy(&result.stderr);
+                let phases = log.lines().find(|l| l.starts_with("pipeline: links ")).map(|l| l["pipeline: ".len()..].split(" (pool").next().unwrap_or("").to_string()).unwrap_or_default();
+                let memory = log.lines().find_map(|l| l.find("peak memory").map(|at| l[at..].to_string())).unwrap_or_default();
+                eprintln!("probe: {label}: {wall:.1} ms from start to exit ({}) | {phases} | {memory}", result.status);
+            }
+            Err(error) => eprintln!("probe: {label}: could not run: {error}"),
+        }
+    };
+    for round in 1..=3 {
+        run(&format!("no data, run {round} (what a process costs by itself)"), &[], &empty);
+    }
+    for round in 1..=5 {
+        run(&format!("as scored, run {round}"), &[], &data);
+    }
+    for round in 1..=2 {
+        for threads in ["4", "6", "12", "16"] {
+            run(&format!("NCPU={threads}, run {round}"), &[("NCPU", threads)], &data);
+        }
+    }
+    for round in 1..=3 {
+        run(&format!("SS_SCAN=narrow, run {round}"), &[("SS_SCAN", "narrow")], &data);
+    }
+    for round in 6..=7 {
+        run(&format!("as scored, run {round}"), &[], &data);
+    }
+    clean();
+    for line in head("/sys/fs/cgroup/cpu.stat", 600).lines().filter(|l| l.starts_with("nr_") || l.starts_with("throttled")) {
+        eprintln!("probe: cpu.stat at the end: {line}");
+    }
+    eprintln!("probe: memory.peak at the end: {}", head("/sys/fs/cgroup/memory.peak", 64));
 }

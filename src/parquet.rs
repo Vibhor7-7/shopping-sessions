@@ -1,11 +1,14 @@
 //! A minimal Parquet writer: one row group, one PLAIN, uncompressed data page
 //! per column. That is all two flat tables need, it is the most widely read
-//! corner of the format, and writing it is little more than copying the columns.
+//! corner of the format, and a PLAIN page of integers is the column as it lies
+//! in memory: the file is never put together here, only handed to the kernel
+//! piece by piece.
 //!
 //! The file layout and the Thrift compact encoding of the footer follow
 //! https://parquet.apache.org/docs/file-format/ and parquet.thrift.
 
-use std::io::Write;
+use std::borrow::Cow;
+use std::io::{ErrorKind, IoSlice, Write};
 use std::path::Path;
 
 // parquet.thrift: Type
@@ -130,25 +133,60 @@ fn little_endian<T: Copy>(values: &[T]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(values.as_ptr() as *const u8, std::mem::size_of_val(values)) }
 }
 
-/// Builds one Parquet file in memory. Add every column with the same number of rows, then `write`.
-pub struct File {
-    bytes: Vec<u8>,
+/// Writes `pieces` one after another, in as few system calls as the kernel takes them in.
+fn write_pieces(file: &mut std::fs::File, pieces: &[Cow<[u8]>]) -> std::io::Result<()> {
+    let mut slices: Vec<IoSlice> = pieces.iter().filter(|piece| !piece.is_empty()).map(|piece| IoSlice::new(piece)).collect();
+    let mut left = &mut slices[..];
+    while !left.is_empty() {
+        match file.write_vectored(left) {
+            Ok(0) => return Err(ErrorKind::WriteZero.into()),
+            Ok(written) => IoSlice::advance_slices(&mut left, written),
+            Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            // A kernel that refuses this much in one call (macOS, past 2 GB) still takes it a piece at a time.
+            Err(e) if e.kind() == ErrorKind::InvalidInput => {
+                for slice in left.iter() {
+                    file.write_all(slice)?;
+                }
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// Builds one Parquet file. Add every column with the same number of rows, then `write`.
+///
+/// The file is a list of pieces: the page headers and the footer, made here,
+/// and between them the columns where the caller keeps them. Nothing is copied
+/// until `write` gives the list to the kernel.
+pub struct File<'a> {
+    pieces: Vec<Cow<'a, [u8]>>,
+    /// The bytes in `pieces`: where in the file the next one starts.
+    len: usize,
     columns: Vec<Column>,
     rows: i64,
 }
 
-impl File {
-    pub fn new(rows: usize, capacity: usize) -> Self {
-        let mut bytes = Vec::with_capacity(capacity + 1024);
-        bytes.extend_from_slice(b"PAR1");
-        Self { bytes, columns: Vec::new(), rows: rows as i64 }
+impl<'a> File<'a> {
+    pub fn new(rows: usize) -> Self {
+        let mut file = Self { pieces: Vec::new(), len: 0, columns: Vec::new(), rows: rows as i64 };
+        file.piece(Cow::Borrowed(&b"PAR1"[..]));
+        file
     }
 
-    /// A column whose page body `fill` appends: for a required column the PLAIN values, nothing else.
-    fn column(&mut self, name: &'static str, kind: Kind, optional: bool, body_len: usize, fill: impl FnOnce(&mut Vec<u8>)) {
-        let offset = self.bytes.len();
+    fn piece(&mut self, piece: Cow<'a, [u8]>) {
+        self.len += piece.len();
+        self.pieces.push(piece);
+    }
+
+    /// A column whose page body is `body`, piece after piece: for a required column the PLAIN values, nothing else.
+    fn column<const N: usize>(&mut self, name: &'static str, kind: Kind, optional: bool, body: [Cow<'a, [u8]>; N]) {
+        let offset = self.len;
         if self.rows > 0 {
-            let mut header = Thrift::new(&mut self.bytes);
+            let body_len: usize = body.iter().map(|piece| piece.len()).sum();
+            let mut bytes = Vec::with_capacity(32);
+            let mut header = Thrift::new(&mut bytes);
             header.i32(1, 0); // DATA_PAGE
             header.i32(2, body_len as i32);
             header.i32(3, body_len as i32);
@@ -159,46 +197,49 @@ impl File {
             header.i32(4, RLE);
             header.end();
             header.out.push(0);
-            let body = self.bytes.len();
-            fill(&mut self.bytes);
-            assert_eq!(self.bytes.len() - body, body_len, "page body of {name}");
+            self.piece(Cow::Owned(bytes));
+            for piece in body {
+                self.piece(piece);
+            }
         }
-        let size = (self.bytes.len() - offset) as i64;
+        let size = (self.len - offset) as i64;
         self.columns.push(Column { name, kind, optional, values: self.rows, offset: offset as i64, size });
     }
 
-    pub fn int32(&mut self, name: &'static str, kind: Kind, values: &[i32]) {
+    pub fn int32(&mut self, name: &'static str, kind: Kind, values: &'a [i32]) {
         assert_eq!(values.len() as i64, self.rows);
-        self.column(name, kind, false, values.len() * 4, |out| out.extend_from_slice(little_endian(values)));
+        self.column(name, kind, false, [Cow::Borrowed(little_endian(values))]);
     }
 
-    pub fn int64(&mut self, name: &'static str, values: &[i64]) {
+    pub fn int64(&mut self, name: &'static str, values: &'a [i64]) {
         assert_eq!(values.len() as i64, self.rows);
-        self.column(name, Kind::Int64, false, values.len() * 8, |out| out.extend_from_slice(little_endian(values)));
+        self.column(name, Kind::Int64, false, [Cow::Borrowed(little_endian(values))]);
     }
 
     /// Non-negative counts: 32-bit when they all fit (the checker takes any integer width), 64-bit otherwise.
-    pub fn counts(&mut self, name: &'static str, values: &[u32]) {
+    pub fn counts(&mut self, name: &'static str, values: &'a [u32]) {
         assert_eq!(values.len() as i64, self.rows);
         if values.iter().all(|&v| v <= i32::MAX as u32) {
-            self.column(name, Kind::Int32, false, values.len() * 4, |out| out.extend_from_slice(little_endian(values)));
+            self.column(name, Kind::Int32, false, [Cow::Borrowed(little_endian(values))]);
         } else {
-            let wide: Vec<i64> = values.iter().map(|&v| i64::from(v)).collect();
-            self.int64(name, &wide);
+            let wide: Vec<u8> = values.iter().flat_map(|&v| i64::from(v).to_le_bytes()).collect();
+            self.column(name, Kind::Int64, false, [Cow::Owned(wide)]);
         }
     }
 
     /// A required string column. `plain` is the values already PLAIN-encoded: a 4-byte length, then the bytes, each.
-    pub fn text(&mut self, name: &'static str, plain: &[u8]) {
-        self.column(name, Kind::Text, false, plain.len(), |out| out.extend_from_slice(plain));
+    pub fn text(&mut self, name: &'static str, plain: &'a [u8]) {
+        self.column(name, Kind::Text, false, [Cow::Borrowed(plain)]);
     }
 
     /// A nullable string column: `present[i]` says whether row i has a value; `plain` holds the present ones.
-    pub fn optional_text(&mut self, name: &'static str, present: &[bool], plain: &[u8]) {
+    pub fn optional_text(&mut self, name: &'static str, present: &[bool], plain: &'a [u8]) {
         assert_eq!(present.len() as i64, self.rows);
-        // Definition levels, 1 bit each, as one bit-packed run of the RLE/bit-packing hybrid.
+        // Definition levels, 1 bit each, as one bit-packed run of the RLE/bit-packing hybrid,
+        // their length in four bytes before them.
         let groups = present.len().div_ceil(8);
-        let mut levels = Vec::with_capacity(groups + 8);
+        let mut levels = Vec::with_capacity(groups + 16);
+        levels.extend_from_slice(&[0; 4]);
         let mut run = (groups as u64) << 1 | 1;
         while run >= 0x80 {
             levels.push(run as u8 | 0x80);
@@ -212,17 +253,15 @@ impl File {
             }
             levels.push(byte);
         }
-        self.column(name, Kind::Text, true, 4 + levels.len() + plain.len(), |out| {
-            out.extend_from_slice(&(levels.len() as u32).to_le_bytes());
-            out.extend_from_slice(&levels);
-            out.extend_from_slice(plain);
-        });
+        let len = (levels.len() - 4) as u32;
+        levels[..4].copy_from_slice(&len.to_le_bytes());
+        self.column(name, Kind::Text, true, [Cow::Owned(levels), Cow::Borrowed(plain)]);
     }
 
     pub fn write(mut self, path: &Path) {
-        let footer = self.bytes.len();
         let total: i64 = self.columns.iter().map(|c| c.size).sum();
-        let mut meta = Thrift::new(&mut self.bytes);
+        let mut footer = Vec::with_capacity(1024);
+        let mut meta = Thrift::new(&mut footer);
         meta.i32(1, 1); // version
         meta.list(2, T_STRUCT, self.columns.len() + 1);
         meta.element();
@@ -294,9 +333,10 @@ impl File {
         }
         meta.string(6, "shopping-sessions");
         meta.out.push(0);
-        let footer_len = (self.bytes.len() - footer) as u32;
-        self.bytes.extend_from_slice(&footer_len.to_le_bytes());
-        self.bytes.extend_from_slice(b"PAR1");
+        let footer_len = footer.len() as u32;
+        footer.extend_from_slice(&footer_len.to_le_bytes());
+        footer.extend_from_slice(b"PAR1");
+        self.piece(Cow::Owned(footer));
         use std::os::unix::fs::OpenOptionsExt;
         let written = std::fs::OpenOptions::new()
             .write(true)
@@ -304,7 +344,7 @@ impl File {
             .truncate(true)
             .mode(0o666)
             .open(path)
-            .and_then(|mut file| file.write_all(&self.bytes));
+            .and_then(|mut file| write_pieces(&mut file, &self.pieces));
         if let Err(e) = written {
             eprintln!("pipeline: cannot write {}: {e}", path.display());
             std::process::exit(1);

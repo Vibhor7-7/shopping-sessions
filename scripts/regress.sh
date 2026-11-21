@@ -22,3 +22,18 @@ for bin in target/release/pipeline "$X86"; do
 done
 echo "diff vs reference, seeds 2 to 5: $(scripts/diff_vs_ref.sh "2 3 4 5" 300k 2>&1 | tail -1)"
 echo "diff vs reference, leap day and year end: $(scripts/diff_vs_ref.sh "15 29" 300k 2>&1 | tail -1)"
+# People with an event or two each: the table that numbers a partition's people
+# grows in the middle of the pass that fills it (src/person.rs), which no
+# generated dataset makes it do. BENCH.md, experiment 41.
+MANY=$(mktemp -d)
+python3 scripts/many_people.py "$MANY/data" 60000 1
+target/release/reference "$MANY/data" "$MANY/ref" 2>/dev/null
+for bin in target/release/pipeline "$X86"; do
+  ok=0; runs=0
+  for config in "NCPU=8" "NCPU=1" "NCPU=3 SS_PERSON_BITS=1 SS_DEDUP_BITS=1" "NCPU=5 SS_PERSON_BITS=9 SS_DEDUP_BITS=7"; do
+    rm -rf "$MANY/out"; runs=$((runs + 1))
+    if env $config "$bin" "$MANY/data" "$MANY/out" 2>/dev/null && $PY scripts/compare_exact.py "$MANY/out" "$MANY/ref" > /dev/null 2>&1; then ok=$((ok + 1)); fi
+  done
+  echo "many people, $bin: $ok/$runs runs match the reference"
+done
+rm -rf "$MANY"

@@ -46,26 +46,20 @@ fn plain(values: impl Iterator<Item = impl AsRef<[u8]>>, out: &mut Vec<u8>) {
     }
 }
 
-/// Writes one thread's user_daily rows as a Parquet file of their own.
+/// Writes one thread's user_daily rows as a Parquet file of their own. The
+/// columns are already what the file's pages hold; only top_category, which few
+/// rows have, is put together here.
 fn write_user_daily(folder: &Path, catalog: &catalog::Catalog, part: usize, rows: person::UserRows) -> usize {
-    let count = rows.person.len();
+    let count = rows.day.len();
     if count == 0 && part != 0 {
         return 0; // the checker needs at least one file, not one per thread
-    }
-    let mut ids = Vec::with_capacity(count * 14 + 16);
-    for &person in &rows.person {
-        let at = ids.len();
-        ids.extend_from_slice(&[0; 4]);
-        key::write_id(person, &mut ids);
-        let len = (ids.len() - at - 4) as u32;
-        ids[at..at + 4].copy_from_slice(&len.to_le_bytes());
     }
     let present: Vec<bool> = rows.top.iter().map(|&top| top != 0).collect();
     let mut tops = Vec::new();
     plain(rows.top.iter().filter(|&&top| top != 0).map(|&top| &catalog.categories[top as usize - 1]), &mut tops);
 
-    let mut file = parquet::File::new(count, ids.len() + tops.len() + count * 21);
-    file.text("user_id", &ids);
+    let mut file = parquet::File::new(count);
+    file.text("user_id", &rows.ids);
     file.int32("day", Kind::Date, &rows.day);
     file.counts("sessions", &rows.sessions);
     file.counts("events", &rows.events);
@@ -91,10 +85,10 @@ fn write_campaign_daily(folder: &Path, catalog: &catalog::Catalog, cells: &[pers
             let at = day * width + campaign;
             let mut sum = [0u64; 4];
             for cell in cells {
-                for i in 0..3 {
-                    sum[i] += cell.credited[at][i];
-                }
-                sum[3] += u64::from(cell.assisted[at]);
+                sum[0] += u64::from(cell.counts[at][person::Cells::SESSIONS]);
+                sum[1] += cell.bought[at][0];
+                sum[2] += cell.bought[at][1];
+                sum[3] += u64::from(cell.counts[at][person::Cells::ASSISTED]);
             }
             if sum[0] == 0 && sum[3] == 0 {
                 continue;
@@ -108,7 +102,7 @@ fn write_campaign_daily(folder: &Path, catalog: &catalog::Catalog, cells: &[pers
         }
     }
     let rows = day_column.len();
-    let mut file = parquet::File::new(rows, ids.len() + channels.len() + rows * 36);
+    let mut file = parquet::File::new(rows);
     file.text("campaign_id", &ids);
     file.text("channel", &channels);
     file.int32("day", Kind::Date, &day_column);
@@ -224,7 +218,9 @@ fn main() {
     let parsed = parse::run(&context, &pools, &events, &clicks, threads, 1 << person_bits, 1 << dedup_bits, chunks);
     let parsed_at = started.elapsed();
 
-    let dropped = dedup::run(&pools.copies, &pools.events, &parsed, 1 << dedup_bits, 64 - dedup_bits, threads);
+    // Slots in dedup's filter for every copy in a partition (a measuring knob; see dedup.rs).
+    let filter_slots = setting("SS_DEDUP_SLOTS").unwrap_or(16).clamp(1, 256);
+    let dropped = dedup::run(&pools.copies, &pools.events, &parsed, 1 << dedup_bits, 64 - dedup_bits, threads, filter_slots);
     let deduped_at = started.elapsed();
 
     let user_folder = output.join("user_daily");
@@ -272,8 +268,8 @@ fn main() {
         pools.copies.records() + pools.events.records() + pools.clicks.records(),
     );
     eprintln!(
-        "pipeline: inside links: catalog done at {catalog_ms:.1} ms; link parse {:.1}, join {:.1}, name {:.1} ms; peak memory {} MB",
-        links.timing[0], links.timing[1], links.timing[2], sys::peak_memory_mb(),
+        "pipeline: inside links: catalog done at {catalog_ms:.1} ms; link parse {:.1}, join {:.1}, name {:.1} ms; peak memory {} MB; scan {}",
+        links.timing[0], links.timing[1], links.timing[2], sys::peak_memory_mb(), scan::chosen().name(),
     );
     // Wall-clock times, so whoever starts the container can see how long it took to
     // reach `main` and how long the container outlived it.
@@ -282,15 +278,20 @@ fn main() {
     if cfg!(target_os = "linux") && event_bytes < (256 << 20) {
         describe_machine();
     }
-    // PROBE BUILD: describe the machine, then spoil the output so the log is shown.
-    describe_machine();
-    probe::anatomy(&context, &events, &clicks, threads, 1 << person_bits, 1 << dedup_bits, chunks);
-    probe::run(&data, &output);
+    // PROBE BUILD. A run the probe itself started is the pipeline and nothing more.
+    if std::env::var_os("SS_PROBE_CHILD").is_some() {
+        std::process::exit(0);
+    }
+    // The output is spoiled first, so that the log is shown whatever becomes of the rest.
     if let Ok(files) = std::fs::read_dir(&user_folder) {
         for file in files.flatten() {
             let _ = std::fs::remove_file(file.path());
         }
     }
     write_user_daily(&user_folder, &catalog, 0, person::UserRows::default());
+    describe_machine();
+    probe::anatomy(&context, &events, &clicks, threads, 1 << person_bits, 1 << dedup_bits, chunks);
+    probe::run(&data, &output);
+    probe::at_scale();
     std::process::exit(0);
 }

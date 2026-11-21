@@ -198,6 +198,94 @@ pub unsafe fn key_of_padded(id: *const u8, len: usize) -> Key {
     }
 }
 
+/// Which bytes are outside the alphabet, the other way round from `CLASS_OF_*`:
+/// a byte is outside when its two nibbles share a bit here, so "is any of
+/// these bytes outside" is a single test of the two tables' AND.
+// bit 0: 3x, x >= 10      bit 1: 4x or 6x, x = 0     bit 2: 5x, x = 11 to 14
+// bit 3: 7x, x >= 11      bit 4: any other high nibble, whatever the low one
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+static OUTSIDE_BY_HIGH: [u8; 16] = [16, 16, 16, 1, 2, 4, 2, 8, 16, 16, 16, 16, 16, 16, 16, 16];
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+static OUTSIDE_BY_LOW: [u8; 16] = [
+    2 | 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 1 | 16, 1 | 4 | 8 | 16, 1 | 4 | 8 | 16, 1 | 4 | 8 | 16, 1 | 4 | 8 | 16,
+    1 | 8 | 16,
+];
+
+/// The packed keys of two IDs at once, if both pack: `pack_padded` of each, or
+/// `None` if either is empty, too long or holds a character outside the
+/// alphabet. 16 bytes must be readable at each, whatever the lengths.
+///
+/// The two share one 256-bit register, a half each, and every step
+/// `pack_padded` takes is taken once for both. The 6-bit codes are then put
+/// side by side with two multiply-adds (pairs, then fours: a code times 64
+/// plus the next, a pair times 4096 plus the next) and one shuffle that lays
+/// the three fours of ten characters end to end, where one ID alone goes
+/// through `pext` and a handful of shifts. About 40 instructions for the two
+/// where two calls of `pack_padded` take about 80 (counted in the compiled
+/// code; BENCH.md, experiment 35).
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+unsafe fn pack_two_padded(a: *const u8, a_len: usize, b: *const u8, b_len: usize) -> Option<(Key, Key)> {
+    use std::arch::x86_64::*;
+    // Both 1 to 10 characters long. The larger of the two decides, and 0 - 1 is
+    // the largest number there is. (Not the two ORed together: 7 | 8 is 15.)
+    if a_len.wrapping_sub(1).max(b_len.wrapping_sub(1)) > 9 {
+        return None;
+    }
+    let both = |first: *const u8, second: *const u8| {
+        _mm256_inserti128_si256(_mm256_castsi128_si256(_mm_loadu_si128(first as *const __m128i)), _mm_loadu_si128(second as *const __m128i), 1)
+    };
+    let twice = |t: &[u8; 16]| _mm256_broadcastsi128_si256(_mm_loadu_si128(t.as_ptr() as *const __m128i));
+    let bytes = both(a, b);
+    let keep = both(LENGTH_MASKS.as_ptr().add(16 - a_len), LENGTH_MASKS.as_ptr().add(16 - b_len));
+    let nibble = _mm256_set1_epi8(0x0f);
+    let high = _mm256_and_si256(_mm256_srli_epi16(bytes, 4), nibble);
+    let low = _mm256_and_si256(bytes, nibble);
+    let outside = _mm256_and_si256(_mm256_shuffle_epi8(twice(&OUTSIDE_BY_HIGH), high), _mm256_shuffle_epi8(twice(&OUTSIDE_BY_LOW), low));
+    if _mm256_testz_si256(outside, keep) == 0 {
+        return None;
+    }
+    let underscore = _mm256_and_si256(_mm256_cmpeq_epi8(bytes, _mm256_set1_epi8(b'_' as i8)), _mm256_set1_epi8(-4));
+    let codes = _mm256_add_epi8(_mm256_add_epi8(bytes, _mm256_shuffle_epi8(twice(&CODE_OFFSET), high)), underscore);
+    let codes = _mm256_and_si256(codes, keep);
+    // Characters 0 to 3, 4 to 7 and 8 to 11 of each ID as 24 bits each, the first character highest.
+    let pairs = _mm256_maddubs_epi16(codes, _mm256_set1_epi16(0x0140));
+    let fours = _mm256_madd_epi16(pairs, _mm256_set1_epi32(0x0001_1000));
+    // The key is the first four's 24 bits, the second's, and the 12 bits of
+    // characters 8 and 9, with four zero bits below: as bytes, lowest first,
+    // the upper two of the third four, then all three of the second and of the first.
+    #[rustfmt::skip]
+    let order = _mm256_setr_epi8(
+        9, 10, 4, 5, 6, 0, 1, 2, -1, -1, -1, -1, -1, -1, -1, -1,
+        9, 10, 4, 5, 6, 0, 1, 2, -1, -1, -1, -1, -1, -1, -1, -1,
+    );
+    let keys = _mm256_shuffle_epi8(fours, order);
+    Some((_mm256_extract_epi64(keys, 0) as u64, _mm256_extract_epi64(keys, 2) as u64))
+}
+
+/// The keys of the two IDs a line starts with: `key_of_padded` of `a`, which
+/// must not be empty, and of `b`, or 0 for an empty `b`. Both must be in the
+/// reader's buffer (16 readable bytes at each, whatever the lengths).
+///
+/// Nearly every line has two IDs that pack, and those are packed together
+/// (`pack_two_padded`). A line with an ID that does not pack, or with an empty
+/// one, takes both the slow way, one at a time.
+#[inline(always)]
+pub unsafe fn keys_of_two_padded(a: *const u8, a_len: usize, b: *const u8, b_len: usize) -> (Key, Key) {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    if let Some(keys) = pack_two_padded(a, a_len, b, b_len) {
+        return keys;
+    }
+    keys_of_two_apart(a, a_len, b, b_len)
+}
+
+/// `keys_of_two_padded` one ID at a time: what it is defined as.
+#[cfg_attr(all(target_arch = "x86_64", target_feature = "avx2"), cold, inline(never))]
+#[cfg_attr(not(all(target_arch = "x86_64", target_feature = "avx2")), inline(always))]
+unsafe fn keys_of_two_apart(a: *const u8, a_len: usize, b: *const u8, b_len: usize) -> (Key, Key) {
+    (key_of_padded(a, a_len), if b_len == 0 { 0 } else { key_of_padded(b, b_len) })
+}
+
 #[cold]
 #[inline(never)]
 fn intern(id: &[u8]) -> Key {
@@ -242,6 +330,77 @@ pub fn write_id(key: Key, out: &mut Vec<u8>) {
     } else {
         out.extend_from_slice(&EXOTIC.lock().unwrap().ids[(key >> 4) as usize]);
     }
+}
+
+/// The characters of a packed key, written as 16 bytes at `out`: the ID, then
+/// bytes that mean nothing.
+///
+/// `squeeze` backwards: the first eight characters' codes are spread one to a
+/// byte, and all ten are turned into characters at once. The codes rise with
+/// the characters (1 to 10 the digits, 11 to 36 the capitals, 37 `_`, 38 to 63
+/// the small letters), so a code's character is the code plus 47, plus the gaps
+/// of the alphabet it has passed.
+#[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+#[inline(always)]
+unsafe fn spell(key: Key, out: *mut u8) {
+    use std::arch::x86_64::*;
+    let first = _pdep_u64(key >> 16, 0x3f3f_3f3f_3f3f_3f3f).swap_bytes();
+    let last = ((key >> 10) & 63) | (((key >> 4) & 63) << 8);
+    let codes = _mm_set_epi64x(last as i64, first as i64);
+    let above = |code: i8| _mm_cmpgt_epi8(codes, _mm_set1_epi8(code));
+    let mut text = _mm_add_epi8(codes, _mm_set1_epi8((b'0' - 1) as i8));
+    text = _mm_add_epi8(text, _mm_and_si128(above(10), _mm_set1_epi8((b'A' - b'9' - 1) as i8)));
+    text = _mm_add_epi8(text, _mm_and_si128(above(36), _mm_set1_epi8((b'_' - b'Z' - 1) as i8)));
+    text = _mm_add_epi8(text, _mm_and_si128(above(37), _mm_set1_epi8((b'a' - b'_' - 1) as i8)));
+    _mm_storeu_si128(out as *mut __m128i, text);
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+#[inline(always)]
+unsafe fn spell(key: Key, out: *mut u8) {
+    let mut text = [0u8; 16];
+    for (at, byte) in text.iter_mut().take(10).enumerate() {
+        *byte = DECODE[((key >> (58 - 6 * at)) & 63) as usize];
+    }
+    (out as *mut [u8; 16]).write_unaligned(text);
+}
+
+/// Appends the ID a key stands for the way a PLAIN Parquet page holds a string:
+/// its length in four bytes, then its characters. `write_id` with the length
+/// in front, and for a packed key without a loop over the characters: a row of
+/// user_daily is a handful of instructions to name.
+#[inline(always)]
+pub fn push_plain(key: Key, out: &mut Vec<u8>) {
+    if !is_packed(key) {
+        return push_plain_exotic(key, out);
+    }
+    // Twenty bytes are written whatever the length; the ones past it are overwritten by the next ID.
+    if out.capacity() - out.len() < 20 {
+        make_room(out);
+    }
+    // The last character holds the key's lowest set bit, and characters are six bits each from bit 63 down.
+    let len = (69 - key.trailing_zeros() as usize) / 6;
+    unsafe {
+        let at = out.as_mut_ptr().add(out.len());
+        (at as *mut u32).write_unaligned((len as u32).to_le());
+        spell(key, at.add(4));
+        out.set_len(out.len() + 4 + len);
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn make_room(out: &mut Vec<u8>) {
+    out.reserve(20);
+}
+
+#[cold]
+#[inline(never)]
+fn push_plain_exotic(key: Key, out: &mut Vec<u8>) {
+    let exotic = EXOTIC.lock().unwrap();
+    let id = &exotic.ids[(key >> 4) as usize];
+    out.extend_from_slice(&(id.len() as u32).to_le_bytes());
+    out.extend_from_slice(id);
 }
 
 #[cold]
@@ -317,6 +476,158 @@ mod tests {
             assert_eq!(unsafe { pack_padded(buffer.as_ptr(), 10) }, pack(&buffer[..10]), "byte {byte} last");
         }
         assert!(packed > 100_000, "{packed} packed");
+    }
+
+    /// `keys_of_two_padded` against `key_of`, one ID at a time: any two IDs side
+    /// by side, of any lengths, with any bytes after them; every byte value in
+    /// every place of either; an empty second ID.
+    #[test]
+    fn two_keys_at_once_are_key_of_each() {
+        let mut state = 1234u64;
+        let mut next = move || {
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        };
+        let expected = |id: &[u8]| if id.is_empty() { 0 } else { key_of(id) };
+        // Two IDs that both pack are packed together, and no others are: the
+        // slow way gives the same keys, so only this tells the two ways apart.
+        let together = |a: &[u8], b: &[u8]| {
+            #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+            {
+                let both = (pack(a), pack(b));
+                let got = unsafe { pack_two_padded(a.as_ptr(), a.len(), b.as_ptr(), b.len()) };
+                assert_eq!(got, (both.0 != 0 && both.1 != 0).then_some(both), "together: {a:?} and {b:?}");
+            }
+            let _ = (a, b);
+        };
+        let alphabet = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz";
+        // Every pair of lengths, empty and too long among them, of IDs that are otherwise fine.
+        for a_len in 0..=13usize {
+            for b_len in 0..=13usize {
+                let buffer = *b"u123456789abcdefghijklmnopqrstuv,Zyxwvutsrqponmlkjihgfedcba987654";
+                let (a, b) = (&buffer[..a_len], &buffer[33..33 + b_len]);
+                together(a, b);
+                if a_len != 0 {
+                    assert_eq!(unsafe { keys_of_two_padded(a.as_ptr(), a_len, b.as_ptr(), b_len) }, (expected(a), expected(b)), "lengths {a_len} and {b_len}");
+                }
+            }
+        }
+        let (mut both_packed, mut one_exotic) = (0, 0);
+        for round in 0..400_000 {
+            let mut buffer = [0u8; 64];
+            // Mostly the alphabet, so that two IDs often both pack; sometimes its neighbours or anything at all.
+            let dirt = [200, 40, 12][round % 3];
+            for byte in &mut buffer {
+                let r = next();
+                *byte = match r % dirt {
+                    0 => b"/:@[^`{\x7f -\"\r\t,\n\0"[(r >> 8) as usize % 16],
+                    1 => (r >> 8) as u8,
+                    _ => alphabet[(r >> 8) as usize % alphabet.len()],
+                };
+            }
+            let (a_len, b_len) = (1 + (next() % 13) as usize, (next() % 14) as usize);
+            // The second ID anywhere after the first: next to it, overlapping its unused bytes, or far off.
+            let b_at = a_len + (next() % 30) as usize;
+            let (a, b) = (&buffer[..a_len], &buffer[b_at..b_at + b_len]);
+            let got = unsafe { keys_of_two_padded(a.as_ptr(), a_len, b.as_ptr(), b_len) };
+            assert_eq!(got, (expected(a), expected(b)), "round {round}: {a:?} and {b:?}");
+            together(a, b);
+            both_packed += usize::from(is_packed(got.0) && got.1 != 0 && is_packed(got.1));
+            one_exotic += usize::from(is_packed(got.0) != is_packed(got.1) && got.1 != 0);
+        }
+        assert!(both_packed > 50_000 && one_exotic > 50_000, "{both_packed} pairs packed, {one_exotic} with one exotic");
+        // Every byte value in every place of an ID of every length, as the first and as the second.
+        for len in 1..=11usize {
+            for place in 0..len {
+                for byte in 0..=255u8 {
+                    let mut buffer = [b'u'; 64];
+                    buffer[32..].fill(b'Z');
+                    buffer[place] = byte;
+                    let (a, b) = (&buffer[..len], &buffer[32..32 + len]);
+                    assert_eq!(unsafe { keys_of_two_padded(a.as_ptr(), len, b.as_ptr(), len) }, (expected(a), expected(b)), "byte {byte} at {place} of {len}");
+                    assert_eq!(unsafe { keys_of_two_padded(b.as_ptr(), len, a.as_ptr(), len) }, (expected(b), expected(a)), "byte {byte} at {place} of {len}, second");
+                    together(a, b);
+                    together(b, a);
+                    // The bytes after an ID are not part of it, whatever they are.
+                    buffer[place] = b'u';
+                    buffer[len] = byte;
+                    buffer[32 + len] = byte;
+                    let (a, b) = (&buffer[..len], &buffer[32..32 + len]);
+                    assert_eq!(unsafe { keys_of_two_padded(a.as_ptr(), len, b.as_ptr(), len) }, (expected(a), expected(b)), "byte {byte} after {len}");
+                    together(a, b);
+                }
+            }
+        }
+        // Every pair of characters next to each other, in every pair of places: the codes do not run into one another.
+        for &first in alphabet {
+            for &second in alphabet {
+                for place in 0..9usize {
+                    let mut buffer = [b'0'; 64];
+                    buffer[place] = first;
+                    buffer[place + 1] = second;
+                    buffer[32 + place] = second;
+                    buffer[33 + place] = first;
+                    let (a, b) = (&buffer[..10], &buffer[32..42]);
+                    assert_eq!(unsafe { keys_of_two_padded(a.as_ptr(), 10, b.as_ptr(), 10) }, (pack(a), pack(b)));
+                }
+            }
+        }
+    }
+
+    /// `push_plain` against `write_id`: every length, every character in every
+    /// place, exotic IDs in between, and a buffer that starts with no room.
+    #[test]
+    fn plain_spelling_is_write_id() {
+        let mut state = 7u64;
+        let mut next = move || {
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        };
+        let alphabet = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz";
+        let mut ids: Vec<Vec<u8>> = Vec::new();
+        for &character in alphabet {
+            for len in 1..=10 {
+                for place in 0..len {
+                    let mut id = vec![b'u'; len];
+                    id[place] = character;
+                    ids.push(id);
+                }
+                ids.push(vec![character; len]);
+            }
+        }
+        for round in 0..200_000 {
+            let len = 1 + (next() % 10) as usize;
+            let mut id: Vec<u8> = (0..len).map(|_| alphabet[(next() >> 8) as usize % alphabet.len()]).collect();
+            match round % 500 {
+                0 => id.extend_from_slice(b"_longer_than_ten"),
+                1 => id[0] = b' ',
+                2 => id = b"\xd9\xa2".to_vec(),
+                _ => {}
+            }
+            ids.push(id);
+        }
+        let (mut got, mut expected) = (Vec::new(), Vec::new());
+        let mut packed = 0;
+        for id in &ids {
+            let key = key_of(id);
+            packed += usize::from(is_packed(key));
+            push_plain(key, &mut got);
+            let at = expected.len();
+            expected.extend_from_slice(&[0; 4]);
+            write_id(key, &mut expected);
+            let len = (expected.len() - at - 4) as u32;
+            expected[at..at + 4].copy_from_slice(&len.to_le_bytes());
+            assert_eq!(&expected[at + 4..], &id[..], "write_id of {id:?}");
+            assert_eq!(got.len(), expected.len(), "after {id:?}");
+        }
+        assert!(got == expected);
+        assert!(packed > 200_000 && packed < ids.len(), "{packed} packed of {}", ids.len());
     }
 
     #[test]
