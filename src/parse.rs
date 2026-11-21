@@ -128,6 +128,7 @@ struct Sink<'a> {
     event_count: usize,
     waiting_clicks: [PendingClick; RING],
     click_count: usize,
+    dates: ts::Dates,
     stats: Stats,
 }
 
@@ -227,8 +228,8 @@ impl Lines for EventLines<'_, '_> {
         }
         let field = |i: usize| std::slice::from_raw_parts(data.add(from[i]), to[i] - from[i]);
         let event = key::key_of(field(0));
-        let ingest = ts::parse(data.add(from[3]), to[3] - from[3]);
-        let at_ms = ts::parse(data.add(from[2]), to[2] - from[2]);
+        let ingest = ts::parse(data.add(from[3]), to[3] - from[3], &mut sink.dates);
+        let at_ms = ts::parse(data.add(from[2]), to[2] - from[2], &mut sink.dates);
         let catalog = context.catalog;
 
         let mut alive = to[1] != from[1]
@@ -303,7 +304,7 @@ impl Lines for ClickLines<'_, '_> {
             return; // malformed, no click_id, or no user_id
         }
         let field = |i: usize| std::slice::from_raw_parts(data.add(from[i]), to[i] - from[i]);
-        let at_ms = ts::parse(data.add(from[3]), to[3] - from[3]);
+        let at_ms = ts::parse(data.add(from[3]), to[3] - from[3], &mut sink.dates);
         let catalog = context.catalog;
         if at_ms == ts::BAD || at_ms < context.epoch || at_ms >= catalog.window_end {
             return;
@@ -367,6 +368,7 @@ pub fn run(
             event_count: 0,
             waiting_clicks: [PendingClick::default(); RING],
             click_count: 0,
+            dates: ts::Dates::new(),
             stats: Stats::default(),
         };
         loop {

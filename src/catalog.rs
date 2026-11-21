@@ -145,7 +145,7 @@ fn manifest_time(text: &[u8], name: &str) -> i64 {
         let close = open + rest[open..].iter().position(|&b| b == b'"')?;
         Some(&rest[open..close])
     });
-    let parsed = value.map_or(ts::BAD, |v| unsafe { ts::parse(v.as_ptr(), v.len()) });
+    let parsed = value.map_or(ts::BAD, |v| unsafe { ts::parse_plain(v.as_ptr(), v.len()) });
     if parsed == ts::BAD {
         eprintln!("pipeline: manifest.json has no valid {name}");
         std::process::exit(2);
