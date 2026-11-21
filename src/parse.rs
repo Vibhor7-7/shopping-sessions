@@ -354,9 +354,9 @@ pub fn run(
         loop {
             let at = next.fetch_add(1, Ordering::Relaxed);
             if let Some(job) = event_jobs.get(at) {
-                reader::walk(&events[job.file as usize], job.offset, job.length, &mut buf, &mut EventLines(&mut sink));
+                reader::walk(&events[job.file as usize].file, job.offset, job.length, &mut buf, &mut EventLines(&mut sink));
             } else if let Some(job) = click_jobs.get(at - event_jobs.len()) {
-                reader::walk(&clicks[job.file as usize], job.offset, job.length, &mut buf, &mut ClickLines(&mut sink));
+                reader::walk(&clicks[job.file as usize].file, job.offset, job.length, &mut buf, &mut ClickLines(&mut sink));
             } else {
                 break;
             }

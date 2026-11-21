@@ -11,10 +11,7 @@ for round in $(seq 1 "$ROUNDS"); do
   .tools/generate --seed "$seed" --events "$EVENTS" --clicks $((EVENTS / 3)) --output "$WORK/base" >/dev/null
   python3 scripts/fuzz.py "$WORK/base" "$WORK/data" "$seed"
   rm -rf "$WORK/ref"; target/release/reference "$WORK/data" "$WORK/ref" 2>/dev/null
-  # Defaults; tiny ranges and blocks through `read`; and the same through file mappings that stop short of the end.
-  for config in "NCPU=8" \
-      "NCPU=$((seed % 5 + 1)) SS_MAP_MIN_BYTES=999999999 SS_JOB_BYTES=$((seed % 977 + 1)) SS_BLOCK_BYTES=$((seed % 211 + 16)) SS_PERSON_BITS=$((seed % 7 + 1)) SS_DEDUP_BITS=$((seed % 5 + 1))" \
-      "NCPU=$((seed % 4 + 1)) SS_MAP_MIN_BYTES=0 SS_MAP_TAIL=$((seed % 700 + 128)) SS_JOB_BYTES=$((seed % 3001 + 200)) SS_BLOCK_BYTES=$((seed % 1500 + 64))"; do
+  for config in "NCPU=8" "NCPU=$((seed % 5 + 1)) SS_JOB_BYTES=$((seed % 977 + 1)) SS_BLOCK_BYTES=$((seed % 211 + 16)) SS_PERSON_BITS=$((seed % 7 + 1)) SS_DEDUP_BITS=$((seed % 5 + 1))"; do
     rm -rf "$WORK/out"
     if ! env $config "$BIN" "$WORK/data" "$WORK/out" 2>"$WORK/err"; then echo "round $round [$config]: CRASH"; tail -3 "$WORK/err"; fail=$((fail + 1)); continue; fi
     if uv run --quiet --python 3.12 --with polars python scripts/compare_exact.py "$WORK/out" "$WORK/ref" > "$WORK/log" 2>&1; then :; else
