@@ -271,8 +271,8 @@ fn main() {
         pools.copies.records() + pools.events.records() + pools.clicks.records(),
     );
     eprintln!(
-        "pipeline: inside links: catalog done at {catalog_ms:.1} ms; link parse {:.1}, join {:.1}, name {:.1} ms; peak memory {} MB",
-        links.timing[0], links.timing[1], links.timing[2], sys::peak_memory_mb(),
+        "pipeline: inside links: catalog done at {catalog_ms:.1} ms; link parse {:.1}, join {:.1}, name {:.1} ms; peak memory {} MB; scan {}",
+        links.timing[0], links.timing[1], links.timing[2], sys::peak_memory_mb(), scan::chosen().name(),
     );
     // Wall-clock times, so whoever starts the container can see how long it took to
     // reach `main` and how long the container outlived it.

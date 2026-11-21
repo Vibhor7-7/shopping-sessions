@@ -12,7 +12,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: CPU
-        run: grep -m1 'model name' /proc/cpuinfo; grep -m1 -o -w -E 'avx2|avx512f' /proc/cpuinfo | sort -u | tr '\n' ' '
+        run: grep -m1 'model name' /proc/cpuinfo; grep -m1 -o -w -E 'avx2|avx512f|avx512vbmi2' /proc/cpuinfo | sort -u | tr '\n' ' '
       - name: Build the image
         run: docker build -t shopping-sessions:latest .
       - name: Fixtures, with the scorer's flags
@@ -23,27 +23,38 @@ jobs:
         run: |
           pip install --quiet polars
           python3 scripts/run_fixtures.py fixtures -- scripts/docker_run.sh
+          # Which delimiter scan this machine's CPU got (src/scan.rs): the fixtures above ran on it.
+          scripts/docker_run.sh fixtures/A1/input out 2>&1 | grep -o 'scan [a-z0-9-]*$'
   native:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Unit tests, baseline x86-64 and the scorer's AVX2 build
+        # The delimiter scan has loops that only some CPUs can run (src/scan.rs), and
+        # hosted runners differ: the test log says which of them this run tested.
         run: |
+          grep -m1 'model name' /proc/cpuinfo; grep -m1 -o -w -E 'avx2|avx512f|avx512vbmi2' /proc/cpuinfo | sort -u | tr '\n' ' '; echo
           cargo test --release
-          RUSTFLAGS="-C target-cpu=x86-64-v3" cargo test --release
-      - name: Fixtures, pipeline and reference, with tiny read blocks too
+          RUSTFLAGS="-C target-cpu=x86-64-v3" cargo test --release -- --nocapture
+      - name: Fixtures, pipeline and reference, with tiny read blocks too, under every scan loop
+        # SS_SCAN asks for a loop; one this CPU cannot run falls back to the narrow one, and the line printed says so.
         run: |
           pip install --quiet polars
           RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release
-          python3 scripts/run_fixtures.py fixtures -- target/release/pipeline
-          SS_JOB_BYTES=7 SS_BLOCK_BYTES=17 python3 scripts/run_fixtures.py fixtures -- target/release/pipeline
+          for scan in "" narrow 256 512; do
+            echo "SS_SCAN=$scan: $(SS_SCAN=$scan target/release/pipeline fixtures/A1/input out 2>&1 | grep -o 'scan [a-z0-9-]*$')"
+            SS_SCAN=$scan python3 scripts/run_fixtures.py fixtures -- target/release/pipeline
+            SS_SCAN=$scan SS_JOB_BYTES=7 SS_BLOCK_BYTES=17 python3 scripts/run_fixtures.py fixtures -- target/release/pipeline
+          done
           scripts/check_reference.sh
       - name: Pipeline and reference agree on a stand-in dataset
         run: |
           cargo build --release --bin synth 2>&1 | tail -1
           target/release/synth --events 1500000 --clicks 400000 --seed 21 --output data
           target/release/reference data ref
-          for settings in "NCPU=4" "NCPU=3 SS_PERSON_BITS=3 SS_DEDUP_BITS=11" "NCPU=4 SS_JOB_BYTES=40000 SS_BLOCK_BYTES=3000"; do
+          for settings in "NCPU=4" "NCPU=3 SS_PERSON_BITS=3 SS_DEDUP_BITS=11" "NCPU=4 SS_JOB_BYTES=40000 SS_BLOCK_BYTES=3000" \
+              "NCPU=4 SS_SCAN=narrow" "NCPU=4 SS_SCAN=256" "NCPU=4 SS_SCAN=512" "NCPU=2 SS_SCAN=512 SS_JOB_BYTES=40000 SS_BLOCK_BYTES=3000" \
+              "NCPU=2 SS_SCAN=256 SS_JOB_BYTES=40000 SS_BLOCK_BYTES=3000"; do
             rm -rf out; env $settings target/release/pipeline data out 2>/dev/null
             echo "[$settings] $(python3 scripts/compare_exact.py out ref | tail -1)"
             python3 scripts/compare_exact.py out ref | tail -1 | grep -q MATCH
