@@ -43,7 +43,9 @@ jobs:
           for package in "linux-tools-$(uname -r)" linux-tools-azure linux-tools-generic; do
             sudo apt-get install -y -qq "$package" > /dev/null 2>&1 || echo "no $package"
           done
-          PERF=$(find /usr/lib -name perf -type f 2>/dev/null | head -1); echo "perf: ${PERF:-none}; kernel $(uname -r)"
+          PERF=$(find /usr/lib /usr/bin -name perf \( -type f -o -type l \) 2>/dev/null | grep -v '^/usr/bin' | head -1)
+          [ -n "$PERF" ] || PERF=$(command -v perf || true)
+          echo "perf: ${PERF:-none}; kernel $(uname -r)"; ls -d /usr/lib/linux*tools* 2>/dev/null | head -5
           [ -n "$PERF" ] || exit 0
           sudo sysctl -q kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0 || true
           grep -m1 'model name' /proc/cpuinfo
