@@ -11,10 +11,12 @@
 - Every submission except the entered one has a "Pick as our final entry" button. **Never press it.** The best score is entered in the final without anyone choosing.
 - Scores of two machines can differ by up to about 20%, the page says; runs under 20 s are timed 3 times and the median counts.
 - Submissions close Sunday 2026-11-22 at 11:00 AM EST.
+- After Submit the page says "Received. Your receipt is BB-…", the form empties, and the new submission heads the list as "Scoring" (first "Fetching"); it turns to "Scored" with its time without a reload. The counter above the form then reads "1 of 2 left this hour" and when the next one frees up (an hour after the submission).
+- The form's fields take a value set directly (no typing needed); the commit field shows the end of a 40-character hash, which is all that fits.
 
 ## Submissions
 
-Rows up to `fac219f` were read off the page on 2026-11-21; the user made them by hand.
+Rows up to `fac219f` were read off the page on 2026-11-21; the user made them by hand. Rows after it are the unattended cycles'.
 
 | When (EST) | ID | Commit | Result | Score | Missing / extra / differing rows | Note |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -25,7 +27,8 @@ Rows up to `fac219f` were read off the page on 2026-11-21; the user made them by
 | Fri 11:10 PM | BB-2AF57432 | `c24627f787beead6f4e68dd5056c64dbd9beedb7` | Scored | 0.97 s | none | |
 | Fri 11:49 PM | BB-9603EAD8 | `c6b4e3e1f74c2fd49ad1a9667d832563a5188de1` | Scored | 0.82 s | none | |
 | Sat 2026-11-21, 12:26 AM | BB-5C420AD1 | `7a5ddaf05a8aa81bd381832f3fff484c5ae6622a` | Scored | 0.80 s | none | |
-| Sat 12:53 AM | BB-DEE36DC7 | `fac219fce1a16f657f26dacc27a532c5fed06d8b` | Scored | **0.78 s** | none | Entered in the final as the best score |
+| Sat 12:53 AM | BB-DEE36DC7 | `fac219fce1a16f657f26dacc27a532c5fed06d8b` | Scored | 0.78 s | none | Was the entry for the final until 3:23 AM |
+| Sat 3:23 AM | BB-34D7EB6F | `8527c64796f2913b4ba12a14e46291c19d2fbad8` | Scored | **0.76 s** | none | Submitted by the unattended cycle 4 (experiments 27 to 29). Scored by the time the page was looked at again, 8 minutes later. Entered in the final as the best score, by the page, without anyone choosing. 15th of 208 teams; the board's best is 0.42 s |
 
 ## Not submitted
 
