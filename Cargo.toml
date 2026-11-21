@@ -18,6 +18,12 @@ path = "src/main.rs"
 name = "reference"
 path = "src/bin/reference.rs"
 
+# A stand-in dataset generator for benchmarks on CI, where the organizers'
+# generator is not available. Never shipped in the image.
+[[bin]]
+name = "synth"
+path = "src/bin/synth.rs"
+
 [profile.release]
 opt-level = 3
 lto = "fat"

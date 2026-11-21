@@ -1,0 +1,91 @@
+name: bench
+# Times this commit against another on a real x86-64 machine, the closest free
+# thing to the scorer's Xeon. Both are built the way the scorer builds them
+# (the Dockerfile's build stage), then run interleaved on a stand-in dataset
+# from src/bin/synth.rs. Start it by hand:
+#   gh workflow run bench.yml -f base=<commit> [-f events=20000000] [-f env_a=... -f env_b=...]
+on:
+  workflow_dispatch:
+    inputs:
+      base:
+        description: Commit to compare against (A); this commit is B
+        required: true
+      events:
+        description: Events in the dataset
+        default: "20000000"
+      runs:
+        description: Runs of each side
+        default: "7"
+      env_a:
+        description: Settings for A, e.g. SS_BLOCK_BYTES=131072
+        default: ""
+      env_b:
+        description: Settings for B
+        default: ""
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Machine
+        run: |
+          lscpu | grep -E 'Model name|^CPU\(s\)|Thread|Core|L1d|L2|L3|Flags' | sed -E 's/(Flags:).*/\1 (see below)/'
+          grep -m1 -o -w -E 'avx2|bmi2|avx512f|avx512bw|avx512vbmi2' /proc/cpuinfo | sort -u | tr '\n' ' '; echo
+          cat /sys/kernel/mm/transparent_hugepage/enabled; free -g | sed -n 2p; df -h . | tail -1
+      - name: Build both the way the scorer does
+        run: |
+          mkdir -p bin
+          docker build -q --target build -t head .
+          docker cp "$(docker create head)":/pipeline bin/head
+          git worktree add -q ../base "${{ inputs.base }}"
+          docker build -q --target build -t base ../base
+          docker cp "$(docker create base)":/pipeline bin/base
+          ls -la bin
+      - name: Dataset
+        run: |
+          cargo build --release --bin synth --bin reference 2>&1 | tail -1
+          target/release/synth --events 2000000 --clicks 500000 --seed 5 --output small
+          target/release/synth --events ${{ inputs.events }} --clicks $(( ${{ inputs.events }} / 4 )) --seed 9 --output data
+          du -sh data/events data/clicks data/links
+      - name: Both agree with the reference on a 2M-event set
+        run: |
+          pip install --quiet polars
+          target/release/reference small ref
+          for side in base head; do
+            rm -rf out; bin/$side small out 2>/dev/null
+            echo "$side: $(python3 scripts/compare_exact.py out ref | tail -1)"
+          done
+          rm -rf out; bin/head small out 2>/dev/null; python3 scripts/compare_exact.py out ref | tail -1 | grep -q MATCH
+      - name: A/B, 4 threads
+        env:
+          NCPU: 4
+          ENV_A: ${{ inputs.env_a }}
+          ENV_B: ${{ inputs.env_b }}
+        run: |
+          cat data/events/* data/clicks/* data/links/* > /dev/null
+          scripts/ab.sh data bin/base bin/head ${{ inputs.runs }}
+      - name: A/B again, to see how much two measurements of one thing differ
+        env:
+          NCPU: 4
+          ENV_A: ${{ inputs.env_a }}
+          ENV_B: ${{ inputs.env_b }}
+        run: scripts/ab.sh data bin/base bin/head ${{ inputs.runs }}
+      - name: One thread, where the work per line shows without the other threads
+        env:
+          NCPU: 1
+          ENV_A: ${{ inputs.env_a }}
+          ENV_B: ${{ inputs.env_b }}
+        run: scripts/ab.sh data bin/base bin/head 3
+      - name: The whole container, as the scorer times it
+        run: |
+          docker build -q -t shopping-sessions:latest .
+          for i in 1 2 3 4 5; do
+            rm -rf out
+            start=$(date +%s%N)
+            CPUS=4 MEM=12g scripts/docker_run.sh data out 2> err.log
+            end=$(date +%s%N)
+            echo "container wall $(( (end - start) / 1000000 )) ms; inside: $(grep -o 'total [0-9.]* ms' err.log)"
+          done
