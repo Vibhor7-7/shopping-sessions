@@ -37,7 +37,7 @@ The test scripts need `uv` (they run `uv run --with polars`); set `PY=python3` i
 
 Things that make it fast:
 
-- **IDs are 64-bit keys.** An ID of up to 10 characters from `[0-9A-Z_a-z]` packs into a `u64` whose integer order is the ID's byte order, 16 bytes at a time (`src/key.rs`). Every ID the generator writes fits. Any other ID (a space, a tab, a `\r`, too long) is interned on a slow, exact path, so the rules hold for any input.
+- **IDs are 64-bit keys.** An ID of up to 10 characters from `[0-9A-Z_a-z]` packs into a `u64` whose integer order is the ID's byte order, 16 bytes at a time (`src/key.rs`); the two IDs a line starts with are packed together, a half of one 256-bit register each. Every ID the generator writes fits. Any other ID (a space, a tab, a `\r`, too long) is interned on a slow, exact path, so the rules hold for any input.
 - **Dedup without a second pass over events.** A copy that would fail validation gets no event record, so if it is the earliest copy, dropping the other copies' records leaves nothing: "dedup comes before validation" for free.
 - **Clicks need no dedup.** Copies of a click are identical, so they credit the same campaign and assist as the same campaign once.
 - **No branch the CPU cannot predict on the hot path.** Which of the three forms a `ts` takes, and whether a user ID is linked, are coin tosses from line to line; both answers are computed and selected. The date part of a timestamp is a table hit.
