@@ -85,15 +85,6 @@ impl Context<'_> {
     }
 }
 
-#[derive(Default, Clone, Copy)]
-pub struct Stats {
-    pub event_lines: u64,
-    pub event_copies: u64,
-    pub event_candidates: u64,
-    pub click_lines: u64,
-    pub clicks: u64,
-}
-
 /// How many lines pass between asking for a user's slot in the link table and
 /// reading it. The table is far larger than the cache, so every lookup is a
 /// memory fetch; started this early, the fetches overlap instead of each one
@@ -103,12 +94,14 @@ const RING: usize = 16;
 /// A parsed event copy waiting for its user's link-table slot to arrive.
 #[derive(Clone, Copy, Default)]
 struct PendingEvent {
+    /// 0 for a copy that would not survive: it leaves only its dedup record.
     user: Key,
     event: Key,
     ts: u32,
     purchase: u32,
     ingest: u32,
-    alive: bool,
+    /// Where the user's lookup in the link table starts.
+    home: u32,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -117,6 +110,7 @@ struct PendingClick {
     click: Key,
     ts: u32,
     campaign: u32,
+    home: u32,
 }
 
 struct Sink<'a> {
@@ -129,7 +123,6 @@ struct Sink<'a> {
     waiting_clicks: [PendingClick; RING],
     click_count: usize,
     dates: ts::Dates,
-    stats: Stats,
 }
 
 impl Sink<'_> {
@@ -138,8 +131,8 @@ impl Sink<'_> {
     fn settle_event(&mut self, pending: PendingEvent) {
         let context = self.context;
         let mut at = NO_EVENT;
-        if pending.alive {
-            let person = context.links.person(pending.user);
+        if pending.user != 0 {
+            let person = context.links.person_at(pending.user, pending.home);
             let partition = (sys::mix(person) >> context.person_shift) as usize;
             at = self.events.push(partition, Event { person, ts: pending.ts, purchase: pending.purchase });
         }
@@ -150,7 +143,7 @@ impl Sink<'_> {
     #[inline(always)]
     fn settle_click(&mut self, pending: PendingClick) {
         let context = self.context;
-        let person = context.links.person(pending.user);
+        let person = context.links.person_at(pending.user, pending.home);
         let partition = (sys::mix(person) >> context.person_shift) as usize;
         self.clicks.push(partition, Click { person, click: pending.click, ts: pending.ts, campaign: pending.campaign });
     }
@@ -208,7 +201,6 @@ impl Lines for EventLines<'_, '_> {
     unsafe fn line(&mut self, data: *const u8, start: usize, commas: *const u32, end: usize, quotes: u32) {
         let sink = &mut *self.0;
         let context = sink.context;
-        sink.stats.event_lines += 1;
         let mut from = [0usize; 7];
         let mut to = [0usize; 7];
         from[0] = start;
@@ -227,7 +219,7 @@ impl Lines for EventLines<'_, '_> {
             return;
         }
         let event = key::key_of_padded(data.add(from[0]), to[0] - from[0]);
-        let ingest = ts::parse(data.add(from[3]), to[3] - from[3], &mut sink.dates);
+        let ingest = ts::parse_utc(data.add(from[3]), to[3] - from[3], &mut sink.dates);
         let at_ms = ts::parse(data.add(from[2]), to[2] - from[2], &mut sink.dates);
         let catalog = context.catalog;
 
@@ -255,11 +247,10 @@ impl Lines for EventLines<'_, '_> {
                 alive = false;
             }
         }
-        let mut user = 0;
+        let (mut user, mut home) = (0, 0);
         if alive {
             user = key::key_of_padded(data.add(from[1]), to[1] - from[1]);
-            context.links.prefetch(user);
-            sink.stats.event_candidates += 1;
+            home = context.links.prefetch(user);
         }
         let ingest = if ingest == ts::BAD {
             u32::MAX
@@ -272,9 +263,8 @@ impl Lines for EventLines<'_, '_> {
             sink.settle_event(ready);
         }
         sink.waiting_events[slot] =
-            PendingEvent { user, event, ts: at_ms.wrapping_sub(context.epoch) as u32, purchase, ingest, alive };
+            PendingEvent { user, event, ts: at_ms.wrapping_sub(context.epoch) as u32, purchase, ingest, home };
         sink.event_count += 1;
-        sink.stats.event_copies += 1;
     }
 }
 
@@ -285,7 +275,6 @@ impl Lines for ClickLines<'_, '_> {
     unsafe fn line(&mut self, data: *const u8, start: usize, commas: *const u32, end: usize, quotes: u32) {
         let sink = &mut *self.0;
         let context = sink.context;
-        sink.stats.click_lines += 1;
         let mut from = [0usize; 4];
         let mut to = [0usize; 4];
         from[0] = start;
@@ -312,16 +301,15 @@ impl Lines for ClickLines<'_, '_> {
             return;
         }
         let user = key::key_of_padded(data.add(from[1]), to[1] - from[1]);
-        context.links.prefetch(user);
+        let home = context.links.prefetch(user);
         let slot = sink.click_count & (RING - 1);
         if sink.click_count >= RING {
             let ready = sink.waiting_clicks[slot];
             sink.settle_click(ready);
         }
         sink.waiting_clicks[slot] =
-            PendingClick { user, click: key::key_of_padded(data.add(from[0]), to[0] - from[0]), ts: (at_ms - context.epoch) as u32, campaign };
+            PendingClick { user, click: key::key_of_padded(data.add(from[0]), to[0] - from[0]), ts: (at_ms - context.epoch) as u32, campaign, home };
         sink.click_count += 1;
-        sink.stats.clicks += 1;
     }
 }
 
@@ -336,7 +324,6 @@ pub struct Parsed {
     pub copies: Chunks,
     pub events: Chunks,
     pub clicks: Chunks,
-    pub stats: Stats,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -367,7 +354,6 @@ pub fn run(
             waiting_clicks: [PendingClick::default(); RING],
             click_count: 0,
             dates: ts::Dates::new(),
-            stats: Stats::default(),
         };
         loop {
             let at = next.fetch_add(1, Ordering::Relaxed);
@@ -384,7 +370,6 @@ pub fn run(
             copies: sink.copies.finish(),
             events: sink.events.finish(),
             clicks: sink.clicks.finish(),
-            stats: sink.stats,
         }
     })
 }

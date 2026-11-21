@@ -33,16 +33,40 @@ impl Links {
         home(id, self.shift)
     }
 
-    /// Asks the CPU to fetch the slot `person(id)` will look at.
+    /// Where the lookup of `id` starts, and a request to the CPU to fetch that
+    /// line now: the lookup itself comes some lines later (`person_at`).
     #[inline(always)]
-    pub fn prefetch(&self, id: Key) {
-        sys::prefetch(unsafe { self.table.0.add(self.home(id)) });
+    pub fn prefetch(&self, id: Key) -> u32 {
+        let home = self.home(id);
+        sys::prefetch(unsafe { self.table.0.add(home) });
+        home as u32
     }
 
-    /// The name of the person `id` belongs to.
+    /// The name of the person `id` belongs to; `home` is what `prefetch(id)` returned.
+    ///
+    /// Whether an ID is linked is a coin toss from line to line, so the four
+    /// slots of its cache line are compared at once and the answer selected,
+    /// rather than branched on. Only an ID pushed out of its line (rare)
+    /// takes the loop.
     #[inline(always)]
-    pub fn person(&self, id: Key) -> Key {
-        let mut at = self.home(id);
+    pub fn person_at(&self, id: Key, home: u32) -> Key {
+        unsafe {
+            let line = self.table.0.add(home as usize) as *const u64; // id, person, id, person, ...
+            let (found, empty) = line_masks(line, id);
+            let stop = found | empty;
+            if stop != 0 {
+                let slot = stop.trailing_zeros() as usize; // the first slot that is `id` or free
+                let person = *line.add(2 * slot + 1);
+                let is_found = (found >> slot) & 1 != 0;
+                return if is_found { person } else { id };
+            }
+            self.person_from(id, (home as usize + 4) & self.mask)
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn person_from(&self, id: Key, mut at: usize) -> Key {
         loop {
             let slot = unsafe { *self.table.0.add(at) };
             if slot[0] == id {
@@ -54,6 +78,35 @@ impl Links {
             at = (at + 1) & self.mask;
         }
     }
+}
+
+/// For the four slots at `line`: which hold `id`, and which are free, one bit a slot.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+unsafe fn line_masks(line: *const u64, id: Key) -> (u32, u32) {
+    use std::arch::x86_64::*;
+    let low = _mm256_loadu_si256(line as *const __m256i);
+    let high = _mm256_loadu_si256(line.add(4) as *const __m256i);
+    let wanted = _mm256_set1_epi64x(id as i64);
+    let zero = _mm256_setzero_si256();
+    // One bit per 64-bit lane; lanes 0 and 2 are IDs, 1 and 3 the people they belong to.
+    let bits = |v: __m256i| _mm256_movemask_pd(_mm256_castsi256_pd(v)) as u32;
+    let ids = |lanes: u32| (lanes & 1) | ((lanes >> 1) & 2);
+    let found = ids(bits(_mm256_cmpeq_epi64(low, wanted))) | (ids(bits(_mm256_cmpeq_epi64(high, wanted))) << 2);
+    let empty = ids(bits(_mm256_cmpeq_epi64(low, zero))) | (ids(bits(_mm256_cmpeq_epi64(high, zero))) << 2);
+    (found, empty)
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+#[inline(always)]
+unsafe fn line_masks(line: *const u64, id: Key) -> (u32, u32) {
+    let (mut found, mut empty) = (0u32, 0u32);
+    for slot in 0..4 {
+        let held = *line.add(2 * slot);
+        found |= u32::from(held == id) << slot;
+        empty |= u32::from(held == 0) << slot;
+    }
+    (found, empty)
 }
 
 #[inline(always)]

@@ -237,22 +237,17 @@ fn main() {
     let people_at = started.elapsed();
     let campaign_rows = write_campaign_daily(&campaign_folder, &catalog, &cells, first_day, days);
 
-    let mut stats = parse::Stats::default();
-    for thread in &parsed {
-        stats.event_lines += thread.stats.event_lines;
-        stats.event_copies += thread.stats.event_copies;
-        stats.event_candidates += thread.stats.event_candidates;
-        stats.click_lines += thread.stats.click_lines;
-        stats.clicks += thread.stats.clicks;
-    }
+    let records = |chunks: fn(&parse::Parsed) -> &pool::Chunks| -> usize {
+        parsed.iter().map(|thread| chunks(thread).iter().flatten().map(|chunk| chunk.1 as usize).sum::<usize>()).sum()
+    };
     let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
     eprintln!(
         "pipeline: {threads} threads, {} event files ({} MB), {} click files ({} MB), {} linked ids; 2^{person_bits} person and 2^{dedup_bits} dedup partitions",
         events.len(), event_bytes >> 20, clicks.len(), click_bytes >> 20, links.ids,
     );
     eprintln!(
-        "pipeline: {} event lines, {} copies, {} candidates, {} dropped as duplicates; {} click lines, {} valid; {} sessions; {} user rows, {campaign_rows} campaign rows",
-        stats.event_lines, stats.event_copies, stats.event_candidates, dropped, stats.click_lines, stats.clicks, sessions,
+        "pipeline: {} event copies, {} of them candidates, {} dropped as duplicates; {} valid clicks; {} sessions; {} user rows, {campaign_rows} campaign rows",
+        records(|t| &t.copies), records(|t| &t.events), dropped, records(|t| &t.clicks), sessions,
         user_rows.iter().sum::<usize>(),
     );
     eprintln!(

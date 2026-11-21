@@ -187,8 +187,10 @@ impl Group {
             }
         }
         let live = Self::offsets(&mut self.event_cursor, &mut self.event_start);
+        // Every slot is written below, exactly once: no need to zero them first.
         self.events.clear();
-        self.events.resize(live, 0);
+        self.events.reserve(live);
+        unsafe { self.events.set_len(live) };
         let mut at = 0;
         for chunks in events {
             for &(start, len) in &chunks[partition] {
@@ -225,7 +227,8 @@ impl Group {
         }
         let kept = Self::offsets(&mut self.click_cursor, &mut self.click_start);
         self.clicks.clear();
-        self.clicks.resize(kept, [0, 0]);
+        self.clicks.reserve(kept);
+        unsafe { self.clicks.set_len(kept) };
         let mut at = 0;
         for chunks in clicks {
             for &(start, len) in &chunks[partition] {

@@ -155,8 +155,10 @@ impl Dates {
     }
 }
 
+#[cfg(not(all(target_arch = "x86_64", target_feature = "sse4.1")))]
 const ZEROS: u64 = 0x3030_3030_3030_3030;
 /// Added to a byte that should be 0 to 9: the top bit stays clear only if it is.
+#[cfg(not(all(target_arch = "x86_64", target_feature = "sse4.1")))]
 const UP_TO_NINE: u64 = 0x7676_7676_7676_7676;
 const TOP_BITS: u64 = 0x8080_8080_8080_8080;
 
@@ -188,6 +190,7 @@ unsafe fn civil_seconds_fast(p: *const u8, dates: &mut Dates) -> i64 {
 }
 
 /// Eight digit values, the first in the lowest byte, as one number (Lemire's three multiplies).
+#[cfg(not(all(target_arch = "x86_64", target_feature = "sse4.1")))]
 #[inline(always)]
 fn eight_digits(v: u64) -> u64 {
     let v = (v & 0x0f0f_0f0f_0f0f_0f0f).wrapping_mul(2_561) >> 8;
@@ -198,17 +201,139 @@ fn eight_digits(v: u64) -> u64 {
 /// Thirteen digits: epoch milliseconds as they are written from 2001 to 2286.
 #[inline(always)]
 unsafe fn thirteen_digits(p: *const u8) -> i64 {
-    let first = (p as *const u64).read_unaligned() ^ ZEROS; // digits 0 to 7
-    let last = (p.add(5) as *const u64).read_unaligned() ^ ZEROS; // digits 5 to 12
-    if ((first | first.wrapping_add(UP_TO_NINE)) | (last | last.wrapping_add(UP_TO_NINE))) & TOP_BITS != 0 {
-        return BAD;
+    let (value, ok) = thirteen(p);
+    if ok {
+        value
+    } else {
+        BAD
     }
-    (eight_digits(first) * 100_000 + eight_digits(last) % 100_000) as i64
 }
 
-/// Epoch milliseconds of the `len` bytes at `p`, or BAD. Reads at most `len` bytes.
+/// The 13 bytes at `p` as a number, and whether they are all digits. Never
+/// branches, so it can be worked out before the form of the text is known.
+/// Reads the three bytes before `p` too (the reader's buffer always has them).
+#[cfg(all(target_arch = "x86_64", target_feature = "sse4.1"))]
+#[inline(always)]
+unsafe fn thirteen(p: *const u8) -> (i64, bool) {
+    use std::arch::x86_64::*;
+    // Sixteen bytes ending at the last digit; the first three are not ours and are zeroed.
+    let bytes = _mm_loadu_si128(p.sub(3) as *const __m128i);
+    let ours = _mm_setr_epi8(0, 0, 0, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1);
+    let digits = _mm_and_si128(_mm_sub_epi8(bytes, _mm_set1_epi8(b'0' as i8)), ours);
+    let over = _mm_subs_epu8(digits, _mm_set1_epi8(9));
+    let ok = _mm_testz_si128(over, over) != 0;
+    // Pairs, fours, eights: each step a multiply-add of neighbours.
+    let pairs = _mm_maddubs_epi16(digits, _mm_setr_epi8(10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1));
+    let fours = _mm_madd_epi16(pairs, _mm_setr_epi16(100, 1, 100, 1, 100, 1, 100, 1));
+    let fours = _mm_packus_epi32(fours, fours);
+    let eights = _mm_madd_epi16(fours, _mm_setr_epi16(10_000, 1, 10_000, 1, 10_000, 1, 10_000, 1));
+    let high = _mm_cvtsi128_si32(eights) as u32 as u64; // digits 0 to 4
+    let low = _mm_extract_epi32(eights, 1) as u32 as u64; // digits 5 to 12
+    ((high * 100_000_000 + low) as i64, ok)
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "sse4.1")))]
+#[inline(always)]
+unsafe fn thirteen(p: *const u8) -> (i64, bool) {
+    let first = (p as *const u64).read_unaligned() ^ ZEROS; // digits 0 to 7
+    let last = (p.add(5) as *const u64).read_unaligned() ^ ZEROS; // digits 5 to 12
+    let ok = ((first | first.wrapping_add(UP_TO_NINE)) | (last | last.wrapping_add(UP_TO_NINE))) & TOP_BITS == 0;
+    ((eight_digits(first) * 100_000 + eight_digits(last) % 100_000) as i64, ok)
+}
+
+/// Seconds for each pair of digit values `tens | ones << 4`, or a value too large to be a time of day.
+#[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+const fn clock_table(limit: u32, unit: u32) -> [u32; 256] {
+    let mut table = [1 << 20; 256];
+    let mut at = 0;
+    while at < 256 {
+        let (tens, ones) = ((at & 15) as u32, (at >> 4) as u32);
+        if tens <= 9 && ones <= 9 && tens * 10 + ones <= limit {
+            table[at] = (tens * 10 + ones) * unit;
+        }
+        at += 1;
+    }
+    table
+}
+#[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+static HOURS: [u32; 256] = clock_table(23, 3_600);
+#[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+static MINUTES: [u32; 256] = clock_table(59, 60);
+#[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+static SECONDS: [u32; 256] = clock_table(59, 1);
+
+/// `HH:MM:SS` at `p` as seconds since midnight, and whether it is a real time of day. Never branches.
+#[inline(always)]
+unsafe fn time_of_day(p: *const u8) -> (i64, bool) {
+    let time = (p as *const u64).read_unaligned() ^ 0x3030_3a30_303a_3030;
+    let wrong = (time | time.wrapping_add(0x7676_7f76_767f_7676)) & TOP_BITS;
+    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+    {
+        // The six digit values side by side, then one table read per pair.
+        let digits = std::arch::x86_64::_pext_u64(time, 0x0f0f_000f_0f00_0f0f) as usize;
+        let seconds = *HOURS.get_unchecked(digits & 255)
+            + *MINUTES.get_unchecked((digits >> 8) & 255)
+            + *SECONDS.get_unchecked((digits >> 16) & 255);
+        (i64::from(seconds), (wrong == 0) & (seconds < 86_400))
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+    {
+        let hour = (time & 15) * 10 + ((time >> 8) & 15);
+        let minute = ((time >> 24) & 15) * 10 + ((time >> 32) & 15);
+        let second = ((time >> 48) & 15) * 10 + ((time >> 56) & 15);
+        ((hour * 3_600 + minute * 60 + second) as i64, (wrong == 0) & (hour <= 23) & (minute <= 59) & (second <= 59))
+    }
+}
+
+/// `YYYY-MM-DDTHH:MM:SS` at `p` as epoch seconds, if its date is already in the
+/// table and the rest is well formed. Never branches and never learns a date.
+#[inline(always)]
+unsafe fn civil_known(p: *const u8, dates: &Dates) -> (i64, bool) {
+    let head = (p as *const u64).read_unaligned();
+    let day = (p.add(8) as *const u16).read_unaligned();
+    let slot = (((day & 15) * 10 + ((day >> 8) & 15)) & 31) as usize;
+    let known = dates.slots.get_unchecked(slot);
+    let (seconds, time_ok) = time_of_day(p.add(11));
+    let ok = (known.head == head) & (known.day == day) & (known.midnight != BAD) & (*p.add(10) == b'T') & time_ok;
+    (known.midnight.wrapping_add(seconds), ok)
+}
+
+/// Epoch milliseconds of the `len` bytes at `p`, or BAD.
+///
+/// Which form a `ts` takes is as good as random from line to line, so the two
+/// common ones (13 digits; UTC on a date already seen) are both worked out
+/// without a branch and the answer picked by the length. Everything else, one
+/// line in ten, goes to `parse_general`. `p` must be in the reader's buffer:
+/// 3 bytes before it and 32 after are read whatever `len` is.
 #[inline(always)]
 pub unsafe fn parse(p: *const u8, len: usize, dates: &mut Dates) -> i64 {
+    let (digits, digits_ok) = thirteen(p);
+    let (seconds, civil_ok) = civil_known(p, dates);
+    let is_digits = len == 13;
+    let is_utc = (len == 20) & (*p.add(19) == b'Z');
+    if (is_digits & digits_ok) | (is_utc & civil_ok) {
+        let pick = (is_digits as i64).wrapping_neg();
+        (digits & pick) | (seconds.wrapping_mul(1_000) & !pick)
+    } else {
+        parse_general(p, len, dates)
+    }
+}
+
+/// `parse` for a field that is nearly always UTC (`ingest_ts` always is): the same answer, without the digits.
+#[inline(always)]
+pub unsafe fn parse_utc(p: *const u8, len: usize, dates: &mut Dates) -> i64 {
+    let (seconds, ok) = civil_known(p, dates);
+    if ok & (len == 20) & (*p.add(19) == b'Z') {
+        seconds * 1_000
+    } else {
+        parse_general(p, len, dates)
+    }
+}
+
+/// Any timestamp, by form: what `parse` and `parse_utc` fall back on. It is the
+/// only place a date is learned.
+#[inline(never)]
+pub unsafe fn parse_general(p: *const u8, len: usize, dates: &mut Dates) -> i64 {
     if len == 20 {
         if *p.add(19) == b'Z' {
             let seconds = civil_seconds_fast(p, dates);
@@ -248,13 +373,24 @@ mod tests {
     }
 
     fn both(text: &[u8], dates: &mut Dates) -> i64 {
-        let mut padded = text.to_vec();
-        padded.extend_from_slice(&[b',', b'x', 0xff, 0, b'9', b'Z', b'\n', b'"']);
-        let fast = unsafe { parse(padded.as_ptr(), text.len(), dates) };
-        // Twice: once learning the date, once from the table.
-        assert_eq!(unsafe { parse(padded.as_ptr(), text.len(), dates) }, fast, "{:?}", String::from_utf8_lossy(text));
-        assert_eq!(unsafe { parse_plain(padded.as_ptr(), text.len()) }, fast, "{:?}", String::from_utf8_lossy(text));
-        fast
+        // As in the reader's buffer: other bytes before and after the field.
+        let mut padded = b"9,\"1".to_vec();
+        let start = padded.len();
+        padded.extend_from_slice(text);
+        padded.extend_from_slice(b",x\xff\09Z\n\"2026-10-03T23:58:10Z,1791071890000,,,,,,,,,,,,,,,,,,,,,,,,,,,");
+        let (p, len) = unsafe { (padded.as_ptr().add(start), text.len()) };
+        let plain = unsafe { parse_plain(p, len) };
+        let shown = String::from_utf8_lossy(text).into_owned();
+        // Twice each: once learning the date, once from the table.
+        for round in 0..2 {
+            assert_eq!(unsafe { parse(p, len, dates) }, plain, "parse, round {round}: {shown:?}");
+            assert_eq!(unsafe { parse_utc(p, len, dates) }, plain, "parse_utc, round {round}: {shown:?}");
+            assert_eq!(unsafe { parse_general(p, len, dates) }, plain, "parse_general, round {round}: {shown:?}");
+        }
+        // And with nothing learned yet.
+        assert_eq!(unsafe { parse(p, len, &mut Dates::new()) }, plain, "parse, fresh: {shown:?}");
+        assert_eq!(unsafe { parse_utc(p, len, &mut Dates::new()) }, plain, "parse_utc, fresh: {shown:?}");
+        plain
     }
 
     fn next(state: &mut u64) -> u64 {
