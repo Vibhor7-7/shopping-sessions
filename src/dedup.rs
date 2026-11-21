@@ -3,11 +3,13 @@
 //! Only a few percent of events have more than one copy, so the work is finding
 //! them. Each partition is scanned twice against a small table of two-bit
 //! counters indexed by key hash: the first scan marks the slots hit more than
-//! once, the second takes the copies in those slots, a few in a hundred, to a
-//! small table keyed by event_id that holds the earliest copy of each so far.
-//! A copy that meets another of its event there is compared with it, and the
-//! event record of the one that loses is marked dropped. Nothing is sorted.
+//! once, the second gathers the copies in those slots, one in seven. Those go
+//! through a small table keyed by event_id that holds the earliest copy of each
+//! so far: a copy that meets another of its event there is compared with it,
+//! and the event record of the one that loses is marked dropped. Nothing is
+//! sorted, and none of it is a branch on what a copy turns out to be.
 
+use std::hint::select_unpredictable;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::parse::{Copy_, Event, Parsed, DROPPED, NO_EVENT};
@@ -39,22 +41,27 @@ impl Earliest {
     /// if their `ingest_ts` are equal: then they are identical), the earlier one
     /// stays, and the loser's `at` is returned, which may be `NO_EVENT`.
     /// A copy that meets no other returns `NO_EVENT`.
+    ///
+    /// Whether a copy finds its slot free or finds its event there is a coin
+    /// toss, and so is which of two copies is the earlier: both are selected,
+    /// not branched on. The only branch left is the step past a slot that holds
+    /// another event, which the table's size keeps rare.
     #[inline(always)]
     fn meet(&mut self, copy: Copy_, hash: u64) -> u32 {
         let mut at = hash as usize & self.mask;
         loop {
             let held = unsafe { self.slots.get_unchecked_mut(at) };
-            if held.event == copy.event {
-                if copy.ingest < held.ingest {
-                    let lost = held.at;
-                    *held = copy;
-                    return lost;
-                }
-                return copy.at;
-            }
-            if held.event == 0 {
-                *held = copy;
-                return NO_EVENT;
+            let same = held.event == copy.event;
+            let free = held.event == 0;
+            if same | free {
+                let earlier = copy.ingest < held.ingest;
+                let lost = select_unpredictable(same, select_unpredictable(earlier, held.at, copy.at), NO_EVENT);
+                // A free slot takes the copy; so does one that holds a later copy of its event.
+                let takes = free | earlier;
+                held.event = copy.event;
+                held.ingest = select_unpredictable(takes, copy.ingest, held.ingest);
+                held.at = select_unpredictable(takes, copy.at, held.at);
+                return lost;
             }
             at = (at + 1) & self.mask;
         }
@@ -77,7 +84,9 @@ pub fn run(
     let dropped = sys::parallel(threads, |_| {
         // Two bits a slot, 32 slots a word: seen once, seen again.
         let mut state: Vec<u64> = Vec::new();
+        let mut suspects: Vec<Copy_> = Vec::new();
         let mut earliest = Earliest::new();
+        let mut scratch = 0u32;
         let mut dropped = 0u64;
         loop {
             let partition = next.fetch_add(1, Ordering::Relaxed);
@@ -117,23 +126,36 @@ pub fn run(
             }
             // A slot hit more than once holds one copy that was not late and at
             // least one that was: at most twice as many copies as late ones.
-            earliest.reset(2 * late);
+            // They are gathered first, each copy written to the end of the list
+            // and the end moved on only for a suspect: one copy in seven is one,
+            // in no order, which is a branch the CPU cannot guess.
+            suspects.clear();
+            suspects.reserve(2 * late + 1);
+            let mut found = 0usize;
             for chunks in &lists {
                 for &(start, len) in &chunks[partition] {
                     let records = unsafe { std::slice::from_raw_parts(copies.at(start), len as usize) };
                     for copy in records {
-                        let hash = sys::mix(copy.event);
-                        let at = slot(hash);
-                        if unsafe { *state.get_unchecked(at >> 5) } >> ((at & 31) * 2 + 1) & 1 != 0 {
-                            // The filter's slot came from the hash's high bits; the table takes its low ones.
-                            let lost = earliest.meet(*copy, hash);
-                            if lost != NO_EVENT {
-                                unsafe { (*events.at(lost)).ts = DROPPED };
-                                dropped += 1;
-                            }
-                        }
+                        let at = slot(sys::mix(copy.event));
+                        let again = unsafe { *state.get_unchecked(at >> 5) } >> ((at & 31) * 2 + 1) & 1;
+                        unsafe { suspects.as_mut_ptr().add(found).write(*copy) };
+                        found += again as usize;
                     }
                 }
+            }
+            debug_assert!(found <= 2 * late);
+            unsafe { suspects.set_len(found) };
+            earliest.reset(found);
+            for copy in &suspects {
+                // The filter's slot came from the hash's high bits; the table takes its low ones.
+                let lost = earliest.meet(*copy, sys::mix(copy.event));
+                // The loser's event record is marked dropped. Most copies lose to
+                // nothing, or have no record: those mark a scratch word instead.
+                let has = lost != NO_EVENT;
+                let record = events.at(select_unpredictable(has, lost, 0)) as *mut u8;
+                let ts = record.wrapping_add(std::mem::offset_of!(Event, ts)) as *mut u32;
+                unsafe { *select_unpredictable(has, ts, &mut scratch as *mut u32) = DROPPED };
+                dropped += u64::from(has);
             }
         }
         dropped
