@@ -85,25 +85,22 @@ impl Context<'_> {
     }
 }
 
-/// How many lines are looked up, and how many filed, at a time (`Sink::batch_*`).
-///
-/// A line asks for its user's slot in the link table when it is parsed: the
-/// table is far larger than the cache, so every lookup is a memory fetch, and
-/// started this early the fetches overlap instead of each one stalling the
-/// parser. The slot is read one batch later, 8 to 15 lines on (`look_up_*`).
-/// Reading it names the person, so the partitions the line's records go to;
-/// those are asked for then, and written one batch after that (`settle_*`).
-///
-/// Looking up and filing are done a batch at a time, in a function of their
-/// own, so that they are not in the line loop at all: with everything in one
-/// loop there were more values in use at once than the CPU has registers, and
-/// about sixty of them went to the stack and back on every line (BENCH.md,
-/// experiment 38).
-const BATCH: usize = 8;
-/// Slots in the ring the waiting lines are kept in. Three batches wait at
-/// once: the one being parsed, the one before it, not yet looked up, and the
-/// one before that, not yet filed.
-const SLOTS: usize = 4 * BATCH;
+/// How many lines pass between asking for a user's slot in the link table and
+/// writing the line's records. The table is far larger than the cache, so every
+/// lookup is a memory fetch; started this early, the fetches overlap instead of
+/// each one stalling the parser.
+const RING: usize = 16;
+/// How many lines after that request the slot is read (`look_up_*`). Reading it
+/// names the person, so the partitions the records go to; those are asked for
+/// then, `RING - LOOK` lines before they are written.
+const LOOK: usize = 12;
+/// Slots in the ring the waiting lines are kept in: twice `RING`, so the slot
+/// a line is put in is never the one about to be settled. A line is stored
+/// first and the old ones are settled and looked up after it, when nothing of
+/// the new line is left in a register: the other way round, everything the
+/// line had worked out was kept on the stack across both and fetched back
+/// (BENCH.md, experiment 38).
+const SLOTS: usize = 2 * RING;
 
 /// A parsed event copy on its way to its partitions.
 #[derive(Clone, Copy, Default)]
@@ -137,14 +134,9 @@ struct Sink<'a> {
     events: Combine<'a, Event, 8>,
     clicks: Combine<'a, Click, 8>,
     waiting_events: [PendingEvent; SLOTS],
-    /// Event lines taken so far; how many of them have been looked up; how many filed.
     event_count: usize,
-    events_looked: usize,
-    events_settled: usize,
     waiting_clicks: [PendingClick; SLOTS],
     click_count: usize,
-    clicks_looked: usize,
-    clicks_settled: usize,
     dates: ts::Dates,
 }
 
@@ -195,52 +187,24 @@ impl Sink<'_> {
         self.clicks.push(pending.home as usize, Click { person: pending.user, click: pending.click, ts: pending.ts, campaign: pending.campaign });
     }
 
-    /// Called when `event_count` has reached a multiple of `BATCH`: files the
-    /// lines looked up a batch ago, oldest first, then looks up the lines of the
-    /// batch before the one just parsed.
-    #[inline(never)]
-    fn batch_events(&mut self) {
-        for line in self.events_settled..self.events_looked {
-            self.settle_event(self.waiting_events[line & (SLOTS - 1)]);
-        }
-        self.events_settled = self.events_looked;
-        let until = self.event_count - BATCH;
-        for line in self.events_looked..until {
-            self.look_up_event(line & (SLOTS - 1));
-        }
-        self.events_looked = until;
-    }
-
-    /// `batch_events` for clicks.
-    #[inline(never)]
-    fn batch_clicks(&mut self) {
-        for line in self.clicks_settled..self.clicks_looked {
-            self.settle_click(self.waiting_clicks[line & (SLOTS - 1)]);
-        }
-        self.clicks_settled = self.clicks_looked;
-        let until = self.click_count - BATCH;
-        for line in self.clicks_looked..until {
-            self.look_up_click(line & (SLOTS - 1));
-        }
-        self.clicks_looked = until;
-    }
-
-    /// Looks up and files everything still waiting, oldest first.
+    /// Files everything still waiting, oldest first; the newest `LOOK` have not been looked up yet.
     fn drain(&mut self) {
-        for line in self.events_looked..self.event_count {
-            self.look_up_event(line & (SLOTS - 1));
-        }
-        for line in self.events_settled..self.event_count {
+        let count = self.event_count;
+        for line in count.saturating_sub(RING)..count {
+            if line + LOOK >= count {
+                self.look_up_event(line & (SLOTS - 1));
+            }
             self.settle_event(self.waiting_events[line & (SLOTS - 1)]);
         }
-        (self.event_count, self.events_looked, self.events_settled) = (0, 0, 0);
-        for line in self.clicks_looked..self.click_count {
-            self.look_up_click(line & (SLOTS - 1));
-        }
-        for line in self.clicks_settled..self.click_count {
+        self.event_count = 0;
+        let count = self.click_count;
+        for line in count.saturating_sub(RING)..count {
+            if line + LOOK >= count {
+                self.look_up_click(line & (SLOTS - 1));
+            }
             self.settle_click(self.waiting_clicks[line & (SLOTS - 1)]);
         }
-        (self.click_count, self.clicks_looked, self.clicks_settled) = (0, 0, 0);
+        self.click_count = 0;
     }
 }
 
@@ -341,13 +305,18 @@ impl Lines for EventLines<'_, '_> {
         } else {
             (ingest_seconds - context.ingest_epoch).clamp(0, i64::from(u32::MAX) - 1) as u32
         };
-        // Into the ring; every `BATCH` lines the older ones are looked up and filed.
+        // The line first, into a slot nothing is waiting in; then the line `RING`
+        // before it is filed and the one `LOOK` before it looked up.
         let count = sink.event_count;
         sink.waiting_events[count & (SLOTS - 1)] =
             PendingEvent { user, event, ts: at_ms.wrapping_sub(context.epoch) as u32, purchase, ingest, home };
         sink.event_count = count + 1;
-        if (count + 1) % BATCH == 0 {
-            sink.batch_events();
+        if count >= RING {
+            let ready = sink.waiting_events[(count - RING) & (SLOTS - 1)];
+            sink.settle_event(ready);
+        }
+        if count >= LOOK {
+            sink.look_up_event((count - LOOK) & (SLOTS - 1));
         }
         true
     }
@@ -387,8 +356,12 @@ impl Lines for ClickLines<'_, '_> {
         sink.waiting_clicks[count & (SLOTS - 1)] =
             PendingClick { user, click, ts: (at_ms - context.epoch) as u32, campaign, home };
         sink.click_count = count + 1;
-        if (count + 1) % BATCH == 0 {
-            sink.batch_clicks();
+        if count >= RING {
+            let ready = sink.waiting_clicks[(count - RING) & (SLOTS - 1)];
+            sink.settle_click(ready);
+        }
+        if count >= LOOK {
+            sink.look_up_click((count - LOOK) & (SLOTS - 1));
         }
         true
     }
@@ -446,12 +419,8 @@ pub fn run(
             clicks: Combine::new(&pools.clicks, &mut arena, person_partitions, chunks.clicks),
             waiting_events: [PendingEvent::default(); SLOTS],
             event_count: 0,
-            events_looked: 0,
-            events_settled: 0,
             waiting_clicks: [PendingClick::default(); SLOTS],
             click_count: 0,
-            clicks_looked: 0,
-            clicks_settled: 0,
             dates: ts::Dates::new(),
         };
         loop {
