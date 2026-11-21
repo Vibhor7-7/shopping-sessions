@@ -13,13 +13,19 @@ COPY ref ./ref
 RUN set -eu; \
     case "$(uname -m)" in x86_64) export RUSTFLAGS="-C target-cpu=x86-64-v3" ;; esac; \
     cargo build --release --locked --offline --bin pipeline; \
-    cp target/release/pipeline /pipeline
+    mkdir -p /rootfs/app /rootfs/data /rootfs/output /rootfs/scratch; \
+    cp target/release/pipeline /rootfs/app/pipeline
 
 # At run time the root filesystem is read-only, the user is 1000:1000 and there
 # is no network. The binary is static and writes only to $OUTPUT_DIR.
-# The base is the starters' Debian, not scratch or Alpine, on purpose: the
-# organizers' scripts/docker_run.sh runs `chmod -R` from inside the image to
-# clean up, and BusyBox's chmod gives up where GNU's carries on.
-FROM debian:bookworm-slim
-COPY --from=build /pipeline /app/pipeline
+#
+# The runtime image is as small as an image with a shell can be (2 MB): if a
+# sandbox is unpacked from the image for every run, its size is paid on every
+# run. BusyBox rather than scratch so that a harness that runs `sh` or `chmod`
+# inside the image still can; the pipeline itself needs neither, and creates
+# its output readable, writable and removable by anyone.
+FROM busybox:1.37-musl
+# One layer: the binary, and the mount points should the sandbox not create them.
+COPY --from=build /rootfs/ /
+WORKDIR /app
 CMD ["/app/pipeline"]
