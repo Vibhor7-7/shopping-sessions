@@ -66,14 +66,18 @@ pub fn map<T>(count: usize) -> *mut T {
     aligned as *mut T
 }
 
-/// The global allocator: the system's, except that a block of 2 MB or more is
-/// its own mapping, aligned to 2 MB and advised for huge pages.
+/// The global allocator: the system's for small blocks; anything from 32 KB up
+/// is put on memory advised for huge pages. A block of 2 MB or more is its own
+/// mapping, aligned to 2 MB. One in between is carved out of a shared 8 MB
+/// mapping and never given back: there are few of them (a thread's read buffer,
+/// its hash tables and cursors) and they live as long as the run does.
 ///
-/// The big buffers (a partition's events while they are grouped, a thread's
-/// output columns) are written densely. On 4 KB pages each megabyte of them is
-/// 256 page faults going in and 256 pages for the kernel to free, one thread,
-/// at exit; where the machine only gives huge pages to memory that asks, this
-/// asks. Where it gives them to everything, or to nothing, it changes nothing.
+/// These buffers are written densely and at random. On 4 KB pages each megabyte
+/// of them is 256 page faults going in, 256 entries competing for the TLB (and
+/// on a virtual machine a missed entry is a walk through two page tables), and
+/// 256 pages for the kernel to free, one thread, at exit. Where the machine
+/// only gives huge pages to memory that asks, this asks. Where it gives them to
+/// everything, or to nothing, it changes nothing.
 #[cfg(target_os = "linux")]
 pub struct HugeBlocks;
 
@@ -88,9 +92,43 @@ mod huge_blocks {
     }
     const MREMAP_MAYMOVE: i32 = 1;
 
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    const MEDIUM: usize = 32 << 10;
+    const ARENA: usize = 8 << 20;
+    /// The shared mapping medium blocks are carved from: where the next goes, and where it ends.
+    static CARVING: AtomicBool = AtomicBool::new(false);
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    static END: AtomicUsize = AtomicUsize::new(0);
+
     #[inline]
     fn large(layout: Layout) -> bool {
         layout.size() >= HUGE && layout.align() <= 4096
+    }
+
+    #[inline]
+    fn medium(layout: Layout) -> bool {
+        layout.size() >= MEDIUM && layout.size() < HUGE && layout.align() <= 4096
+    }
+
+    /// A medium block: zeroed (the mapping is fresh and nothing in it is ever reused), or null.
+    unsafe fn carve(layout: Layout) -> *mut u8 {
+        while CARVING.swap(true, Ordering::Acquire) {
+            std::hint::spin_loop();
+        }
+        let align = layout.align().max(64);
+        let mut start = (NEXT.load(Ordering::Relaxed) + align - 1) & !(align - 1);
+        if start + layout.size() > END.load(Ordering::Relaxed) {
+            start = block(ARENA) as usize;
+            if start == 0 {
+                CARVING.store(false, Ordering::Release);
+                return std::ptr::null_mut();
+            }
+            END.store(start + ARENA, Ordering::Relaxed);
+        }
+        NEXT.store(start + layout.size(), Ordering::Relaxed);
+        CARVING.store(false, Ordering::Release);
+        start as *mut u8
     }
 
     #[inline]
@@ -123,14 +161,16 @@ mod huge_blocks {
         unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
             if large(layout) {
                 block(layout.size())
+            } else if medium(layout) {
+                carve(layout)
             } else {
                 System.alloc(layout)
             }
         }
 
         unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-            if large(layout) {
-                block(layout.size()) // a fresh mapping is zeros already
+            if large(layout) || medium(layout) {
+                self.alloc(layout) // fresh from the kernel: zeros already
             } else {
                 System.alloc_zeroed(layout)
             }
@@ -139,33 +179,30 @@ mod huge_blocks {
         unsafe fn dealloc(&self, at: *mut u8, layout: Layout) {
             if large(layout) {
                 munmap(at as *mut c_void, pages(layout.size()));
-            } else {
+            } else if !medium(layout) {
                 System.dealloc(at, layout)
             }
         }
 
         unsafe fn realloc(&self, at: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
             let new_layout = Layout::from_size_align_unchecked(new_size, layout.align());
-            match (large(layout), large(new_layout)) {
-                (false, false) => System.realloc(at, layout, new_size),
-                // Large to large: the kernel moves the pages, nothing is copied.
-                (true, true) => {
-                    let moved = mremap(at as *mut c_void, pages(layout.size()), pages(new_size), MREMAP_MAYMOVE);
-                    if moved as isize == -1 {
-                        std::ptr::null_mut()
-                    } else {
-                        moved as *mut u8
-                    }
-                }
-                _ => {
-                    let new = self.alloc(new_layout);
-                    if !new.is_null() {
-                        std::ptr::copy_nonoverlapping(at, new, layout.size().min(new_size));
-                        self.dealloc(at, layout);
-                    }
-                    new
-                }
+            if !large(layout) && !medium(layout) && !large(new_layout) && !medium(new_layout) {
+                return System.realloc(at, layout, new_size);
             }
+            if large(layout) && large(new_layout) {
+                // The kernel moves the pages; nothing is copied.
+                let moved = mremap(at as *mut c_void, pages(layout.size()), pages(new_size), MREMAP_MAYMOVE);
+                return if moved as isize == -1 { std::ptr::null_mut() } else { moved as *mut u8 };
+            }
+            if medium(layout) && medium(new_layout) && new_size <= layout.size() {
+                return at;
+            }
+            let new = self.alloc(new_layout);
+            if !new.is_null() {
+                std::ptr::copy_nonoverlapping(at, new, layout.size().min(new_size));
+                self.dealloc(at, layout);
+            }
+            new
         }
     }
 }

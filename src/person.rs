@@ -39,6 +39,19 @@ pub struct UserRows {
     pub top: Vec<u32>,
 }
 
+impl UserRows {
+    fn with_capacity(rows: usize) -> Self {
+        Self {
+            person: Vec::with_capacity(rows),
+            day: Vec::with_capacity(rows),
+            sessions: Vec::with_capacity(rows),
+            events: Vec::with_capacity(rows),
+            revenue: Vec::with_capacity(rows),
+            top: Vec::with_capacity(rows),
+        }
+    }
+}
+
 /// campaign_daily, indexed by `day * (campaigns + 1) + campaign`; `organic` is the last campaign.
 pub struct Cells {
     /// sessions, purchasing_sessions, revenue_cents
@@ -518,6 +531,9 @@ pub fn run<R: Send>(
     let campaigns = setup.catalog.campaign_ids.len();
     let width = campaigns + 1;
     let wide: Option<Vec<(u32, u32)>> = setup.wide.map(|table| table.lock().unwrap().clone());
+    // A person is active on about one day for every nine events: enough room that the columns rarely grow.
+    let event_records: usize = events.iter().map(|c| c.iter().flatten().map(|chunk| chunk.1 as usize).sum::<usize>()).sum();
+    let expected_rows = event_records / 8 / threads + 64;
     let next = AtomicUsize::new(0);
     let results = sys::parallel(threads, |me| {
         let mut group = Group { bits: setup.person_bits, ..Group::default() };
@@ -533,7 +549,7 @@ pub fn run<R: Send>(
             window_place: vec![0; campaigns],
             window: Vec::new(),
             bin_purchases: Vec::new(),
-            rows: UserRows::default(),
+            rows: UserRows::with_capacity(expected_rows),
             cells: Cells { credited: vec![[0; 3]; width * setup.days], assisted: vec![0; width * setup.days] },
             sessions: 0,
         };
