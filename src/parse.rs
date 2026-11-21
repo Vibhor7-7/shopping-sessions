@@ -266,8 +266,9 @@ impl Lines for EventLines<'_, '_> {
         }
         // Both IDs at once. An empty user_id, which no line survives, has the key 0.
         let (event, user_key) = key::keys_of_two_padded(data.add(id), id_end - id, data.add(user_at), user_end - user_at);
-        let (ingest_seconds, ingest) = ts::parse_utc(data.add(ingest_at), ingest_end - ingest_at, &mut sink.dates);
-        let at_ms = ts::parse(data.add(ts_at), ts_end - ts_at, &mut sink.dates);
+        // Both timestamps, their times of day in one pass (ts::times_of_day).
+        let (at_ms, (ingest_seconds, ingest)) =
+            ts::parse_both(data.add(ts_at), ts_end - ts_at, data.add(ingest_at), ingest_end - ingest_at, &mut sink.dates);
         let catalog = context.catalog;
 
         let mut alive = user_end != user_at

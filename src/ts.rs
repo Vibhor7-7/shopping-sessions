@@ -169,6 +169,7 @@ const ZEROS: u64 = 0x3030_3030_3030_3030;
 /// Added to a byte that should be 0 to 9: the top bit stays clear only if it is.
 #[cfg(not(all(target_arch = "x86_64", target_feature = "sse4.1")))]
 const UP_TO_NINE: u64 = 0x7676_7676_7676_7676;
+#[cfg(not(all(target_arch = "x86_64", target_feature = "sse4.1")))]
 const TOP_BITS: u64 = 0x8080_8080_8080_8080;
 
 /// `YYYY-MM-DDTHH:MM:SS` at `p` (20 readable bytes) as epoch seconds, or BAD.
@@ -264,44 +265,86 @@ const fn clock_table(limit: u32, unit: u32) -> [u32; 256] {
     }
     table
 }
+/// For the hours and minutes of an offset (`zone`).
 #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
 static HOURS: [u32; 256] = clock_table(23, 3_600);
 #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
 static MINUTES: [u32; 256] = clock_table(59, 60);
-#[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
-static SECONDS: [u32; 256] = clock_table(59, 1);
+
+/// Two texts of eight bytes side by side, each to be read as `HH:MM:SS`: for
+/// each, its seconds since midnight in the low half of its 64 bits, and all of
+/// its 64 bits set if it is a real time of day (none if it is not).
+///
+/// After an XOR with `00:00:00` a digit is 0 to 9 and a colon 0. Two
+/// multiply-adds then weigh the six digits (10 and 1 for a pair, then 3,600,
+/// 60 and 1), which is all the arithmetic there is; a byte over the largest
+/// digit its place allows, or an hour over 23, makes it no time of day.
+/// One pass for two texts costs what it costs for one, so an event line's `ts`
+/// and `ingest_ts` share it (BENCH.md, experiment 42; until then each went
+/// through a `pext` and three table reads of its own).
+#[cfg(all(target_arch = "x86_64", target_feature = "sse4.1"))]
+#[inline(always)]
+unsafe fn clocks(texts: std::arch::x86_64::__m128i) -> (std::arch::x86_64::__m128i, std::arch::x86_64::__m128i) {
+    use std::arch::x86_64::*;
+    let digits = _mm_xor_si128(texts, _mm_set1_epi64x(i64::from_le_bytes(*b"00:00:00")));
+    // H H : M M : S S, the most each place may hold.
+    let over = _mm_subs_epu8(digits, _mm_set1_epi64x(i64::from_le_bytes([2, 9, 0, 5, 9, 0, 5, 9])));
+    // Words: HH, ten times the minutes' first digit, their second digit, SS.
+    let pairs = _mm_maddubs_epi16(digits, _mm_set1_epi64x(i64::from_le_bytes([10, 1, 0, 10, 1, 0, 10, 1])));
+    let late = _mm_cmpgt_epi16(pairs, _mm_setr_epi16(23, i16::MAX, i16::MAX, i16::MAX, 23, i16::MAX, i16::MAX, i16::MAX));
+    let halves = _mm_madd_epi16(pairs, _mm_setr_epi16(3_600, 60, 60, 1, 3_600, 60, 60, 1));
+    let seconds = _mm_add_epi32(halves, _mm_srli_epi64(halves, 32));
+    (seconds, _mm_cmpeq_epi64(_mm_or_si128(over, late), _mm_setzero_si128()))
+}
 
 /// `HH:MM:SS` at `p` as seconds since midnight, and whether it is a real time of day. Never branches.
+#[cfg(all(target_arch = "x86_64", target_feature = "sse4.1"))]
+#[inline(always)]
+unsafe fn time_of_day(p: *const u8) -> (i64, bool) {
+    use std::arch::x86_64::*;
+    let (seconds, real) = clocks(_mm_loadl_epi64(p as *const __m128i));
+    (i64::from(_mm_cvtsi128_si32(seconds) as u32), _mm_cvtsi128_si32(real) != 0)
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "sse4.1")))]
 #[inline(always)]
 unsafe fn time_of_day(p: *const u8) -> (i64, bool) {
     let time = (p as *const u64).read_unaligned() ^ 0x3030_3a30_303a_3030;
     let wrong = (time | time.wrapping_add(0x7676_7f76_767f_7676)) & TOP_BITS;
-    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
-    {
-        // The six digit values side by side, then one table read per pair.
-        let digits = std::arch::x86_64::_pext_u64(time, 0x0f0f_000f_0f00_0f0f) as usize;
-        let seconds = *HOURS.get_unchecked(digits & 255)
-            + *MINUTES.get_unchecked((digits >> 8) & 255)
-            + *SECONDS.get_unchecked((digits >> 16) & 255);
-        (i64::from(seconds), (wrong == 0) & (seconds < 86_400))
-    }
-    #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
-    {
-        let hour = (time & 15) * 10 + ((time >> 8) & 15);
-        let minute = ((time >> 24) & 15) * 10 + ((time >> 32) & 15);
-        let second = ((time >> 48) & 15) * 10 + ((time >> 56) & 15);
-        ((hour * 3_600 + minute * 60 + second) as i64, (wrong == 0) & (hour <= 23) & (minute <= 59) & (second <= 59))
-    }
+    let hour = (time & 15) * 10 + ((time >> 8) & 15);
+    let minute = ((time >> 24) & 15) * 10 + ((time >> 32) & 15);
+    let second = ((time >> 48) & 15) * 10 + ((time >> 56) & 15);
+    ((hour * 3_600 + minute * 60 + second) as i64, (wrong == 0) & (hour <= 23) & (minute <= 59) & (second <= 59))
+}
+
+/// `time_of_day` of `a` and of `b`, in one pass where the CPU has one.
+#[cfg(all(target_arch = "x86_64", target_feature = "sse4.1"))]
+#[inline(always)]
+unsafe fn times_of_day(a: *const u8, b: *const u8) -> ((i64, bool), (i64, bool)) {
+    use std::arch::x86_64::*;
+    let texts = _mm_insert_epi64(_mm_loadl_epi64(a as *const __m128i), (b as *const i64).read_unaligned(), 1);
+    let (seconds, real) = clocks(texts);
+    let real = _mm_movemask_epi8(real) as u32;
+    (
+        (i64::from(_mm_cvtsi128_si32(seconds) as u32), real & 1 != 0),
+        (i64::from(_mm_extract_epi32(seconds, 2) as u32), real & 0x100 != 0),
+    )
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "sse4.1")))]
+#[inline(always)]
+unsafe fn times_of_day(a: *const u8, b: *const u8) -> ((i64, bool), (i64, bool)) {
+    (time_of_day(a), time_of_day(b))
 }
 
 /// `YYYY-MM-DDTHH:MM:SS` at `p` as epoch seconds, if its date is already in the
-/// table and the rest is well formed. Never branches and never learns a date.
+/// table and the rest is well formed; `time_of_day(p + 11)` is handed in.
+/// Never branches and never learns a date.
 #[inline(always)]
-unsafe fn civil_known(p: *const u8, dates: &Dates) -> (i64, bool) {
+unsafe fn civil_known(p: *const u8, dates: &Dates, (seconds, time_ok): (i64, bool)) -> (i64, bool) {
     let head = (p as *const u64).read_unaligned();
     let tail = (p.add(8) as *const u32).read_unaligned() & 0x00ff_ffff; // DDT
     let known = dates.slots.get_unchecked(Dates::slot(tail as u16));
-    let (seconds, time_ok) = time_of_day(p.add(11));
     // Two compares cover the date, the `T`, and whether the slot is filled at all.
     let ok = (known.head == head) & (known.tail == tail) & time_ok;
     (known.midnight.wrapping_add(seconds), ok)
@@ -376,8 +419,14 @@ fn hidden(flag: bool) -> bool {
 /// reader's buffer: 3 bytes before it and 32 after are read whatever `len` is.
 #[inline(always)]
 pub unsafe fn parse(p: *const u8, len: usize, dates: &mut Dates) -> i64 {
+    parse_timed(p, len, dates, time_of_day(p.add(11)))
+}
+
+/// `parse`, given `time_of_day(p + 11)`.
+#[inline(always)]
+unsafe fn parse_timed(p: *const u8, len: usize, dates: &mut Dates, time: (i64, bool)) -> i64 {
     let (digits, digits_ok) = thirteen(p);
-    let (seconds, civil_ok) = civil_known(p, dates);
+    let (seconds, civil_ok) = civil_known(p, dates, time);
     let is_digits = len == 13;
     let is_utc = (len == 20) & (*p.add(19) == b'Z');
     // Selected, not branched on: left to itself the compiler turns this back into
@@ -406,17 +455,35 @@ pub unsafe fn parse(p: *const u8, len: usize, dates: &mut Dates) -> i64 {
 /// predicts, and the seconds come out without a division. Anything unexpected
 /// goes to `parse_general` and gets the same answer the slow way.
 #[inline(always)]
+#[allow(dead_code)]
 pub unsafe fn parse_utc(p: *const u8, len: usize, dates: &mut Dates) -> (i64, i64) {
+    parse_utc_timed(p, len, dates, time_of_day(p.add(11)))
+}
+
+/// `parse_utc`, given `time_of_day(p + 11)`.
+#[inline(always)]
+unsafe fn parse_utc_timed(p: *const u8, len: usize, dates: &mut Dates, (seconds, time_ok): (i64, bool)) -> (i64, i64) {
     let head = (p as *const u64).read_unaligned();
     let tail = (p.add(8) as *const u32).read_unaligned() & 0x00ff_ffff; // DDT
     let known = dates.slots.get_unchecked(Dates::slot(tail as u16));
-    let (seconds, time_ok) = time_of_day(p.add(11));
     if len == 20 && *p.add(19) == b'Z' && known.head == head && known.tail == tail && time_ok {
         let seconds = known.midnight + seconds;
         (seconds, seconds * 1_000)
     } else {
         parse_utc_general(p, len, dates)
     }
+}
+
+/// An event line's two timestamps: its `ts` as `parse` gives it, and its
+/// `ingest_ts` as `parse_utc` does. Both hold a time of day at the same place
+/// (when `ts` is not digits only), and the two are worked out in one pass
+/// (`times_of_day`). `ts` and `ingest` must each be in the reader's buffer, as
+/// for `parse`.
+#[inline(always)]
+pub unsafe fn parse_both(ts: *const u8, ts_len: usize, ingest: *const u8, ingest_len: usize, dates: &mut Dates) -> (i64, (i64, i64)) {
+    let (ts_time, ingest_time) = times_of_day(ts.add(11), ingest.add(11));
+    let ingest = parse_utc_timed(ingest, ingest_len, dates, ingest_time);
+    (parse_timed(ts, ts_len, dates, ts_time), ingest)
 }
 
 #[cold]
@@ -496,6 +563,11 @@ mod tests {
             assert_eq!(unsafe { parse_utc(p, len, dates) }, utc_pair(plain), "parse_utc, round {round}: {shown:?}");
             assert_eq!(unsafe { parse_general(p, len, dates) }, plain, "parse_general, round {round}: {shown:?}");
         }
+        // As an event line's pair, on either side (the same text on the other).
+        for round in 0..2 {
+            let dates = if round == 0 { &mut *dates } else { &mut Dates::new() };
+            assert_eq!(unsafe { parse_both(p, len, p, len, dates) }, (plain, utc_pair(plain)), "parse_both, round {round}: {shown:?}");
+        }
         // And with nothing learned yet.
         assert_eq!(unsafe { parse(p, len, &mut Dates::new()) }, plain, "parse, fresh: {shown:?}");
         assert_eq!(unsafe { parse_utc(p, len, &mut Dates::new()) }, utc_pair(plain), "parse_utc, fresh: {shown:?}");
@@ -514,7 +586,7 @@ mod tests {
 
     /// What `parse` makes of a text that is not 13 digits or UTC: `offset_known`, fed as `parse` feeds it.
     unsafe fn finished_here(p: *const u8, len: usize, dates: &Dates) -> (i64, bool) {
-        let (seconds, civil_ok) = civil_known(p, dates);
+        let (seconds, civil_ok) = civil_known(p, dates, time_of_day(p.add(11)));
         offset_known(p, len, seconds, civil_ok)
     }
 
@@ -623,6 +695,112 @@ mod tests {
             }
         }
         assert!(good > 3_000 && bad > 20_000, "{good} good, {bad} bad");
+    }
+
+    /// The definition of a time of day: `HH:MM:SS` from 00:00:00 to 23:59:59, as seconds.
+    fn plain_time(text: &[u8; 8]) -> Option<i64> {
+        let digit = |at: usize| text[at].is_ascii_digit().then(|| i64::from(text[at] - b'0'));
+        if text[2] != b':' || text[5] != b':' {
+            return None;
+        }
+        let (hour, minute, second) = (digit(0)? * 10 + digit(1)?, digit(3)? * 10 + digit(4)?, digit(6)? * 10 + digit(7)?);
+        (hour <= 23 && minute <= 59 && second <= 59).then_some(hour * 3_600 + minute * 60 + second)
+    }
+
+    /// `time_of_day` of `a`, and `times_of_day` of `a` and `b` on either side, against the definition.
+    fn check_times(a: &[u8; 8], b: &[u8; 8]) -> (bool, bool) {
+        let found = |(seconds, real): (i64, bool)| real.then_some(seconds);
+        let (plain_a, plain_b) = (plain_time(a), plain_time(b));
+        unsafe {
+            assert_eq!(found(time_of_day(a.as_ptr())), plain_a, "{:?}", String::from_utf8_lossy(a));
+            let (first, second) = times_of_day(a.as_ptr(), b.as_ptr());
+            assert_eq!((found(first), found(second)), (plain_a, plain_b), "{:?} with {:?}", String::from_utf8_lossy(a), String::from_utf8_lossy(b));
+            let (first, second) = times_of_day(b.as_ptr(), a.as_ptr());
+            assert_eq!((found(first), found(second)), (plain_b, plain_a), "{:?} with {:?}", String::from_utf8_lossy(b), String::from_utf8_lossy(a));
+        }
+        (plain_a.is_some(), plain_b.is_some())
+    }
+
+    /// The times of day straight, not through `parse`: one that was wrongly found
+    /// bad would still come out right there, the slow way, and nothing would show
+    /// (BENCH.md, "What 35 says"). Every second of the day beside another time,
+    /// and every byte value in every place of both sides.
+    #[test]
+    fn every_time_of_day_and_every_byte_in_one() {
+        let text = |seconds: u32| -> [u8; 8] {
+            format!("{:02}:{:02}:{:02}", seconds / 3_600, seconds / 60 % 60, seconds % 60).into_bytes().try_into().unwrap()
+        };
+        for seconds in 0..86_400 {
+            let other = (seconds * 7 + 12_345) % 86_400;
+            assert_eq!(check_times(&text(seconds), &text(other)), (true, true));
+            assert_eq!(plain_time(&text(seconds)), Some(i64::from(seconds)));
+        }
+        let (mut good, mut bad) = (0, 0);
+        for base in [*b"00:00:00", *b"23:59:59", *b"19:58:10", *b"09:30:05", *b"20:00:49"] {
+            for other in [*b"12:34:56", *b"24:00:00", *b"\0\0\0\0\0\0\0\0", *b"\xff\xff\xff\xff\xff\xff\xff\xff", *b"00:00:00"] {
+                for at in 0..8 {
+                    for byte in 0..=255u8 {
+                        let mut changed = base;
+                        changed[at] = byte;
+                        if check_times(&changed, &other).0 {
+                            good += 1;
+                        } else {
+                            bad += 1;
+                        }
+                    }
+                }
+            }
+        }
+        // Every pair of digit values in each of the three places, the other two left alone.
+        for place in [0, 3, 6] {
+            for tens in 0..=255u8 {
+                for ones in 0..=255u8 {
+                    let mut changed = *b"11:22:33";
+                    (changed[place], changed[place + 1]) = (tens, ones);
+                    if check_times(&changed, b"23:59:59").0 {
+                        good += 1;
+                    } else {
+                        bad += 1;
+                    }
+                }
+            }
+        }
+        assert!(good > 1_000 && bad > 200_000, "{good} good, {bad} bad");
+    }
+
+    /// An event line's two timestamps are each their own: every pairing of the
+    /// forms, good and bad, gives what `parse` and `parse_utc` give one at a time.
+    #[test]
+    fn two_timestamps_at_once_are_each_their_own() {
+        let texts = [
+            "2026-10-03T23:58:10Z", "2026-10-03T19:58:10-04:00", "1791071890000", "2026-10-04T00:00:00Z", "2026-10-03T24:00:00Z",
+            "2026-10-03T23:60:10Z", "2026-10-03T23:58:60Z", "2026-10-03T2a:58:10Z", "2026-10-03T23:58:10", "", "0001791071890000",
+            "2026-10-05T07:08:09+05:30", "2026-10-05T07:08:09+05:60", "2026-02-30T07:08:09Z", "2026-10-03T19-58-10Z", "86400000",
+            "2026-10-03T00:00:00Z", "2026-10-03T23:59:59Z", "2026-10-03T29:00:00Z", "1791071890000.0",
+        ];
+        let padded = |text: &str| {
+            let mut bytes = b"9,\"1".to_vec();
+            bytes.extend_from_slice(text.as_bytes());
+            bytes.extend_from_slice(b",x\xff\09Z\n\"2026-10-03T23:58:10Z,1791071890000,,,,,,,,,,,,,,,,,,,,,,,,,,,");
+            bytes
+        };
+        let mut dates = Dates::new();
+        let mut seen = [0usize; 4];
+        for round in 0..2 {
+            for a in texts {
+                for b in texts {
+                    let (pa, pb) = (padded(a), padded(b));
+                    unsafe {
+                        let (a_at, b_at) = (pa.as_ptr().add(4), pb.as_ptr().add(4));
+                        let (plain_a, plain_b) = (parse_plain(a_at, a.len()), parse_plain(b_at, b.len()));
+                        assert_eq!(parse_both(a_at, a.len(), b_at, b.len(), &mut dates), (plain_a, utc_pair(plain_b)), "round {round}: {a:?} with {b:?}");
+                        assert_eq!(parse_both(a_at, a.len(), b_at, b.len(), &mut Dates::new()), (plain_a, utc_pair(plain_b)), "fresh: {a:?} with {b:?}");
+                        seen[usize::from(plain_a != BAD) * 2 + usize::from(plain_b != BAD)] += 1;
+                    }
+                }
+            }
+        }
+        assert!(seen.iter().all(|&n| n >= 100), "{seen:?}");
     }
 
     #[test]
