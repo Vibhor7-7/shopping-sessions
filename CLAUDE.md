@@ -67,3 +67,22 @@ memory, and image size. Flag anything that could fail on hidden data.
   track page shows its log (see BENCH.md). Merge main into it before use.
 - In zsh, `env $settings command` does not split `$settings`; use
   `sh -c "$settings command"`.
+
+# Unattended cycles (overnight.sh)
+- `overnight.sh` starts one Claude Code session per cycle with `overnight.md` as
+  its whole prompt; the user set this up on 2026-11-21. In those sessions, and
+  only there, the session itself submits on the track page, once a cycle, under
+  overnight.md's conditions. Everywhere else submissions stay the user's.
+- overnight.md is written for any repository. Its checks, here:
+  - "bench.sh at 60M" is the bench workflow with `-f events=60000000` (this Mac
+    cannot hold the dataset), and "under 60s" is that run's `docker run` time.
+  - "at least 5% faster than the last submitted version" is the bench workflow's
+    4-thread total with `-f base=<the last commit in SUBMISSIONS.md>`, in both of
+    its repeats. `bench.sh 20M` on the Mac wanders by more than 5%: log it, do
+    not decide by it.
+  - A change that passes and is faster stays in main even while main is less
+    than 5% ahead of the last submitted commit. The submission waits for a
+    later cycle; the gains add up.
+- SUBMISSIONS.md is the record of every submission and how the track page
+  works; MORNING.md is the note the user reads first.
+- The probe is never submitted by an unattended cycle.

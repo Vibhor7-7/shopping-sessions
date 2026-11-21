@@ -4,19 +4,29 @@
 
 - **Scorer** is the only number that counts: the track page's time for a commit, on the hidden ~20M-event practice set.
 - **x86 A/B** is what decides whether a change is kept: the `bench` workflow builds two commits with the Dockerfile and runs them interleaved on one GitHub x86-64 machine (2 cores / 4 threads, stand-in 20M-event dataset from `src/bin/synth.rs`). Times are the in-process total in ms, minimum of 5 runs, base → head. Noise between repeats is about 1%. The CPU differs from run to run, so only compare within a row.
-- The workflow's 4-thread number has two threads to a core; its **one-thread** number has a core to itself. They can disagree: fewer instructions pay when threads share a core (experiment 22), a stall avoided pays when they do not (experiment 24). Which of the two the scorer's 8 CPUs are is not known until the probe's log is read, so both are given.
+- The workflow's 4-thread number has two threads to a core; its **one-thread** number has a core to itself. They can disagree: fewer instructions pay when threads share a core (experiment 22), a stall avoided pays when they do not (experiment 24). The track page says each run gets "8 pinned vCPUs (hyperthreads)", so the scorer is the first case, 4 cores with two threads each: **the 4-thread number is the one to believe.**
 - **bench.sh 20M** is `scripts/bench.sh 20M` on the development Mac (ARM, 8 threads, the organizers' generator, seed 120): best / median wall ms of 5. The Mac is under memory pressure and its numbers wander by 10% or more; they are here because the rules ask for one, not because they decide anything.
 - **Verified** means: 36 fixtures, `make check-dev`, `scripts/diff_vs_ref.sh` on seeds 2 to 5, on the native build and on an x86-64 build (`scripts/regress.sh`), then CI on real amd64.
 
 ## Scorer results
 
-| When | Commit | Score | Note |
+| When (EST) | Commit | Score | Note |
 | --- | --- | --- | --- |
-| 2026-11-20 | `d698c87` | 1.05 s | First submission. Debian runtime image, 115 MB. |
-| 2026-11-20 | `7f9bffe` | 0.96 s | 18% less in-process time on x86 A/B, but only 9% less on the scorer. Leaderboard top: 0.40 s. |
-| 2026-11-20 | `e03e2c3` | **0.82 s** | BusyBox image (experiment 16) and write-combining buffers (18 to 20) together: 15% less than `7f9bffe`. Leaderboard top: 0.40 s. |
+| Fri 2026-11-20, 8:49 PM | `d698c87` | 1.05 s | First submission. Debian runtime image, 115 MB. |
+| Fri 9:35 PM | `8cb3e8e` | 0.99 s | Experiments 2 to 6. |
+| Fri 9:59 PM | `6bbe143` | 0.98 s | Experiments 8, 9 and 11. |
+| Fri 10:35 PM | `7f9bffe` | 0.96 s | Experiments 12 to 14. 18% less in-process time than `d698c87` on x86 A/B, 9% less on the scorer. |
+| Fri 11:10 PM | `c24627f` | 0.97 s | The BusyBox image (experiment 16) on `7f9bffe`'s code: **the image alone is worth nothing.** |
+| Fri 11:49 PM | `c6b4e3e` (code of `e03e2c3`) | 0.82 s | Write-combining buffers (18 to 20): 15% less than `c24627f`, where the x86 A/B gave 6% (Zen 4) to 12% (Ice Lake). |
+| Sat 2026-11-21, 12:26 AM | `7a5ddaf` | 0.80 s | Experiment 22 alone: −2.4%, for −4.4% on x86 A/B. |
+| Sat 12:53 AM | `fac219f` | **0.78 s** | Experiments 22 to 25: −4.9% from `c6b4e3e`, for −8.7% on x86 A/B. The entry for the final as of now. 10th of 163 teams; the board's best is 0.59 s. |
 
-The gap between "18% less in-process" and "9% less scored" is what experiment 16 was about. `e03e2c3` carries both the image change and experiments 18 to 20, so its score does not separate them: the x86 A/B gave 6% (Zen 4) to 12% (Ice Lake) for 18 to 20 alone, the scorer 15% for both. `c5b2dfd` (the image change alone) was never submitted; submitting it is the only way to split the two.
+This table was read off the track page on 2026-11-21 (the first five rows' times too; three of them had not been logged here). `SUBMISSIONS.md` has the full hashes.
+
+What the scores say:
+- **The image is not it.** `c24627f` settled what experiment 16 left open.
+- **The last two submissions moved the score by about half of what they moved the in-process time**: −2.4% for −4.4%, −4.9% for −8.7%. Either about 0.36 s of the 0.78 s is spent where our own timer does not look (before `main`, and after the process's last line: the kernel unmapping 1.2 GB), or the scorer's CPU gains less than GitHub's from fewer instructions. Experiments 18 to 20 went the other way (−15% for −6 to −12%), so it is not one fixed number. The probe's log is the way to tell.
+- The page says practice times vary by up to about 20% between scoring machines: a difference of 0.02 s between two submissions is inside that.
 
 ## Experiments
 
@@ -56,7 +66,7 @@ Rows 1 to 15 were run before this log existed and are reconstructed from the ben
 | 22 | One delimiter stream (commas and newlines in one array), and a line's fields split with vector instructions: the 4 bytes around each of a line's 8 delimiters are compared with a quote at once. The compiled loop spent about 145 of its 650 instructions a line on seven rounds of "is this field wrapped"; now about 60 | `7a5ddaf` | **999 → 955 (Zen 4, EPYC 9V74), −4.4%**; repeat 1003 → 959; parse 702 → 660 (−5.9%). One thread: 2510 → 2521, no change (fewer instructions only pay when two threads share a core) | 382 / 384, peak 1258 MB (ARM takes the scalar path) | yes | **kept** |
 | 23 | `ingest_ts` checked with compare-and-branch (its form never varies, so the branches predict) instead of a dozen flag instructions, and its seconds taken straight from the parse, not by multiplying by 1000 and dividing again | `80df6c5` | 1250 → 1229 (Ice Lake 8370C), −1.7%; repeat 1248 → 1231, −1.3%; parse 850 → 830 (−2.4%). One thread: 3026 → 2993, −1.1% | 381 / 387, peak 1262 MB | yes | kept |
 | — | Measurement: where the time is, not the instructions (`profile` workflow, new step: `perf` sampling on the CPU clock, 20M events, 4 threads, Zen 4) | `1359a83` | parse 52% of samples, people 16%, the delimiter scan 11%, dedup 4% + 1.7% sorting its suspects, kernel: 3.2% copying file data, 2.2% zeroing new pages. By line: **10% on the first touch of a push** (loading the partition's state, writing into its buffer), 2.2% on the campaign and product hash table's slot, 8% across the timestamp code, 3.5% in the hash function | n/a | n/a | measurement only. It named experiments 24 and 25 |
-| 24 | The link table is read 12 lines after a line is parsed instead of 16; that names the person, so both partitions, whose state and buffer are prefetched then; the records are written 4 lines later | `86b8dce` | 20M: 1228 → 1221 (Ice Lake 8370C), −0.6%; repeat 1232 → 1229: nothing, with two threads to a core. **One thread: 3025 → 2935, −3.0%**; parse −4.6%. 60M (2^11 partitions): 2887 → 2825 (Granite Rapids 6975P-C), −2.2%; repeat −1.5%; one thread 7529 → 7311, −2.9% | 387 / 411, peak 1271 MB | yes | kept. A stall hurts less when a second thread can use the core meanwhile, so what this is worth on the scorer depends on whether its 8 CPUs are 8 cores; the probe's thread-scaling lines say |
+| 24 | The link table is read 12 lines after a line is parsed instead of 16; that names the person, so both partitions, whose state and buffer are prefetched then; the records are written 4 lines later | `86b8dce` | 20M: 1228 → 1221 (Ice Lake 8370C), −0.6%; repeat 1232 → 1229: nothing, with two threads to a core. **One thread: 3025 → 2935, −3.0%**; parse −4.6%. 60M (2^11 partitions): 2887 → 2825 (Granite Rapids 6975P-C), −2.2%; repeat −1.5%; one thread 7529 → 7311, −2.9% | 387 / 411, peak 1271 MB | yes | kept. A stall hurts less when a second thread can use the core meanwhile, and the scorer's 8 CPUs are hyperthreads (the track page says so), so expect the 4-thread numbers there: little at 20M, 2% at 60M |
 | 25 | Campaign and product IDs of the files' own shape (a prefix and a number: `c_45`, `p123`) looked up by the number in a small array; any other text, and any number past the array, still goes through the map, which holds every ID | `ea498ca` | 1160 → 1150 (Zen 3), −0.9%; repeat 1162 → 1148, −1.2%; parse −1.7%. One thread: 3117 → 3076, −1.3% | 397 / 443, peak 1256 MB | yes (and a unit test against the map on 25,000 spellings) | kept |
 | — | 22 to 25 together against the last scored commit, at 20M and at 60M | `e03e2c3` vs `f245e54` | 20M: **1244 → 1135 (Zen 3), −8.7%**; repeat 1242 → 1135; parse −12.4%; one thread 3134 → 2843, −9.3%. 60M: **3867 → 3483 (Zen 4, EPYC 9V74), −9.9%**; repeat 3828 → 3475, −9.2%; one thread 9720 → 8724, −10.2% | as 24 | yes | measurement only |
 | — | Measurement: the profile again, after 22 to 25 (Sapphire Rapids 8573C, 4 threads) | `f245e54` | 1.26 billion instructions (was 1.33). Samples: parse 45%, people 19% + 1.4% sorting clicks, the delimiter scan 9%, **kernel 10%: 5.0% copying file data, 4.8% zeroing the 1.2 GB of new pages**, dedup 4.4% + 1.7% sorting suspects, links 4% | n/a | n/a | measurement only. The first touch of a push is down from 10% to about 5% of samples |
@@ -91,7 +101,7 @@ Notes on the 60M runs:
 
 ## To try, most promising first
 
-1. **Read the scorer's machine**: the probe's log, if the user spends a submission on it. It now decides more than items 2 and 3: whether the 8 CPUs are 8 cores (which column of this file to believe, and whether prefetching or instruction counts come first), what 4 KB pages cost there, and how fast `/output` is.
+1. **Read the scorer's machine**: the probe's log, if the user spends a submission on it (it has not been submitted; an unattended cycle never submits it, because it fails the dev check on purpose). The track page already answers one of its questions: the 8 CPUs are hyperthreads. Still open, and worth more now that half of each gain goes missing on the scorer: how long a sandbox takes to reach `main`, what 4 KB pages cost there going in and at exit, how fast `/output` is, and whether AVX-512 is there.
 2. **`mmap` again, if the scorer is bare metal.** It lost on virtual machines because of page-table walks (experiment 10); on bare metal those are cheap, and the copy it saves is 5% of the samples.
 3. **AVX-512 stage one**, if the probe shows it there and not slowing the scalar code around it. The scan is 9 to 11% of the run; with `vpcompressb` (Ice Lake and later) a block's delimiters become offsets in four instructions instead of thirty.
 4. **Dedup without a record for every copy.** 97% of copy records only prove that an event has no second copy. They cost a push a line (about 10% of parse), 330 MB of new pages at 20M, and the dedup phase with its sort (6%). No design yet: every exact filter seen so far needs a table the size of the IDs, read at random.
