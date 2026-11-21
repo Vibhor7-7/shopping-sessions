@@ -16,6 +16,7 @@ mod parquet;
 mod parse;
 mod person;
 mod pool;
+mod probe;
 mod reader;
 mod scan;
 mod sys;
@@ -281,6 +282,14 @@ fn main() {
     if cfg!(target_os = "linux") && event_bytes < (256 << 20) {
         describe_machine();
     }
-    // Nothing left to flush or free that the kernel will not do faster.
+    // PROBE BUILD: describe the machine, then spoil the output so the log is shown.
+    describe_machine();
+    probe::run(&data, &output);
+    if let Ok(files) = std::fs::read_dir(&user_folder) {
+        for file in files.flatten() {
+            let _ = std::fs::remove_file(file.path());
+        }
+    }
+    write_user_daily(&user_folder, &catalog, 0, person::UserRows::default());
     std::process::exit(0);
 }
