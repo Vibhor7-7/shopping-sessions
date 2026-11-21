@@ -170,6 +170,14 @@ impl Dates {
         Self { slots }
     }
 
+    /// The two characters of the day of the month in the text at `p`. Read where
+    /// it is asked for and nowhere else: left to itself the compiler takes
+    /// them out of a wider load of the same bytes, three instructions for one.
+    #[inline(always)]
+    unsafe fn day(p: *const u8) -> u16 {
+        std::ptr::read_volatile(p.add(8) as *const [u8; 2] as *const u16)
+    }
+
     /// The slot for a day of the month, given its two characters: a different
     /// one for each of 01 to 31. The low two bits of the first character, then
     /// the low four of the second.
@@ -310,6 +318,45 @@ static HOURS: [u32; 256] = clock_table(23, 3_600);
 #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
 static MINUTES: [u32; 256] = clock_table(59, 60);
 
+/// 32 bytes that a vector instruction reads from memory where it uses them.
+///
+/// Written as an ordinary constant, a vector of 32 bytes is loaded into a
+/// register before the line loop and held there. The loop has more such
+/// constants than there are registers, and the compiler then moves them from
+/// register to register around every step that needs one free (about a dozen
+/// moves a line in the compiled loop, and a constant or two stored to the
+/// stack and fetched back). A volatile read cannot be moved out of the loop,
+/// and it is folded into the instruction that uses it: one memory operand,
+/// no register, no move (BENCH.md, experiment 43).
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[repr(C, align(32))]
+struct InPlace([u8; 32]);
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+impl InPlace {
+    const fn bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    /// Sixteen words, each stored low byte first.
+    const fn words(words: [i16; 16]) -> Self {
+        let mut bytes = [0u8; 32];
+        let mut at = 0;
+        while at < 16 {
+            let word = words[at].to_le_bytes();
+            bytes[2 * at] = word[0];
+            bytes[2 * at + 1] = word[1];
+            at += 1;
+        }
+        Self(bytes)
+    }
+
+    #[inline(always)]
+    fn read(&'static self) -> std::arch::x86_64::__m256i {
+        unsafe { std::ptr::read_volatile(self as *const Self as *const std::arch::x86_64::__m256i) }
+    }
+}
+
 /// `HH:MM:SS` at `p` as seconds since midnight, and whether it is a real time
 /// of day (00:00:00 to 23:59:59). Never branches. The definition `numbers` is
 /// held to, and what a build without AVX2 runs.
@@ -348,48 +395,57 @@ unsafe fn time_of_day(p: *const u8) -> (i64, bool) {
 #[inline(always)]
 unsafe fn wide_numbers(digits: std::arch::x86_64::__m128i, times: std::arch::x86_64::__m128i) -> ((i64, bool), (i64, bool), (i64, bool)) {
     use std::arch::x86_64::*;
-    const O: i8 = b'0' as i8;
-    const C: i8 = b':' as i8;
+    const O: u8 = b'0';
+    const C: u8 = b':';
     const MAX: i16 = i16::MAX;
-    let texts = _mm256_inserti128_si256(_mm256_castsi128_si256(digits), times, 1);
+    /// What each kind of text should be made of.
     #[rustfmt::skip]
-    let values = _mm256_xor_si256(texts, _mm256_setr_epi8(
+    static MADE_OF: InPlace = InPlace::bytes([
         O, O, O, O, O, O, O, O, O, O, O, O, O, O, O, O,
         O, O, C, O, O, C, O, O, O, O, C, O, O, C, O, O,
-    ));
-    // The most each place may hold: anything for the three bytes that are not
-    // ours, 9 for a digit; H H : M M : S S for a time of day.
+    ]);
+    /// The most each place may hold: anything for the three bytes that are not
+    /// ours, 9 for a digit; H H : M M : S S for a time of day.
     #[rustfmt::skip]
-    let over = _mm256_subs_epu8(values, _mm256_setr_epi8(
-        -1, -1, -1, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9,
+    static MOST: InPlace = InPlace::bytes([
+        255, 255, 255, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9,
         2, 9, 0, 5, 9, 0, 5, 9, 2, 9, 0, 5, 9, 0, 5, 9,
-    ));
-    // Words. Digits: nothing, the first digit, then six pairs. A time of day:
-    // HH, ten times the minutes' first digit, their second digit, SS.
+    ]);
+    /// Neighbours to words. Digits: nothing, the first digit, then six pairs. A
+    /// time of day: HH, ten times the minutes' first digit, their second digit, SS.
     #[rustfmt::skip]
-    let pairs = _mm256_maddubs_epi16(values, _mm256_setr_epi8(
+    static NEIGHBOURS: InPlace = InPlace::bytes([
         0, 0, 0, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1,
         10, 1, 0, 10, 1, 0, 10, 1, 10, 1, 0, 10, 1, 0, 10, 1,
-    ));
-    // An hour over 23. (A pair of digits is at most 2,805, whatever the bytes were.)
+    ]);
+    /// The most an hour may be. (A pair of digits is at most 2,805, whatever the bytes were.)
     #[rustfmt::skip]
-    let late = _mm256_cmpgt_epi16(pairs, _mm256_setr_epi16(
+    static LATEST: InPlace = InPlace::words([
         MAX, MAX, MAX, MAX, MAX, MAX, MAX, MAX,
         23, MAX, MAX, MAX, 23, MAX, MAX, MAX,
-    ));
+    ]);
+    /// Words to double words. Digits: the first digit, then three fours. A time
+    /// of day: the hours and the minutes' tens in seconds, then the rest.
+    #[rustfmt::skip]
+    static PAIRS: InPlace = InPlace::words([
+        100, 1, 100, 1, 100, 1, 100, 1,
+        3_600, 60, 60, 1, 3_600, 60, 60, 1,
+    ]);
+
+    let texts = _mm256_inserti128_si256(_mm256_castsi128_si256(digits), times, 1);
+    let values = _mm256_xor_si256(texts, MADE_OF.read());
+    let over = _mm256_subs_epu8(values, MOST.read());
+    let pairs = _mm256_maddubs_epi16(values, NEIGHBOURS.read());
+    let late = _mm256_cmpgt_epi16(pairs, LATEST.read());
     // All 64 bits set where nothing is wrong: the digits' two halves, then each time of day.
     let clear = _mm256_cmpeq_epi64(_mm256_or_si256(over, late), _mm256_setzero_si256());
     let clear = _mm256_movemask_pd(_mm256_castsi256_pd(clear)) as u32;
-    // Double words. Digits: the first digit, then three fours. A time of day:
-    // the hours and the minutes' tens in seconds, then the rest.
-    #[rustfmt::skip]
-    let fours = _mm256_madd_epi16(pairs, _mm256_setr_epi16(
-        100, 1, 100, 1, 100, 1, 100, 1,
-        3_600, 60, 60, 1, 3_600, 60, 60, 1,
-    ));
+    let fours = _mm256_madd_epi16(pairs, PAIRS.read());
     let digits = _mm256_castsi256_si128(fours);
     let digits = _mm_packus_epi32(digits, digits);
-    let eights = _mm_madd_epi16(digits, _mm_setr_epi16(10_000, 1, 10_000, 1, 10_000, 1, 10_000, 1));
+    // Fours to eights. Only the low two double words are used; the zeros keep the
+    // constant from being one the compiler broadcasts into a register first.
+    let eights = _mm_madd_epi16(digits, _mm_setr_epi16(10_000, 1, 10_000, 1, 0, 0, 0, 0));
     let high = _mm_cvtsi128_si32(eights) as u32 as u64; // digits 0 to 4
     let low = _mm_extract_epi32(eights, 1) as u32 as u64; // digits 5 to 12
     let times = _mm256_extracti128_si256(fours, 1);
@@ -439,7 +495,7 @@ unsafe fn numbers_of_one(p: *const u8, time: *const u8) -> ((i64, bool), (i64, b
 /// is not, the seconds mean nothing. Never branches and never learns a date.
 #[inline(always)]
 unsafe fn date_known(p: *const u8, dates: &Dates) -> (i64, bool) {
-    let known = dates.slots.get_unchecked(Dates::slot((p.add(8) as *const u16).read_unaligned()));
+    let known = dates.slots.get_unchecked(Dates::slot(Dates::day(p)));
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     let same = {
         use std::arch::x86_64::*;
@@ -464,8 +520,8 @@ unsafe fn date_known(p: *const u8, dates: &Dates) -> (i64, bool) {
 #[inline(always)]
 unsafe fn dates_known(a: *const u8, b: *const u8, dates: &Dates) -> ((i64, bool), (i64, bool)) {
     use std::arch::x86_64::*;
-    let known_a = dates.slots.get_unchecked(Dates::slot((a.add(8) as *const u16).read_unaligned()));
-    let known_b = dates.slots.get_unchecked(Dates::slot((b.add(8) as *const u16).read_unaligned()));
+    let known_a = dates.slots.get_unchecked(Dates::slot(Dates::day(a)));
+    let known_b = dates.slots.get_unchecked(Dates::slot(Dates::day(b)));
     let both = |first: *const u8, second: *const u8| {
         _mm256_inserti128_si256(_mm256_castsi128_si256(_mm_loadu_si128(first as *const __m128i)), _mm_loadu_si128(second as *const __m128i), 1)
     };
@@ -554,16 +610,19 @@ pub unsafe fn parse(p: *const u8, len: usize, dates: &mut Dates) -> i64 {
     finish(p, len, dates, digits, date_known(p, dates), time)
 }
 
-/// `parse`, given what the text holds as numbers (`numbers`) and its date (`date_known`).
+/// The two common forms of a `ts`, 13 digits and UTC on a date already seen,
+/// both worked out without a branch from what the text holds as numbers
+/// (`numbers`) and its date (`date_known`): the epoch milliseconds, and whether
+/// the text is one of the two and good. Then what the offset form needs: the
+/// epoch seconds of the text read as local time, and whether those are good.
 #[inline(always)]
-unsafe fn finish(
+unsafe fn common_forms(
     p: *const u8,
     len: usize,
-    dates: &mut Dates,
     (digits, digits_ok): (i64, bool),
     (midnight, date_ok): (i64, bool),
     (time, time_ok): (i64, bool),
-) -> i64 {
+) -> (i64, bool, i64, bool) {
     let seconds = midnight.wrapping_add(time);
     let civil_ok = date_ok & time_ok;
     let is_digits = len == 13;
@@ -572,6 +631,13 @@ unsafe fn finish(
     // a branch on the form, which is the one thing here that cannot be predicted.
     let value = std::hint::select_unpredictable(is_digits, digits, seconds.wrapping_mul(1_000));
     let ok = std::hint::select_unpredictable(is_digits, digits_ok, is_utc & civil_ok);
+    (value, ok, seconds, civil_ok)
+}
+
+/// `parse`, given what the text holds as numbers (`numbers`) and its date (`date_known`).
+#[inline(always)]
+unsafe fn finish(p: *const u8, len: usize, dates: &mut Dates, digits: (i64, bool), date: (i64, bool), time: (i64, bool)) -> i64 {
+    let (value, ok, seconds, civil_ok) = common_forms(p, len, digits, date, time);
     // `ok` is true nine times in ten, so this branch is cheap, but only as one
     // branch: the compiler splits a branch on "A and B, or C and D" into a branch
     // on each, and the first of those is the form again. `hidden` keeps from it
@@ -614,16 +680,43 @@ unsafe fn finish_utc(p: *const u8, len: usize, dates: &mut Dates, (midnight, dat
 /// An event line's two timestamps: its `ts` as `parse` gives it, and its
 /// `ingest_ts` as `parse_utc` does. What the two hold as numbers is worked out
 /// in one pass (`numbers`) and their two dates are looked up in one compare
-/// (`dates_known`), both before either is finished: a date that `ingest_ts`
-/// brings for the first time is not yet known to the `ts` beside it, which
-/// then gets its answer the slow way. `ts` and `ingest` must each be in the
-/// reader's buffer, as for `parse`.
+/// (`dates_known`). `ts` and `ingest` must each be in the reader's buffer, as
+/// for `parse`.
+///
+/// When either needs the slow way (a date not yet in the table, a bad
+/// timestamp, digits that are not thirteen), both go it, in one call that
+/// nothing worked out here has to outlive (`both_general`): with a call of its
+/// own for each, whatever the other had found was kept on the stack across it
+/// on every line. The slow way gives every text the answer the fast one does.
 #[inline(always)]
 pub unsafe fn parse_both(ts: *const u8, ts_len: usize, ingest: *const u8, ingest_len: usize, dates: &mut Dates) -> (i64, (i64, i64)) {
-    let (digits, ts_time, ingest_time) = numbers(ts, ts.add(11), ingest.add(11));
-    let (ts_date, ingest_date) = dates_known(ts, ingest, dates);
-    let ingest = finish_utc(ingest, ingest_len, dates, ingest_date, ingest_time);
-    (finish(ts, ts_len, dates, digits, ts_date, ts_time), ingest)
+    let (digits, ts_time, (ingest_time, ingest_time_ok)) = numbers(ts, ts.add(11), ingest.add(11));
+    let (ts_date, (ingest_midnight, ingest_date_ok)) = dates_known(ts, ingest, dates);
+    // `ingest_ts` is always UTC on a date already seen, so these are branches the CPU predicts.
+    if !(ingest_len == 20 && *ingest.add(19) == b'Z' && ingest_date_ok && ingest_time_ok) {
+        return both_general(ts, ts_len, ingest, ingest_len, dates);
+    }
+    let ingest_seconds = ingest_midnight + ingest_time;
+    let (value, ok, seconds, civil_ok) = common_forms(ts, ts_len, digits, ts_date, ts_time);
+    // As in `finish`: one branch, taken nine times in ten.
+    if hidden(ok) {
+        return (value, (ingest_seconds, ingest_seconds * 1_000));
+    }
+    let (value, ok) = offset_known(ts, ts_len, seconds, civil_ok);
+    if ok {
+        (value, (ingest_seconds, ingest_seconds * 1_000))
+    } else {
+        both_general(ts, ts_len, ingest, ingest_len, dates)
+    }
+}
+
+/// `parse_both` the slow way: each timestamp by its form. `ingest_ts` first,
+/// so that a date it brings is in the table when `ts` is read.
+#[cold]
+#[inline(never)]
+unsafe fn both_general(ts: *const u8, ts_len: usize, ingest: *const u8, ingest_len: usize, dates: &mut Dates) -> (i64, (i64, i64)) {
+    let ingest = parse_utc_general(ingest, ingest_len, dates);
+    (parse_general(ts, ts_len, dates), ingest)
 }
 
 #[cold]
