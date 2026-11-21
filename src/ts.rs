@@ -175,7 +175,7 @@ impl Dates {
     /// them out of a wider load of the same bytes, three instructions for one.
     #[inline(always)]
     unsafe fn day(p: *const u8) -> u16 {
-        std::ptr::read_volatile(p.add(8) as *const [u8; 2] as *const u16)
+        u16::from_le_bytes(std::ptr::read_volatile(p.add(8) as *const [u8; 2]))
     }
 
     /// The slot for a day of the month, given its two characters: a different
