@@ -498,11 +498,22 @@ pub fn at_scale() {
     }
     for round in 1..=2 {
         for threads in ["4", "6", "12", "16"] {
-            run(&format!("NCPU={threads}, run {round}"), &[("NCPU", threads)], &data);
+            if round == 1 || threads == "4" || threads == "16" {
+                run(&format!("NCPU={threads}, run {round}"), &[("NCPU", threads)], &data);
+            }
         }
     }
     for round in 1..=3 {
         run(&format!("SS_SCAN=narrow, run {round}"), &[("SS_SCAN", "narrow")], &data);
+    }
+    // Partitions and the read block: what two threads of one core have to keep in its cache between them.
+    for round in 1..=2 {
+        for bits in ["9", "11"] {
+            run(&format!("2^{bits} partitions of each kind, run {round}"), &[("SS_PERSON_BITS", bits), ("SS_DEDUP_BITS", bits)], &data);
+        }
+        for block in ["131072", "524288"] {
+            run(&format!("SS_BLOCK_BYTES={block}, run {round}"), &[("SS_BLOCK_BYTES", block)], &data);
+        }
     }
     for round in 6..=7 {
         run(&format!("as scored, run {round}"), &[], &data);
