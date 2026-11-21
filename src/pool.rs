@@ -150,18 +150,18 @@ struct Pending<T> {
     end_index: u32,
 }
 
-/// `Scatter` for 16-byte records, through write-combining buffers.
+/// `Scatter` through write-combining buffers of `N` records.
 ///
 /// A thread appends to a couple of thousand partitions in turn, each into
 /// memory nothing has touched yet. Written directly, every new cache line of
 /// every partition is first fetched from memory (only to be overwritten), and
-/// with that many streams no prefetcher sees them coming. Here the four records
-/// of a line collect in a small buffer that stays in cache, and the full line
-/// goes out in one non-temporal store, which fetches nothing.
-pub struct Combine<'p, T> {
+/// with that many streams no prefetcher sees them coming. Here `N` records, a
+/// whole number of cache lines, collect in a small buffer that stays in cache
+/// and then go out in non-temporal stores, which fetch nothing.
+pub struct Combine<'p, T, const N: usize> {
     pool: &'p Pool<T>,
-    /// One cache line of buffered records per partition.
-    lines: *mut [T; 4],
+    /// `N` buffered records per partition, each buffer starting on a cache line.
+    buffers: *mut [T; N],
     states: Vec<Pending<T>>,
     chunks: Vec<Vec<(u32, u32)>>,
     chunk: u32,
@@ -170,34 +170,38 @@ pub struct Combine<'p, T> {
     slab_left: u32,
 }
 
-/// Copies one 64-byte line (both 64-byte aligned) without reading the destination into cache first.
+/// Copies `lines` 64-byte lines (both ends 64-byte aligned) without reading the destination into cache first.
 #[inline(always)]
-unsafe fn stream_line(from: *const u8, to: *mut u8) {
+unsafe fn stream_lines(from: *const u8, to: *mut u8, lines: usize) {
     #[cfg(all(target_arch = "x86_64", target_feature = "avx"))]
     {
         use std::arch::x86_64::*;
-        _mm256_stream_si256(to as *mut __m256i, _mm256_load_si256(from as *const __m256i));
-        _mm256_stream_si256(to.add(32) as *mut __m256i, _mm256_load_si256(from.add(32) as *const __m256i));
+        for half in 0..2 * lines {
+            _mm256_stream_si256(to.add(32 * half) as *mut __m256i, _mm256_load_si256(from.add(32 * half) as *const __m256i));
+        }
     }
     #[cfg(all(target_arch = "x86_64", not(target_feature = "avx")))]
     {
         use std::arch::x86_64::*;
-        for part in 0..4 {
+        for part in 0..4 * lines {
             _mm_stream_si128(to.add(16 * part) as *mut __m128i, _mm_load_si128(from.add(16 * part) as *const __m128i));
         }
     }
     #[cfg(not(target_arch = "x86_64"))]
-    std::ptr::copy_nonoverlapping(from, to, 64);
+    std::ptr::copy_nonoverlapping(from, to, 64 * lines);
 }
 
-impl<'p, T: Copy> Combine<'p, T> {
-    /// `chunk` records per chunk: a power of two, at least 4, no larger than a slab.
+impl<'p, T: Copy, const N: usize> Combine<'p, T, N> {
+    /// Cache lines in a full buffer.
+    const LINES: usize = N * std::mem::size_of::<T>() / 64;
+
+    /// `chunk` records per chunk: a power of two, at least `N`, no larger than a slab.
     pub fn new(pool: &'p Pool<T>, partitions: usize, chunk: usize) -> Self {
-        assert!(std::mem::size_of::<T>() == 16 && std::mem::align_of::<T>() <= 16);
-        assert!(chunk.is_power_of_two() && chunk >= 4 && chunk <= SLAB_RECORDS);
+        assert!(N.is_power_of_two() && (N * std::mem::size_of::<T>()) % 64 == 0 && std::mem::align_of::<T>() <= 64);
+        assert!(chunk.is_power_of_two() && chunk >= N && chunk <= SLAB_RECORDS);
         Self {
             pool,
-            lines: sys::map::<[T; 4]>(partitions.max(64)), // page-aligned, so every line is cache-line aligned
+            buffers: sys::map::<[T; N]>(partitions.max(64)), // page-aligned, so every buffer starts on a cache line
             states: (0..partitions).map(|_| Pending { line: std::ptr::null_mut(), index: 0, end_index: 0 }).collect(),
             chunks: vec![Vec::new(); partitions],
             chunk: chunk as u32,
@@ -208,7 +212,7 @@ impl<'p, T: Copy> Combine<'p, T> {
     }
 
     /// Appends `record` to `partition` and returns its global index. The record
-    /// is only in its final place once its line has filled, or after `finish`.
+    /// is only in its final place once its buffer has filled, or after `finish`.
     #[inline(always)]
     pub fn push(&mut self, partition: usize, record: T) -> u32 {
         unsafe {
@@ -217,13 +221,13 @@ impl<'p, T: Copy> Combine<'p, T> {
             }
             let state = &mut *self.states.as_mut_ptr().add(partition);
             let index = state.index;
-            let slot = (index & 3) as usize;
-            let buffer = self.lines.add(partition) as *mut T;
+            let slot = index as usize & (N - 1);
+            let buffer = self.buffers.add(partition) as *mut T;
             buffer.add(slot).write(record);
             state.index = index + 1;
-            if slot == 3 {
-                stream_line(buffer as *const u8, state.line as *mut u8);
-                state.line = state.line.add(4);
+            if slot == N - 1 {
+                stream_lines(buffer as *const u8, state.line as *mut u8, Self::LINES);
+                state.line = state.line.add(N);
             }
             index
         }
@@ -258,8 +262,8 @@ impl<'p, T: Copy> Combine<'p, T> {
             if state.line.is_null() {
                 continue;
             }
-            let buffered = (state.index & 3) as usize;
-            unsafe { std::ptr::copy_nonoverlapping(self.lines.add(partition) as *const T, state.line, buffered) };
+            let buffered = state.index as usize & (N - 1);
+            unsafe { std::ptr::copy_nonoverlapping(self.buffers.add(partition) as *const T, state.line, buffered) };
             let used = state.index - (state.end_index - self.chunk);
             if used > 0 {
                 self.chunks[partition].push((state.end_index - self.chunk, used));
