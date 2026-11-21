@@ -86,30 +86,38 @@ impl Context<'_> {
 }
 
 /// How many lines pass between asking for a user's slot in the link table and
-/// reading it. The table is far larger than the cache, so every lookup is a
-/// memory fetch; started this early, the fetches overlap instead of each one
-/// stalling the parser.
+/// writing the line's records. The table is far larger than the cache, so every
+/// lookup is a memory fetch; started this early, the fetches overlap instead of
+/// each one stalling the parser.
 const RING: usize = 16;
+/// How many lines after that request the slot is read (`look_up_*`). Reading it
+/// names the person, so the partitions the records go to; those are asked for
+/// then, `RING - LOOK` lines before they are written.
+const LOOK: usize = 12;
 
-/// A parsed event copy waiting for its user's link-table slot to arrive.
+/// A parsed event copy on its way to its partitions.
 #[derive(Clone, Copy, Default)]
 struct PendingEvent {
-    /// 0 for a copy that would not survive: it leaves only its dedup record.
+    /// The user until the link table has been read, then the person. 0 for a
+    /// copy that would not survive: it leaves only its dedup record.
     user: Key,
     event: Key,
     ts: u32,
     purchase: u32,
     ingest: u32,
-    /// Where the user's lookup in the link table starts.
+    /// Where the user's lookup in the link table starts; after the lookup, the
+    /// two partitions: the person's in the low half, the event's in the high half.
     home: u32,
 }
 
 #[derive(Clone, Copy, Default)]
 struct PendingClick {
+    /// The user until the link table has been read, then the person.
     user: Key,
     click: Key,
     ts: u32,
     campaign: u32,
+    /// Where the lookup starts; after it, the person's partition.
     home: u32,
 }
 
@@ -126,36 +134,68 @@ struct Sink<'a> {
 }
 
 impl Sink<'_> {
-    /// Files an event copy: its event record if it would survive, and its dedup record.
+    /// Reads the link table for an event copy: from here on it knows its person
+    /// and both its partitions, and the CPU has been asked for them.
     #[inline(always)]
-    fn settle_event(&mut self, pending: PendingEvent) {
+    fn look_up_event(&mut self, slot: usize) {
         let context = self.context;
-        let mut at = NO_EVENT;
+        let pending = unsafe { self.waiting_events.get_unchecked_mut(slot) };
+        let mut person_partition = 0;
         if pending.user != 0 {
             let person = context.links.person_at(pending.user, pending.home);
-            let partition = (sys::mix(person) >> context.person_shift) as usize;
-            at = self.events.push(partition, Event { person, ts: pending.ts, purchase: pending.purchase });
+            pending.user = person;
+            person_partition = (sys::mix(person) >> context.person_shift) as usize;
+            self.events.prefetch(person_partition);
         }
-        let partition = (sys::mix(pending.event) >> context.dedup_shift) as usize;
+        let event_partition = (sys::mix(pending.event) >> context.dedup_shift) as usize;
+        self.copies.prefetch(event_partition);
+        pending.home = person_partition as u32 | (event_partition as u32) << 16;
+    }
+
+    /// Files an event copy that has been looked up: its event record if it would survive, and its dedup record.
+    #[inline(always)]
+    fn settle_event(&mut self, pending: PendingEvent) {
+        let mut at = NO_EVENT;
+        if pending.user != 0 {
+            let partition = (pending.home & 0xffff) as usize;
+            at = self.events.push(partition, Event { person: pending.user, ts: pending.ts, purchase: pending.purchase });
+        }
+        let partition = (pending.home >> 16) as usize;
         self.copies.push(partition, Copy_ { event: pending.event, ingest: pending.ingest, at });
     }
 
     #[inline(always)]
-    fn settle_click(&mut self, pending: PendingClick) {
+    fn look_up_click(&mut self, slot: usize) {
         let context = self.context;
+        let pending = unsafe { self.waiting_clicks.get_unchecked_mut(slot) };
         let person = context.links.person_at(pending.user, pending.home);
+        pending.user = person;
         let partition = (sys::mix(person) >> context.person_shift) as usize;
-        self.clicks.push(partition, Click { person, click: pending.click, ts: pending.ts, campaign: pending.campaign });
+        self.clicks.prefetch(partition);
+        pending.home = partition as u32;
     }
 
-    /// Files everything still waiting.
+    #[inline(always)]
+    fn settle_click(&mut self, pending: PendingClick) {
+        self.clicks.push(pending.home as usize, Click { person: pending.user, click: pending.click, ts: pending.ts, campaign: pending.campaign });
+    }
+
+    /// Files everything still waiting, oldest first; the newest `LOOK` have not been looked up yet.
     fn drain(&mut self) {
-        for i in 0..self.event_count.min(RING) {
-            self.settle_event(self.waiting_events[i]);
+        let count = self.event_count;
+        for line in count.saturating_sub(RING)..count {
+            if line + LOOK >= count {
+                self.look_up_event(line & (RING - 1));
+            }
+            self.settle_event(self.waiting_events[line & (RING - 1)]);
         }
         self.event_count = 0;
-        for i in 0..self.click_count.min(RING) {
-            self.settle_click(self.waiting_clicks[i]);
+        let count = self.click_count;
+        for line in count.saturating_sub(RING)..count {
+            if line + LOOK >= count {
+                self.look_up_click(line & (RING - 1));
+            }
+            self.settle_click(self.waiting_clicks[line & (RING - 1)]);
         }
         self.click_count = 0;
     }
@@ -259,6 +299,9 @@ impl Lines for EventLines<'_, '_> {
             let ready = sink.waiting_events[slot];
             sink.settle_event(ready);
         }
+        if sink.event_count >= LOOK {
+            sink.look_up_event((sink.event_count - LOOK) & (RING - 1));
+        }
         sink.waiting_events[slot] =
             PendingEvent { user, event, ts: at_ms.wrapping_sub(context.epoch) as u32, purchase, ingest, home };
         sink.event_count += 1;
@@ -296,6 +339,9 @@ impl Lines for ClickLines<'_, '_> {
         if sink.click_count >= RING {
             let ready = sink.waiting_clicks[slot];
             sink.settle_click(ready);
+        }
+        if sink.click_count >= LOOK {
+            sink.look_up_click((sink.click_count - LOOK) & (RING - 1));
         }
         sink.waiting_clicks[slot] =
             PendingClick { user, click: key::key_of_padded(data.add(id), id_end - id), ts: (at_ms - context.epoch) as u32, campaign, home };
