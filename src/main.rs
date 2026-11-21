@@ -274,6 +274,10 @@ fn main() {
         "pipeline: inside links: catalog done at {catalog_ms:.1} ms; link parse {:.1}, join {:.1}, name {:.1} ms; peak memory {} MB",
         links.timing[0], links.timing[1], links.timing[2], sys::peak_memory_mb(),
     );
+    // Wall-clock times, so whoever starts the container can see how long it took to
+    // reach `main` and how long the container outlived it.
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis());
+    eprintln!("pipeline: began at {} ms, ended at {now} ms since 1970", now - started.elapsed().as_millis());
     if cfg!(target_os = "linux") && event_bytes < (256 << 20) {
         describe_machine();
     }

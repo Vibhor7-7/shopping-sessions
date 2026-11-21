@@ -1,0 +1,44 @@
+name: overhead
+# Where does a container's time go outside the process? Runs the image under
+# several variations of the scorer's flags and splits each run into: until the
+# process began, the process itself, and from its end to `docker run` returning.
+#   gh workflow run overhead.yml [-f events=60000000]
+on:
+  workflow_dispatch:
+    inputs:
+      events:
+        description: Events in the dataset
+        default: "60000000"
+
+jobs:
+  overhead:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Image and dataset
+        run: |
+          docker build -q -t shopping-sessions:latest .
+          cargo build --release --bin synth 2>&1 | tail -1
+          target/release/synth --events ${{ inputs.events }} --clicks $(( ${{ inputs.events }} / 4 )) --seed 9 --output data
+          cat data/events/* data/clicks/* data/links/* > /dev/null
+          grep -m1 'model name' /proc/cpuinfo; free -g | sed -n 2p; docker info --format 'docker {{.ServerVersion}}, {{.Driver}}, cgroup v{{.CgroupVersion}}, runtime {{.DefaultRuntime}}'
+      - name: Variations
+        run: |
+          mkdir -p bind && chmod 777 bind
+          try() {
+            name="$1"; shift
+            for i in 1 2 3; do
+              sudo rm -rf bind/*
+              start=$(date +%s%3N)
+              docker run --rm --network none --read-only --tmpfs /tmp:rw,size=64m --user 1000:1000 \
+                -v "$PWD/data":/data:ro -e NCPU=4 "$@" shopping-sessions:latest 2> err.log
+              end=$(date +%s%3N)
+              began=$(grep -o 'began at [0-9]*' err.log | grep -o '[0-9]*$'); ended=$(grep -o 'ended at [0-9]*' err.log | grep -o '[0-9]*$')
+              echo "$name: total $((end - start)) ms = $((began - start)) before main + $((ended - began)) in the process + $((end - ended)) after it"
+            done
+          }
+          try "scorer flags, output on disk     " --cpus 4 --memory 12g -v "$PWD/bind":/output
+          try "output on tmpfs                  " --cpus 4 --memory 12g --tmpfs /output:rw,size=2g,mode=1777
+          try "no memory limit, output on disk  " --cpus 4 -v "$PWD/bind":/output
+          try "no limits at all, output on tmpfs" --tmpfs /output:rw,size=2g,mode=1777
+          try "scorer flags, cpuset 0-3         " --cpuset-cpus 0-3 --memory 12g -v "$PWD/bind":/output
