@@ -58,3 +58,14 @@ jobs:
             echo "[$settings] $(python3 scripts/compare_exact.py out ref | tail -1)"
             python3 scripts/compare_exact.py out ref | tail -1 | grep -q MATCH
           done
+      - name: Pipeline and reference agree when nearly every event has a user of its own
+        # The table that numbers a partition's people then grows in the middle of the pass that
+        # fills it (src/person.rs), which no generated dataset makes it do. BENCH.md, experiment 41.
+        run: |
+          python3 scripts/many_people.py many 60000 1
+          target/release/reference many manyref
+          for settings in "NCPU=4" "NCPU=1" "NCPU=3 SS_PERSON_BITS=1 SS_DEDUP_BITS=1" "NCPU=5 SS_PERSON_BITS=9 SS_DEDUP_BITS=7"; do
+            rm -rf out; env $settings target/release/pipeline many out 2>/dev/null
+            echo "[$settings] $(python3 scripts/compare_exact.py out manyref | tail -1)"
+            python3 scripts/compare_exact.py out manyref | tail -1 | grep -q MATCH
+          done
