@@ -15,7 +15,7 @@ jobs:
         run: grep -m1 'model name' /proc/cpuinfo; grep -m1 -o -w -E 'avx2|avx512f|avx512_vbmi2' /proc/cpuinfo | sort -u | tr '\n' ' '
       - name: Build the image
         run: docker build -t shopping-sessions:latest .
-      - name: The probe's log on this machine (branch probe only: no fixtures here, its output is wrong on purpose)
+      - name: The probe's log on this machine (branch probe only; no fixtures here, its output is wrong on purpose)
         env:
           CPUS: 4
           MEM: 12g
