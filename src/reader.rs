@@ -44,11 +44,27 @@ pub trait Lines {
     /// Commas in a well-formed line: one fewer than its fields.
     const COMMAS: usize;
 
-    /// One line with the right number of commas, which holds `quotes` double
-    /// quotes. `delims[0]` is the offset of the newline before it (`u32::MAX`,
-    /// which is -1, for the line at offset 0), `delims[1..=COMMAS]` are its
-    /// commas and `delims[COMMAS + 1]` is its own newline.
-    unsafe fn line(&mut self, data: *const u8, delims: *const u32, quotes: u32);
+    /// What may be one line: `delims[0]` is the offset of the newline before it
+    /// (`u32::MAX`, which is -1, for the line at offset 0) and `delims[1..]` are
+    /// the delimiters that follow, at least `COMMAS + 1` of them. Stage one does
+    /// not say which of those are commas, so that is settled here, from the bytes:
+    /// the line has the right number of fields exactly when the first `COMMAS`
+    /// are commas and the next one is a newline. If so, the line is taken
+    /// (`quotes` is how many double quotes lie between `delims[0]` and
+    /// `delims[COMMAS + 1]`) and the answer is `true`. If not, nothing is done
+    /// and the answer is `false`.
+    unsafe fn line(&mut self, data: *const u8, delims: *const u32, quotes: u32) -> bool;
+}
+
+/// Whether delimiters 1 to `N - 1` after `delims[0]` are commas and delimiter
+/// `N` is a newline: a line of `N` fields. All of them must be real delimiters.
+#[inline(always)]
+pub unsafe fn is_line<const N: usize>(data: *const u8, delims: *const u32) -> bool {
+    let mut ok = *data.add(*delims.add(N) as usize) == b'\n';
+    for comma in 1..N {
+        ok &= *data.add(*delims.add(comma) as usize) != b'\n';
+    }
+    ok
 }
 
 /// A field's bounds once the quotes around it, if it is wrapped in a pair, are
@@ -83,16 +99,21 @@ impl Fields {
     }
 }
 
-/// Splits a line of `N` fields (at most 7) at its delimiters, `delims` as
-/// `Lines::line` gets them, and returns how many fields were wrapped in quotes.
+/// Splits what may be a line of `N` fields (at most 7) at its delimiters,
+/// `delims` as `Lines::line` gets them. Returns how many fields were wrapped in
+/// quotes, and whether this is a line of `N` fields at all (`is_line`); if it is
+/// not, the bounds and the count mean nothing.
 /// All fields at once: the four bytes around each delimiter hold the last
-/// character of the field before it and the first of the field after it, and
-/// with those side by side the seven "is this field wrapped" questions are a
-/// handful of vector instructions instead of seven rounds of loads and compares.
-/// Reads `delims[0..9]`, and the 4 bytes from one before each of those offsets.
+/// character of the field before it, the delimiter itself and the first
+/// character of the field after it. With those side by side, the seven "is this
+/// field wrapped" questions and the eight "is this a comma or a newline" ones
+/// are a handful of vector instructions instead of rounds of loads and compares.
+/// Reads `delims[0..9]`, and the 4 bytes from one before each of those offsets:
+/// a slot past the last delimiter holds `u32::MAX`, and reads the bytes before
+/// the data, which the reader keeps readable and which never hold a newline.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 #[inline(always)]
-pub unsafe fn split<const N: usize>(data: *const u8, delims: *const u32, fields: &mut Fields) -> u32 {
+pub unsafe fn split<const N: usize>(data: *const u8, delims: *const u32, fields: &mut Fields) -> (u32, bool) {
     use std::arch::x86_64::*;
     let around = |i: usize| (data.offset(*delims.add(i) as i32 as isize - 1) as *const i32).read_unaligned();
     let low = _mm_insert_epi32(
@@ -106,7 +127,12 @@ pub unsafe fn split<const N: usize>(data: *const u8, delims: *const u32, fields:
         3,
     );
     // Lane i: the bytes at delimiter i's offset - 1, +0, +1, +2.
-    let quote = _mm256_cmpeq_epi8(_mm256_inserti128_si256(_mm256_castsi128_si256(low), high, 1), _mm256_set1_epi8(b'"' as i8));
+    let around_all = _mm256_inserti128_si256(_mm256_castsi128_si256(low), high, 1);
+    // Byte 1 of lane i is delimiter i itself: bit 4i + 1 says it is a newline.
+    // Lanes 1 to N - 1 must be commas and lane N the newline that ends the line.
+    let newlines = _mm256_movemask_epi8(_mm256_cmpeq_epi8(around_all, _mm256_set1_epi8(b'\n' as i8))) as u32;
+    let is_line = newlines & (0x2222_2220 & (u32::MAX >> (28 - 4 * N))) == 2 << (4 * N);
+    let quote = _mm256_cmpeq_epi8(around_all, _mm256_set1_epi8(b'"' as i8));
     // Field i lies between delimiters i and i + 1: it opens with the byte after
     // the first (byte 2 of lane i) and closes with the byte before the second
     // (byte 0 of lane i + 1).
@@ -121,12 +147,15 @@ pub unsafe fn split<const N: usize>(data: *const u8, delims: *const u32, fields:
     _mm256_store_si256(fields.start.as_mut_ptr() as *mut __m256i, _mm256_add_epi32(_mm256_add_epi32(before, one), wrapped));
     _mm256_store_si256(fields.len.as_mut_ptr() as *mut __m256i, _mm256_sub_epi32(len, _mm256_add_epi32(wrapped, wrapped)));
     let bits = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_slli_epi32(wrapped, 31))) as u32;
-    (bits & ((1 << N) - 1)).count_ones()
+    ((bits & ((1 << N) - 1)).count_ones(), is_line)
 }
 
 #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
 #[inline(always)]
-pub unsafe fn split<const N: usize>(data: *const u8, delims: *const u32, fields: &mut Fields) -> u32 {
+pub unsafe fn split<const N: usize>(data: *const u8, delims: *const u32, fields: &mut Fields) -> (u32, bool) {
+    if !is_line::<N>(data, delims) {
+        return (0, false);
+    }
     let mut count = 0;
     for field in 0..N {
         let start = (*delims.add(field)).wrapping_add(1) as usize;
@@ -135,7 +164,7 @@ pub unsafe fn split<const N: usize>(data: *const u8, delims: *const u32, fields:
         fields.len[field] = (to - from) as u32;
         count += wrapped;
     }
-    count
+    (count, true)
 }
 
 fn read_fully(file: &File, mut into: &mut [u8], mut at: u64) -> usize {
@@ -156,6 +185,22 @@ fn read_fully(file: &File, mut into: &mut [u8], mut at: u64) -> usize {
         }
     }
     total
+}
+
+/// The first delimiter from `delims[from]` on that is a newline, or -1 if the
+/// rest of the buffer holds none.
+#[inline(always)]
+unsafe fn next_newline(data: *const u8, delims: *const u32, mut from: isize) -> isize {
+    loop {
+        let at = *delims.offset(from);
+        if at == u32::MAX {
+            return -1;
+        }
+        if *data.add(at as usize) == b'\n' {
+            return from;
+        }
+        from += 1;
+    }
 }
 
 /// Feeds `sink` every data line of `file` that starts in `offset..offset + length`.
@@ -186,60 +231,57 @@ pub fn walk<L: Lines>(file: &File, offset: u64, length: u64, buf: &mut ReadBuf, 
         let data = unsafe { buf.bytes.as_ptr().add(FRONT) };
         unsafe { buf.index.build(data, len) };
         let index = &buf.index;
-        let count = index.newline_count;
-        let newlines = index.newlines.as_ptr();
         let delims = index.delims();
 
-        let mut line = 0usize; // which newline ends the next line
         let mut start = 0usize; // where the next line starts
         // Which delimiter is the one just before `start`: -1 is the slot in front, the delimiter at offset -1.
         let mut before = -1isize;
         if skip {
-            if count == 0 {
+            // The first newline ends the header, or the line this range starts inside.
+            let first = unsafe { next_newline(data, delims, 0) };
+            if first < 0 {
                 if at_end {
                     return;
                 }
                 continue; // still inside the line to skip: read on
             }
-            let first = unsafe { *newlines };
-            start = first as usize + 1;
-            line = 1;
+            before = first;
+            start = unsafe { *delims.offset(first) } as usize + 1;
             skip = false;
-            before = 0;
-            unsafe {
-                while *delims.offset(before) < first {
-                    before += 1;
-                }
-            }
         }
         // Lines starting at or after `stop` belong to the next range.
         let stop = usize::try_from(range_end - base).unwrap_or(usize::MAX);
         let mut done = false;
         unsafe {
             let mut quotes_before = index.quotes_before(start);
-            while line < count {
+            loop {
                 if start >= stop {
                     done = true;
                     break;
                 }
-                let end = *newlines.add(line);
-                let quotes_at_end = index.quotes_before(end as usize);
-                let quotes = quotes_at_end - quotes_before;
-                quotes_before = quotes_at_end;
-                // The line's own newline is the delimiter COMMAS + 1 after the one
-                // before it exactly when COMMAS commas lie between the two.
-                if *delims.offset(before + L::COMMAS as isize + 1) == end {
-                    sink.line(data, delims.offset(before), quotes);
-                    before += L::COMMAS as isize + 1;
-                } else {
-                    // Wrong number of fields (an empty line has none): malformed, dropped.
-                    before += 1;
-                    while *delims.offset(before) < end {
-                        before += 1;
+                // If this is a line with the right number of fields, its newline is
+                // the delimiter COMMAS + 1 after the one before it. A slot past the
+                // last delimiter holds `u32::MAX`: fewer delimiters than that are left.
+                let end = *delims.offset(before + L::COMMAS as isize + 1);
+                if end != u32::MAX {
+                    let quotes_at_end = index.quotes_before(end as usize);
+                    if sink.line(data, delims.offset(before), quotes_at_end - quotes_before) {
+                        quotes_before = quotes_at_end;
+                        before += L::COMMAS as isize + 1;
+                        start = end as usize + 1;
+                        continue;
                     }
                 }
-                start = end as usize + 1;
-                line += 1;
+                // Not such a line. If it ends in this buffer it has the wrong number
+                // of fields (an empty line has none): malformed, dropped. If it does
+                // not, it is the unfinished line at the end of what has been read.
+                let newline = next_newline(data, delims, before + 1);
+                if newline < 0 {
+                    break;
+                }
+                before = newline;
+                start = *delims.offset(newline) as usize + 1;
+                quotes_before = index.quotes_before(start);
             }
         }
         if done || at_end || base + start as u64 >= range_end {
@@ -318,4 +360,184 @@ pub fn jobs(inputs: &[Input], target: u64) -> Vec<Job> {
         }
     }
     jobs
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A small deterministic generator, so the test needs no crate.
+    fn next(state: &mut u64) -> u64 {
+        *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = *state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// What a sink is owed for one line: its bytes, its quotes, and each field
+    /// without the quotes wrapped around it.
+    #[derive(Debug, PartialEq)]
+    struct Seen {
+        line: Vec<u8>,
+        quotes: u32,
+        wrapped: u32,
+        fields: Vec<Vec<u8>>,
+    }
+
+    /// Takes lines of `N` fields through `split`, as the event and click sinks do.
+    struct Split<const N: usize>(Vec<Seen>);
+    /// Takes lines of `N` fields through `is_line` and `unquoted`, as the link sink does.
+    struct Plain<const N: usize>(Vec<Seen>);
+
+    unsafe fn seen(data: *const u8, delims: *const u32, fields: usize, quotes: u32, wrapped: u32, bounds: Vec<(usize, usize)>) -> Seen {
+        let (from, to) = ((*delims).wrapping_add(1) as usize, *delims.add(fields) as usize);
+        Seen {
+            line: std::slice::from_raw_parts(data.add(from), to - from).to_vec(),
+            quotes,
+            wrapped,
+            fields: bounds.iter().map(|&(at, len)| std::slice::from_raw_parts(data.add(at), len).to_vec()).collect(),
+        }
+    }
+
+    macro_rules! split_sink {
+        ($n:literal) => {
+            impl Lines for Split<$n> {
+                const COMMAS: usize = $n - 1;
+                unsafe fn line(&mut self, data: *const u8, delims: *const u32, quotes: u32) -> bool {
+                    let mut fields = Fields::new();
+                    let (wrapped, shaped) = split::<$n>(data, delims, &mut fields);
+                    assert_eq!(shaped, is_line::<$n>(data, delims));
+                    if shaped {
+                        let bounds = (0..$n).map(|i| (fields.at(i), fields.len(i))).collect();
+                        self.0.push(seen(data, delims, $n, quotes, wrapped, bounds));
+                    }
+                    shaped
+                }
+            }
+            impl Lines for Plain<$n> {
+                const COMMAS: usize = $n - 1;
+                unsafe fn line(&mut self, data: *const u8, delims: *const u32, quotes: u32) -> bool {
+                    if !is_line::<$n>(data, delims) {
+                        return false;
+                    }
+                    let mut wrapped = 0;
+                    let mut bounds = Vec::new();
+                    for field in 0..$n {
+                        let (from, to, w) = unquoted(data, (*delims.add(field)).wrapping_add(1) as usize, *delims.add(field + 1) as usize);
+                        bounds.push((from, to - from));
+                        wrapped += w;
+                    }
+                    self.0.push(seen(data, delims, $n, quotes, wrapped, bounds));
+                    true
+                }
+            }
+        };
+    }
+    split_sink!(2);
+    split_sink!(4);
+    split_sink!(7);
+
+    /// The definition: every line after the first that starts in the range and has `fields` fields.
+    fn expected(content: &[u8], fields: usize) -> Vec<Seen> {
+        let mut lines: Vec<&[u8]> = content.split(|&b| b == b'\n').collect();
+        if content.is_empty() || content.ends_with(b"\n") {
+            lines.pop(); // nothing after the last newline: not a line
+        }
+        let mut found = Vec::new();
+        for line in lines.into_iter().skip(1) {
+            let parts: Vec<&[u8]> = line.split(|&b| b == b',').collect();
+            if parts.len() != fields {
+                continue;
+            }
+            let mut wrapped = 0;
+            let unwrapped = parts
+                .iter()
+                .map(|part| {
+                    if part.len() >= 2 && part[0] == b'"' && part[part.len() - 1] == b'"' {
+                        wrapped += 1;
+                        part[1..part.len() - 1].to_vec()
+                    } else {
+                        part.to_vec()
+                    }
+                })
+                .collect();
+            found.push(Seen { line: line.to_vec(), quotes: line.iter().filter(|&&b| b == b'"').count() as u32, wrapped, fields: unwrapped });
+        }
+        found
+    }
+
+    fn read_with<L: Lines>(input: &Input, block: usize, target: u64, sink: &mut L) {
+        // Ranges in file order, each with a buffer of its own or one that has been used before.
+        let mut pieces = jobs(std::slice::from_ref(input), target);
+        pieces.sort_by_key(|job| job.offset);
+        let capacity = 2 * block;
+        let mut buf = ReadBuf { bytes: vec![0; FRONT + capacity + 128], index: Index::new(capacity + 64), block };
+        for job in pieces {
+            walk(&input.file, job.offset, job.length, &mut buf, sink);
+        }
+    }
+
+    #[test]
+    fn every_line_reaches_its_sink_once_whatever_the_blocks_and_ranges() {
+        let path = std::env::temp_dir().join(format!("shopping-sessions-walk-{}.csv", std::process::id()));
+        let mut state = 2026;
+        let mut lines_seen = [0usize; 3];
+        for round in 0..1_500 {
+            // Fields are short, so that lines of 2, 4 and 7 fields all turn up, with
+            // empty lines, quotes in and out of place, and long lines now and then.
+            let len = (next(&mut state) % 900) as usize;
+            let newline_every = 6 + next(&mut state) % 60;
+            let mut content: Vec<u8> = (0..len)
+                .map(|_| {
+                    let r = next(&mut state);
+                    match r % newline_every {
+                        0 => b'\n',
+                        1..=4 if r >> 20 & 1 == 0 => b',',
+                        5 if r >> 21 & 3 == 0 => b'"',
+                        6 if r >> 23 & 7 == 0 => b'\r',
+                        _ => b'a' + (r >> 32) as u8 % 26,
+                    }
+                })
+                .collect();
+            if round % 3 == 0 && !content.is_empty() {
+                *content.last_mut().unwrap() = b'\n';
+            }
+            // Wrap some fields in quotes, as the generator does.
+            let mut at = 0;
+            while at < content.len() {
+                let end = content[at..].iter().position(|&b| b == b',' || b == b'\n').map_or(content.len(), |p| at + p);
+                if next(&mut state) % 5 == 0 && end - at >= 2 {
+                    content[at] = b'"';
+                    content[end - 1] = b'"';
+                }
+                at = end + 1;
+            }
+            std::fs::write(&path, &content).unwrap();
+            let input = Input { file: File::open(&path).unwrap(), len: content.len() as u64 };
+            let whole = content.len() as u64 + 1;
+            for (block, target) in [(16, whole), (17, 7), (16, 1), (64, 50), (61, 33), (128, whole), (1000, 129), (4096, whole)] {
+                let mut two = Plain::<2>(Vec::new());
+                read_with(&input, block, target, &mut two);
+                assert_eq!(two.0, expected(&content, 2), "round {round}, 2 fields, block {block}, ranges of {target}");
+                let mut two = Split::<2>(Vec::new());
+                read_with(&input, block, target, &mut two);
+                assert_eq!(two.0, expected(&content, 2), "round {round}, 2 fields split, block {block}, ranges of {target}");
+                let mut four = Split::<4>(Vec::new());
+                read_with(&input, block, target, &mut four);
+                assert_eq!(four.0, expected(&content, 4), "round {round}, 4 fields, block {block}, ranges of {target}");
+                let mut four = Plain::<4>(Vec::new());
+                read_with(&input, block, target, &mut four);
+                assert_eq!(four.0, expected(&content, 4), "round {round}, 4 fields plain, block {block}, ranges of {target}");
+                let mut seven = Split::<7>(Vec::new());
+                read_with(&input, block, target, &mut seven);
+                assert_eq!(seven.0, expected(&content, 7), "round {round}, 7 fields, block {block}, ranges of {target}");
+                lines_seen[0] += two.0.len();
+                lines_seen[1] += four.0.len();
+                lines_seen[2] += seven.0.len();
+            }
+        }
+        std::fs::remove_file(&path).ok();
+        assert!(lines_seen.iter().all(|&n| n > 2_000), "{lines_seen:?}");
+    }
 }

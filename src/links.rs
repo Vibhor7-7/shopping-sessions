@@ -123,18 +123,22 @@ impl Lines for LinkLines {
     const COMMAS: usize = 1;
 
     #[inline(always)]
-    unsafe fn line(&mut self, data: *const u8, delims: *const u32, quotes: u32) {
+    unsafe fn line(&mut self, data: *const u8, delims: *const u32, quotes: u32) -> bool {
+        if !reader::is_line::<2>(data, delims) {
+            return false; // not two fields
+        }
         let comma = *delims.add(1) as usize;
         let (a0, a1, w0) = reader::unquoted(data, (*delims).wrapping_add(1) as usize, comma);
         let (b0, b1, w1) = reader::unquoted(data, comma + 1, *delims.add(2) as usize);
         if quotes != 2 * (w0 + w1) || a0 == a1 || b0 == b1 {
-            return; // malformed, or a side is empty
+            return true; // malformed, or a side is empty
         }
         let a = key::key_of_padded(data.add(a0), a1 - a0);
         let b = key::key_of_padded(data.add(b0), b1 - b0);
         if a != b {
             self.edges.push((a, b)); // a self-link changes nothing
         }
+        true
     }
 }
 

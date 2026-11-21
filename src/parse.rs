@@ -238,11 +238,14 @@ impl Lines for EventLines<'_, '_> {
     const COMMAS: usize = 6;
 
     #[inline(always)]
-    unsafe fn line(&mut self, data: *const u8, delims: *const u32, quotes: u32) {
+    unsafe fn line(&mut self, data: *const u8, delims: *const u32, quotes: u32) -> bool {
         let sink = &mut *self.0;
         let context = sink.context;
         let mut fields = Fields::new();
-        let wrapped = reader::split::<7>(data, delims, &mut fields);
+        let (wrapped, is_line) = reader::split::<7>(data, delims, &mut fields);
+        if !is_line {
+            return false; // not seven fields
+        }
         let (id, id_end) = (fields.at(0), fields.at(0) + fields.len(0));
         let (user_at, user_end) = (fields.at(1), fields.at(1) + fields.len(1));
         let (ts_at, ts_end) = (fields.at(2), fields.at(2) + fields.len(2));
@@ -252,7 +255,7 @@ impl Lines for EventLines<'_, '_> {
         let (price_at, price_end) = (fields.at(6), fields.at(6) + fields.len(6));
         // Quotes anywhere but around whole fields make the line malformed; so does an empty event_id.
         if quotes != 2 * wrapped || id == id_end {
-            return;
+            return true;
         }
         let event = key::key_of_padded(data.add(id), id_end - id);
         let (ingest_seconds, ingest) = ts::parse_utc(data.add(ingest_at), ingest_end - ingest_at, &mut sink.dates);
@@ -305,6 +308,7 @@ impl Lines for EventLines<'_, '_> {
         sink.waiting_events[slot] =
             PendingEvent { user, event, ts: at_ms.wrapping_sub(context.epoch) as u32, purchase, ingest, home };
         sink.event_count += 1;
+        true
     }
 }
 
@@ -312,26 +316,29 @@ impl Lines for ClickLines<'_, '_> {
     const COMMAS: usize = 3;
 
     #[inline(always)]
-    unsafe fn line(&mut self, data: *const u8, delims: *const u32, quotes: u32) {
+    unsafe fn line(&mut self, data: *const u8, delims: *const u32, quotes: u32) -> bool {
         let sink = &mut *self.0;
         let context = sink.context;
         let mut fields = Fields::new();
-        let wrapped = reader::split::<4>(data, delims, &mut fields);
+        let (wrapped, is_line) = reader::split::<4>(data, delims, &mut fields);
+        if !is_line {
+            return false; // not four fields
+        }
         let (id, id_end) = (fields.at(0), fields.at(0) + fields.len(0));
         let (user_at, user_end) = (fields.at(1), fields.at(1) + fields.len(1));
         let (campaign_at, campaign_end) = (fields.at(2), fields.at(2) + fields.len(2));
         let (ts_at, ts_end) = (fields.at(3), fields.at(3) + fields.len(3));
         if quotes != 2 * wrapped || id == id_end || user_at == user_end {
-            return; // malformed, no click_id, or no user_id
+            return true; // malformed, no click_id, or no user_id
         }
         let at_ms = ts::parse(data.add(ts_at), ts_end - ts_at, &mut sink.dates);
         let catalog = context.catalog;
         if at_ms == ts::BAD || at_ms < context.epoch || at_ms >= catalog.window_end {
-            return;
+            return true;
         }
         let campaign = catalog.campaign(data.add(campaign_at), campaign_end - campaign_at);
         if campaign == catalog::NONE {
-            return;
+            return true;
         }
         let user = key::key_of_padded(data.add(user_at), user_end - user_at);
         let home = context.links.prefetch(user);
@@ -346,6 +353,7 @@ impl Lines for ClickLines<'_, '_> {
         sink.waiting_clicks[slot] =
             PendingClick { user, click: key::key_of_padded(data.add(id), id_end - id), ts: (at_ms - context.epoch) as u32, campaign, home };
         sink.click_count += 1;
+        true
     }
 }
 
