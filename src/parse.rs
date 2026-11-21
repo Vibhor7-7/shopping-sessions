@@ -131,6 +131,9 @@ struct Sink<'a> {
     waiting_clicks: [PendingClick; RING],
     click_count: usize,
     dates: ts::Dates,
+    /// PROBE BUILD ONLY: see `reader::STOP`.
+    stop: u32,
+    checksum: u64,
 }
 
 impl Sink<'_> {
@@ -145,10 +148,15 @@ impl Sink<'_> {
             let person = context.links.person_at(pending.user, pending.home);
             pending.user = person;
             person_partition = (sys::mix(person) >> context.person_shift) as usize;
-            self.events.prefetch(person_partition);
+            if self.stop == 0 || self.stop == 6 {
+                self.events.prefetch(person_partition);
+            }
+            self.checksum ^= person;
         }
         let event_partition = (sys::mix(pending.event) >> context.dedup_shift) as usize;
-        self.copies.prefetch(event_partition);
+        if self.stop == 0 || self.stop == 7 {
+            self.copies.prefetch(event_partition);
+        }
         pending.home = person_partition as u32 | (event_partition as u32) << 16;
     }
 
@@ -156,9 +164,12 @@ impl Sink<'_> {
     #[inline(always)]
     fn settle_event(&mut self, pending: PendingEvent) {
         let mut at = NO_EVENT;
-        if pending.user != 0 {
+        if pending.user != 0 && (self.stop == 0 || self.stop == 6) {
             let partition = (pending.home & 0xffff) as usize;
             at = self.events.push(partition, Event { person: pending.user, ts: pending.ts, purchase: pending.purchase });
+        }
+        if self.stop == 5 || self.stop == 6 {
+            return;
         }
         let partition = (pending.home >> 16) as usize;
         self.copies.push(partition, Copy_ { event: pending.event, ingest: pending.ingest, at });
@@ -171,12 +182,18 @@ impl Sink<'_> {
         let person = context.links.person_at(pending.user, pending.home);
         pending.user = person;
         let partition = (sys::mix(person) >> context.person_shift) as usize;
-        self.clicks.prefetch(partition);
+        if self.stop == 0 {
+            self.clicks.prefetch(partition);
+        }
+        self.checksum ^= person;
         pending.home = partition as u32;
     }
 
     #[inline(always)]
     fn settle_click(&mut self, pending: PendingClick) {
+        if self.stop != 0 {
+            return;
+        }
         self.clicks.push(pending.home as usize, Click { person: pending.user, click: pending.click, ts: pending.ts, campaign: pending.campaign });
     }
 
@@ -241,6 +258,10 @@ impl Lines for EventLines<'_, '_> {
     unsafe fn line(&mut self, data: *const u8, delims: *const u32, quotes: u32) {
         let sink = &mut *self.0;
         let context = sink.context;
+        if sink.stop == 3 {
+            sink.checksum = sink.checksum.wrapping_add(u64::from(*delims.add(7)) ^ u64::from(quotes));
+            return;
+        }
         let mut fields = Fields::new();
         let wrapped = reader::split::<7>(data, delims, &mut fields);
         let (id, id_end) = (fields.at(0), fields.at(0) + fields.len(0));
@@ -287,7 +308,13 @@ impl Lines for EventLines<'_, '_> {
         let (mut user, mut home) = (0, 0);
         if alive {
             user = key::key_of_padded(data.add(user_at), user_end - user_at);
-            home = context.links.prefetch(user);
+            if sink.stop != 4 {
+                home = context.links.prefetch(user);
+            }
+        }
+        if sink.stop == 4 {
+            sink.checksum ^= user ^ event ^ (ingest_seconds as u64) ^ (at_ms as u64) ^ u64::from(purchase);
+            return;
         }
         let ingest = if ingest == ts::BAD {
             u32::MAX
@@ -315,6 +342,10 @@ impl Lines for ClickLines<'_, '_> {
     unsafe fn line(&mut self, data: *const u8, delims: *const u32, quotes: u32) {
         let sink = &mut *self.0;
         let context = sink.context;
+        if sink.stop == 3 {
+            sink.checksum = sink.checksum.wrapping_add(u64::from(*delims.add(4)) ^ u64::from(quotes));
+            return;
+        }
         let mut fields = Fields::new();
         let wrapped = reader::split::<4>(data, delims, &mut fields);
         let (id, id_end) = (fields.at(0), fields.at(0) + fields.len(0));
@@ -334,6 +365,10 @@ impl Lines for ClickLines<'_, '_> {
             return;
         }
         let user = key::key_of_padded(data.add(user_at), user_end - user_at);
+        if sink.stop == 4 {
+            sink.checksum ^= user ^ key::key_of_padded(data.add(id), id_end - id) ^ (at_ms as u64) ^ u64::from(campaign);
+            return;
+        }
         let home = context.links.prefetch(user);
         let slot = sink.click_count & (RING - 1);
         if sink.click_count >= RING {
@@ -398,6 +433,8 @@ pub fn run(
             waiting_clicks: [PendingClick::default(); RING],
             click_count: 0,
             dates: ts::Dates::new(),
+            stop: buf.stop,
+            checksum: 0,
         };
         loop {
             let at = next.fetch_add(1, Ordering::Relaxed);
@@ -410,6 +447,7 @@ pub fn run(
             }
         }
         sink.drain();
+        std::hint::black_box(sink.checksum);
         Parsed {
             copies: sink.copies.finish(),
             events: sink.events.finish(),

@@ -94,7 +94,10 @@ pub fn run(data: &std::path::Path, output: &std::path::Path) {
     }
 
     eprintln!("probe: ---- memory ----");
-    for (label, bytes) in [("fresh 256 MB, first touch", 256usize << 20), ("fresh 256 MB again", 256 << 20)] {
+    let on_huge_pages = || {
+        head("/proc/self/smaps_rollup", 4096).lines().find(|l| l.starts_with("AnonHugePages")).and_then(|l| l.split_whitespace().nth(1).map(str::to_string)).unwrap_or_else(|| "?".into())
+    };
+    for (label, bytes) in [("fresh 256 MB as the pipeline allocates it, first touch", 256usize << 20), ("the same again", 256 << 20)] {
         let started = Instant::now();
         let mut block = vec![0u8; bytes];
         for at in (0..bytes).step_by(4096) {
@@ -103,11 +106,15 @@ pub fn run(data: &std::path::Path, output: &std::path::Path) {
         let touched = started.elapsed().as_secs_f64() * 1e3;
         let started = Instant::now();
         let copy = block.clone();
-        eprintln!("probe: {label}: touch {touched:.1} ms, copy {:.1} ms ({})", started.elapsed().as_secs_f64() * 1e3, copy[bytes - 4096]);
+        let copied = started.elapsed().as_secs_f64() * 1e3;
+        let huge = on_huge_pages();
+        let last = copy[bytes - 4096];
+        let started = Instant::now();
+        drop(copy);
+        drop(block);
+        eprintln!("probe: {label}: touch {touched:.1} ms, copy {copied:.1} ms, this process then has {huge} kB on huge pages, unmap both {:.1} ms ({last})", started.elapsed().as_secs_f64() * 1e3);
     }
-    for line in head("/proc/meminfo", 4096).lines().filter(|l| l.starts_with("AnonHugePages")) {
-        eprintln!("probe: meminfo while 512 MB were live: {line}");
-    }
+    plain_pages();
 
     eprintln!("probe: ---- disks ----");
     let chunk = vec![7u8; 8 << 20];
@@ -141,6 +148,95 @@ pub fn run(data: &std::path::Path, output: &std::path::Path) {
     }
     vector_widths();
     eprintln!("probe: ---- end; the output is now made wrong on purpose so this log is shown ----");
+}
+
+/// What 4 KB pages cost here against huge ones: 256 MB mapped, every page touched, unmapped, under each advice.
+fn plain_pages() {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        use std::ffi::c_void;
+        extern "C" {
+            fn mmap(addr: *mut c_void, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut c_void;
+            fn munmap(addr: *mut c_void, len: usize) -> i32;
+            fn madvise(addr: *mut c_void, len: usize, advice: i32) -> i32;
+        }
+        let bytes = 256usize << 20;
+        for (label, advice) in [("no advice", 0), ("MADV_HUGEPAGE", 14), ("MADV_NOHUGEPAGE", 15)] {
+            for threads in [1usize, 8] {
+                let started = Instant::now();
+                let times: Vec<(f64, f64)> = crate::sys::parallel(threads, |_| {
+                    let map = mmap(std::ptr::null_mut(), bytes + (2 << 20), 3, 0x22, -1, 0);
+                    if map as isize == -1 {
+                        return (0.0, 0.0);
+                    }
+                    let start = ((map as usize + (2 << 20) - 1) & !((2 << 20) - 1)) as *mut u8;
+                    if advice != 0 {
+                        madvise(start as *mut c_void, bytes, advice);
+                    }
+                    let began = Instant::now();
+                    for at in (0..bytes).step_by(4096) {
+                        start.add(at).write_volatile(1);
+                    }
+                    let touched = began.elapsed().as_secs_f64() * 1e3;
+                    let began = Instant::now();
+                    munmap(map, bytes + (2 << 20));
+                    (touched, began.elapsed().as_secs_f64() * 1e3)
+                });
+                let wall = started.elapsed().as_secs_f64() * 1e3;
+                let touch = times.iter().map(|t| t.0).fold(0.0, f64::max);
+                let unmap = times.iter().map(|t| t.1).fold(0.0, f64::max);
+                eprintln!("probe: 256 MB a thread on {threads} threads, {label}: touch every page {touch:.1} ms, unmap {unmap:.1} ms (slowest thread; {wall:.1} ms in all)");
+            }
+        }
+    }
+}
+
+/// The parse phase of this dataset again, cut short at each stage, and whole on other thread counts.
+pub fn anatomy(
+    context: &crate::parse::Context,
+    events: &[crate::reader::Input],
+    clicks: &[crate::reader::Input],
+    threads: usize,
+    person_partitions: usize,
+    dedup_partitions: usize,
+    chunks: crate::parse::ChunkSizes,
+) {
+    use std::sync::atomic::Ordering;
+    let time = |stop: u32, threads: usize, rounds: usize| -> f64 {
+        crate::reader::STOP.store(stop, Ordering::Relaxed);
+        let mut best = f64::MAX;
+        for _ in 0..rounds {
+            let pools = crate::parse::Pools { copies: crate::pool::Pool::new(), events: crate::pool::Pool::new(), clicks: crate::pool::Pool::new() };
+            let started = Instant::now();
+            let parsed = crate::parse::run(context, &pools, events, clicks, threads, person_partitions, dedup_partitions, chunks);
+            best = best.min(started.elapsed().as_secs_f64() * 1e3);
+            std::mem::forget(parsed);
+            std::mem::forget(pools);
+        }
+        crate::reader::STOP.store(0, Ordering::Relaxed);
+        best
+    };
+    eprintln!("probe: ---- the parse phase of this dataset, cut short at each stage ({threads} threads, best of 5) ----");
+    for (stop, what) in [
+        (1, "read() only"),
+        (2, "+ delimiter scan"),
+        (3, "+ line walk"),
+        (4, "+ fields into values"),
+        (5, "+ link lookups"),
+        (6, "+ event records"),
+        (7, "+ copy records, not event records"),
+        (0, "everything"),
+    ] {
+        eprintln!("probe: parse, {what}: {:.1} ms", time(stop, threads, 5));
+    }
+    eprintln!("probe: ---- the whole parse phase by thread count (best of 3) ----");
+    for count in [1usize, 2, 4, 6, 8, 12, 16] {
+        eprintln!("probe: parse on {count:>2} threads: {:.1} ms", time(0, count, 3));
+    }
+    eprintln!("probe: ---- read() and the delimiter scan only, by thread count (best of 3) ----");
+    for count in [1usize, 2, 4, 8, 16] {
+        eprintln!("probe: read + scan on {count:>2} threads: {:.1} ms", time(2, count, 3));
+    }
 }
 
 /// Newlines, commas and quotes in `len` bytes, 64 at a time with 256-bit compares: what stage one does.

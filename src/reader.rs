@@ -16,18 +16,26 @@ const FRONT: usize = 64;
 /// Bytes read per call: small enough to stay in the L2 cache while it is parsed.
 const BLOCK: usize = 1 << 18;
 
+/// PROBE BUILD ONLY: how far a line's work goes, so the probe can time the parse
+/// phase stage by stage. 0 = everything; 1 = read; 2 = + delimiter scan;
+/// 3 = + line walk; 4 = + fields into values; 5 = + link lookups;
+/// 6 = + event records; 7 = copy records instead of event records.
+pub static STOP: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 pub struct ReadBuf {
     bytes: Vec<u8>,
     index: Index,
     /// Bytes per read: BLOCK, unless a test asks for something tiny to put block edges everywhere.
     block: usize,
+    pub stop: u32,
 }
 
 impl ReadBuf {
     pub fn new() -> Self {
         let block = std::env::var("SS_BLOCK_BYTES").ok().and_then(|v| v.parse().ok()).unwrap_or(BLOCK).clamp(16, 1 << 24);
         let capacity = 2 * block;
-        Self { bytes: vec![0; FRONT + capacity + 128], index: Index::new(capacity + 64), block }
+        let stop = STOP.load(std::sync::atomic::Ordering::Relaxed);
+        Self { bytes: vec![0; FRONT + capacity + 128], index: Index::new(capacity + 64), block, stop }
     }
 
     /// Room for `len` bytes of data plus a newline and the vector overread.
@@ -161,6 +169,18 @@ fn read_fully(file: &File, mut into: &mut [u8], mut at: u64) -> usize {
 /// Feeds `sink` every data line of `file` that starts in `offset..offset + length`.
 pub fn walk<L: Lines>(file: &File, offset: u64, length: u64, buf: &mut ReadBuf, sink: &mut L) {
     let range_end = offset + length;
+    if buf.stop == 1 {
+        let mut at = offset;
+        while at < range_end {
+            let want = (buf.block as u64).min(range_end - at) as usize;
+            let got = read_fully(file, &mut buf.bytes[FRONT..FRONT + want], at);
+            if got == 0 {
+                break;
+            }
+            at += got as u64;
+        }
+        return;
+    }
     // Start one byte early: if that byte is a newline, a line starts exactly at `offset`.
     let mut next_read = offset.saturating_sub(1);
     let mut base = next_read; // file offset of data[0]
@@ -189,6 +209,19 @@ pub fn walk<L: Lines>(file: &File, offset: u64, length: u64, buf: &mut ReadBuf, 
         let count = index.newline_count;
         let newlines = index.newlines.as_ptr();
         let delims = index.delims();
+        if buf.stop == 2 {
+            if at_end {
+                return;
+            }
+            let start = if count > 0 { (unsafe { *newlines.add(count - 1) }) as usize + 1 } else { 0 };
+            if base + start as u64 >= range_end {
+                return;
+            }
+            buf.bytes.copy_within(FRONT + start..FRONT + len, FRONT);
+            len -= start;
+            base += start as u64;
+            continue;
+        }
 
         let mut line = 0usize; // which newline ends the next line
         let mut start = 0usize; // where the next line starts

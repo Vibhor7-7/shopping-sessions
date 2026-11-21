@@ -284,6 +284,7 @@ fn main() {
     }
     // PROBE BUILD: describe the machine, then spoil the output so the log is shown.
     describe_machine();
+    probe::anatomy(&context, &events, &clicks, threads, 1 << person_bits, 1 << dedup_bits, chunks);
     probe::run(&data, &output);
     if let Ok(files) = std::fs::read_dir(&user_folder) {
         for file in files.flatten() {
