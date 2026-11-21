@@ -26,6 +26,8 @@ TIMESTAMPS = [
 PRICES = [b"", b"0", b"00", b"1", b"0250", b"10000000", b"10000001", b"0000000000010000000", b"00000000000100000000",
           b"19.99", b"-5", b"+500", b"1e3", b" 250", b"250 ", "２５０".encode(), "٢٥٠".encode(), b"250\r", b"99999999999999999999"]
 TYPES = [b"view", b"cart", b"purchase", b"Purchase", b"VIEW", b"cart ", b" view", b"views", b"", b"purchas", b"purchases", b"viewcart"]
+# (event_id, ingest_ts) of every changed event copy so far: no two may be the same.
+MOVED = set()
 
 
 def window(source):
@@ -122,6 +124,13 @@ def mutate(rng, line, kind, start, end, serial):
         try:
             ingest = datetime.datetime.strptime(out[3].decode(), "%Y-%m-%dT%H:%M:%SZ")
             delta = rng.choice([1, -1]) * (700 + (serial % 97) * 1300)
+            # Except on that of a copy that began with the same ingest_ts (the generator writes
+            # such identical copies) and was moved by the same step, as one such pair in 194
+            # is: seed 1795388356 made an event whose two earliest copies tied, one valid
+            # and one not. Such a copy takes 97 more steps, where no other copy can be.
+            while (out[0], ingest + datetime.timedelta(seconds=delta)) in MOVED:
+                delta += (1 if delta > 0 else -1) * 97 * 1300
+            MOVED.add((out[0], ingest + datetime.timedelta(seconds=delta)))
             out[3] = (ingest + datetime.timedelta(seconds=delta)).strftime("%Y-%m-%dT%H:%M:%SZ").encode()
         except ValueError:
             pass
