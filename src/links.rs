@@ -4,7 +4,8 @@
 //! union-find laid out in one open-addressing table. A root always takes the
 //! byte-wise smaller of two IDs as its parent's key, so when the joins are done
 //! the root of every tree is the smallest ID of its person: the name rules.md
-//! asks for, with no separate pass to find it.
+//! asks for, with no separate pass to find it. One pass over the table then
+//! puts that name beside every ID (`name_all`).
 
 use std::fs::File;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -142,8 +143,29 @@ impl Lines for LinkLines {
     }
 }
 
+/// What the four low bits of a pointer to a parent slot hold. No key has it
+/// there (a packed key ends in 0000, an interned one in 0001), so a word that
+/// holds a pointer can be told from one that already holds a name.
+const POINTER: u64 = 2;
+
+#[inline(always)]
+fn pointer_to(slot: usize) -> u64 {
+    ((slot as u64) << 4) | POINTER
+}
+
+#[inline(always)]
+fn is_pointer(word: u64) -> bool {
+    word & 15 == POINTER
+}
+
+/// The slot a pointer points to.
+#[inline(always)]
+fn pointed(word: u64) -> usize {
+    (word >> 4) as usize
+}
+
 /// The union-find while it is being built: each slot an ID key and, in the word
-/// that will hold its person, its parent slot + 1, or 0 for a root.
+/// that will hold its person, a pointer to its parent slot, or 0 for a root.
 struct Forest<'a> {
     words: &'a [AtomicU64],
     mask: usize,
@@ -188,7 +210,7 @@ impl Forest<'_> {
             if parent == 0 {
                 return at;
             }
-            let up = (parent - 1) as usize;
+            let up = pointed(parent);
             let grand = self.parent(up).load(Ordering::Acquire);
             if grand == 0 {
                 return up;
@@ -208,16 +230,80 @@ impl Forest<'_> {
             let (ka, kb) = (self.id(a).load(Ordering::Relaxed), self.id(b).load(Ordering::Relaxed));
             // The root with the larger ID goes under the one with the smaller.
             let (small, large) = if key::compare(ka, kb).is_lt() { (a, b) } else { (b, a) };
-            if self.parent(large).compare_exchange(0, small as u64 + 1, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+            if self.parent(large).compare_exchange(0, pointer_to(small), Ordering::AcqRel, Ordering::Relaxed).is_ok() {
                 return;
             }
         }
+    }
+
+    /// Gives the ID in slot `at`, which holds a pointer, its person's name: the
+    /// ID of its tree's root. Followed upwards, the pointers end at a slot whose
+    /// word is 0 (the root, which its own thread has not reached yet: its ID is
+    /// the name) or at one that already holds a name (the root, or an ID between
+    /// that its thread has named: the same name). Which of the two is a coin
+    /// toss, so the name is selected, not branched on; both are in the one cache
+    /// line that was asked for when `at` was put in the queue.
+    #[inline(always)]
+    fn name(&self, at: usize) {
+        let mut up = pointed(self.parent(at).load(Ordering::Relaxed));
+        loop {
+            let word = self.parent(up).load(Ordering::Relaxed);
+            if is_pointer(word) {
+                up = pointed(word); // an ID the joins left more than one step from its root
+                continue;
+            }
+            let name = std::hint::select_unpredictable(word == 0, self.id(up).load(Ordering::Relaxed), word);
+            self.parent(at).store(name, Ordering::Relaxed);
+            return;
+        }
+    }
+
+    /// Names every ID in slots `from..to`, in one pass, and counts them.
+    ///
+    /// Nothing here branches on what a slot holds: whether it is empty, a root
+    /// or linked to another ID is as good as random from slot to slot. Every
+    /// slot's word is written: a root's with its own ID, an empty slot's with
+    /// the 0 it had, a pointer with itself. A slot that holds a pointer is also
+    /// put in a queue and the line of the slot it points to asked for; it is
+    /// named `BATCH` to `2 * BATCH` queued slots later, a batch at a time, when
+    /// that line has had time to arrive and while the lines of the slots queued
+    /// since are on their way. (A slot that is not queued asks for its own line.)
+    ///
+    /// Threads share the table and each writes only the words of its own slots.
+    /// A word another thread reads is 0, a pointer or a name, before and after
+    /// each of those writes, and `name` is right for all three.
+    fn name_all(&self, from: usize, to: usize) -> usize {
+        const BATCH: usize = 16;
+        const QUEUE: usize = 4 * BATCH;
+        let mut queue = [0usize; QUEUE];
+        let (mut queued, mut named) = (0usize, 0usize);
+        let mut ids = 0usize;
+        for at in from..to {
+            let id = self.id(at).load(Ordering::Relaxed);
+            let word = self.parent(at).load(Ordering::Relaxed);
+            let linked = is_pointer(word);
+            ids += usize::from(id != 0);
+            self.parent(at).store(std::hint::select_unpredictable(word == 0, id, word), Ordering::Relaxed);
+            unsafe { *queue.get_unchecked_mut(queued % QUEUE) = at };
+            queued += usize::from(linked);
+            sys::prefetch(self.id(std::hint::select_unpredictable(linked, pointed(word), at)));
+            if queued - named >= 2 * BATCH {
+                for _ in 0..BATCH {
+                    self.name(unsafe { *queue.get_unchecked(named % QUEUE) });
+                    named += 1;
+                }
+            }
+        }
+        while named < queued {
+            self.name(queue[named % QUEUE]);
+            named += 1;
+        }
+        ids
     }
 }
 
 pub fn build(inputs: &[Input], threads: usize) -> Links {
     let started = std::time::Instant::now();
-    let since = |from: std::time::Instant| from.elapsed().as_secs_f64() * 1e3;
     // Parse.
     let total: u64 = inputs.iter().map(|i| i.len).sum();
     let target = reader::job_bytes().unwrap_or((total / (threads as u64 * 4)).clamp(1 << 16, 1 << 22));
@@ -234,31 +320,38 @@ pub fn build(inputs: &[Input], threads: usize) -> Links {
         lines.edges
     });
     let edges: usize = edge_lists.iter().map(Vec::len).sum();
+    let parsed = started.elapsed().as_secs_f64() * 1e3;
+    let mut links = join_and_name(&edge_lists, if edges < 20_000 { 1 } else { threads });
+    links.timing[0] = parsed;
+    links
+}
 
+/// The table for these edges (pairs of different IDs), joined and named on `threads` threads.
+fn join_and_name(edge_lists: &[Vec<(Key, Key)>], threads: usize) -> Links {
+    let since = |from: std::time::Instant| from.elapsed().as_secs_f64() * 1e3;
+    let edges: usize = edge_lists.iter().map(Vec::len).sum();
     // Every edge names at most two new IDs; keep the table under three quarters
     // full (in practice about a third, since most IDs are named by several lines).
     let capacity = (edges * 2 * 4 / 3).max(16).next_power_of_two();
     let table = sys::map::<u64>(capacity * 2);
     let (mask, shift) = (capacity - 1, 64 - capacity.trailing_zeros());
-    let parsed = since(started);
     if edges == 0 {
-        return Links { table: sys::Shared(table), mask, shift, ids: 0, timing: [parsed, 0.0, 0.0] };
+        return Links { table: sys::Shared(table), mask, shift, ids: 0, timing: [0.0; 3] };
     }
     let shared = sys::Shared(table);
-    let join_threads = if edges < 20_000 { 1 } else { threads };
     /// The table is far larger than the cache and every step lands somewhere new,
-    /// so each loop asks for the lines it will need this many steps ahead.
+    /// so the join asks for the lines it will need this many edges ahead.
     const AHEAD: usize = 8;
     let joining = std::time::Instant::now();
 
     // Join. The table is all zeros: every slot empty, every node a root.
-    sys::parallel(join_threads, |me| {
+    sys::parallel(threads, |me| {
         let forest = Forest {
             words: unsafe { std::slice::from_raw_parts({ shared }.0 as *const AtomicU64, capacity * 2) },
             mask,
             shift,
         };
-        for list in edge_lists.iter().skip(me).step_by(join_threads) {
+        for list in edge_lists.iter().skip(me).step_by(threads) {
             for (at, &(a, b)) in list.iter().enumerate() {
                 if let Some(&(next_a, next_b)) = list.get(at + AHEAD) {
                     sys::prefetch(forest.id(home(next_a, shift)));
@@ -272,57 +365,221 @@ pub fn build(inputs: &[Input], threads: usize) -> Links {
     let joined = since(joining);
     let naming = std::time::Instant::now();
 
-    // Point every ID straight at its root...
-    let ranges = |me: usize| (capacity * me / join_threads, capacity * (me + 1) / join_threads);
-    sys::parallel(join_threads, |me| {
+    // Replace every pointer with the ID of its tree's root, which is the person's
+    // name, and give every root its own: each thread a share of the slots.
+    let counts = sys::parallel(threads, |me| {
         let forest = Forest {
             words: unsafe { std::slice::from_raw_parts({ shared }.0 as *const AtomicU64, capacity * 2) },
             mask,
             shift,
         };
-        let (from, to) = ranges(me);
-        for at in from..to {
-            if at + AHEAD < to {
-                let parent = forest.parent(at + AHEAD).load(Ordering::Relaxed);
-                if parent != 0 {
-                    sys::prefetch(forest.id((parent - 1) as usize));
-                }
+        forest.name_all(capacity * me / threads, capacity * (me + 1) / threads)
+    });
+    Links { table: shared, mask, shift, ids: counts.iter().sum(), timing: [0.0, joined, since(naming)] }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn next(state: &mut u64) -> u64 {
+        *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = *state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// The definition: IDs that edges connect, however far apart, are one
+    /// person, named by the byte-wise smallest of them.
+    fn names_by_definition(edges: &[(Key, Key)]) -> HashMap<Key, Key> {
+        fn root(parent: &mut HashMap<Key, Key>, id: Key) -> Key {
+            let mut top = id;
+            while parent[&top] != top {
+                top = parent[&top];
             }
-            if forest.id(at).load(Ordering::Relaxed) != 0 {
-                let root = forest.find(at);
-                if root != at {
-                    forest.parent(at).store(root as u64 + 1, Ordering::Release);
-                }
+            let mut at = id;
+            while at != top {
+                at = parent.insert(at, top).unwrap();
+            }
+            top
+        }
+        let mut parent: HashMap<Key, Key> = HashMap::new();
+        for &(a, b) in edges {
+            parent.entry(a).or_insert(a);
+            parent.entry(b).or_insert(b);
+            let (a, b) = (root(&mut parent, a), root(&mut parent, b));
+            parent.insert(a, b);
+        }
+        let ids: Vec<Key> = parent.keys().copied().collect();
+        let mut smallest: HashMap<Key, Key> = HashMap::new();
+        for &id in &ids {
+            let top = root(&mut parent, id);
+            let held = smallest.entry(top).or_insert(id);
+            if key::compare(id, *held).is_lt() {
+                *held = id;
             }
         }
-    });
-    // ...then replace the pointer with the root's ID, which is the person's name.
-    // Each thread writes only the second word of its own slots and reads only
-    // first words, which no longer change.
-    let counts = sys::parallel(join_threads, |me| {
-        let forest = Forest {
-            words: unsafe { std::slice::from_raw_parts({ shared }.0 as *const AtomicU64, capacity * 2) },
-            mask,
-            shift,
-        };
-        let (from, to) = ranges(me);
-        let mut ids = 0usize;
-        for at in from..to {
-            if at + AHEAD < to {
-                let parent = forest.parent(at + AHEAD).load(Ordering::Relaxed);
-                if parent != 0 {
-                    sys::prefetch(forest.id((parent - 1) as usize));
+        ids.iter().map(|&id| (id, smallest[&root(&mut parent, id)])).collect()
+    }
+
+    /// An ID's key: most pack, some are interned (a space does not pack), so both kinds of key meet in one tree.
+    fn id(number: u64) -> Key {
+        let text = if number % 7 == 3 { format!("u {number}") } else { format!("u{number}") };
+        key::key_of(text.as_bytes())
+    }
+
+    /// Joins `edges`, dealt out to `lists` lists, on `threads` threads, and holds every ID to the definition.
+    fn check(edges: &[(Key, Key)], lists: usize, threads: usize, what: &str) {
+        let mut edge_lists: Vec<Vec<(Key, Key)>> = vec![Vec::new(); lists];
+        for (at, &edge) in edges.iter().enumerate() {
+            edge_lists[at * lists / edges.len().max(1)].push(edge);
+        }
+        let links = join_and_name(&edge_lists, threads);
+        let expected = names_by_definition(edges);
+        assert_eq!(links.ids, expected.len(), "{what}: how many IDs");
+        for (&id, &name) in &expected {
+            assert_eq!(links.person_at(id, links.prefetch(id)), name, "{what}: the person of {id:#x}");
+        }
+        // An ID no edge names is its own person.
+        for number in 0..64 {
+            let stranger = id(1 << 40 | number);
+            assert_eq!(links.person_at(stranger, links.prefetch(stranger)), stranger, "{what}: a stranger");
+        }
+        // Nothing of the forest is left in the table: every slot is empty or holds an ID and a name.
+        let words = unsafe { std::slice::from_raw_parts(links.table.0, (links.mask + 1) * 2) };
+        for at in 0..=links.mask {
+            let (held, name) = (words[id_word(at)], words[id_word(at) + 4]);
+            assert_eq!(expected.get(&held).copied().unwrap_or(0), name, "{what}: slot {at}");
+        }
+    }
+
+    #[test]
+    fn every_id_gets_the_smallest_id_of_its_person() {
+        let mut state = 33;
+        // Trees of every shape the joins can leave, small enough to run thousands.
+        for round in 0..1_500u64 {
+            let count = 1 + (next(&mut state) % 300) as usize;
+            let people = 1 + next(&mut state) % (2 * count as u64 + 1);
+            let mut edges: Vec<(Key, Key)> = Vec::new();
+            let base = round << 20;
+            match round % 5 {
+                // Any two IDs of a small or a large pool: from all singletons to one person.
+                0 | 1 => {
+                    for _ in 0..count {
+                        let (a, b) = (next(&mut state) % people, next(&mut state) % people);
+                        if a != b {
+                            edges.push((id(base + a), id(base + b)));
+                        }
+                    }
+                }
+                // Chains, each ID linked to the next, read from the small end, the
+                // large end (one thread leaves each ID a step from the one before:
+                // the longest paths there are) or in any order.
+                2 | 3 => {
+                    let mut chain: Vec<u64> = (0..count as u64).collect();
+                    if round % 2 == 0 {
+                        chain.reverse();
+                    }
+                    if round % 3 == 0 {
+                        for at in (1..chain.len()).rev() {
+                            chain.swap(at, (next(&mut state) % (at as u64 + 1)) as usize);
+                        }
+                    }
+                    let length = 2 + next(&mut state) % 120;
+                    for &at in &chain {
+                        if (at + 1) % length != 0 {
+                            edges.push((id(base + at), id(base + at + 1)));
+                        }
+                    }
+                }
+                // A shared device: many small people, each joined to one ID, some lines repeated either way round.
+                _ => {
+                    let device = id(base + next(&mut state) % (3 * count as u64));
+                    for at in 0..count as u64 {
+                        let (first, second) = (id(base + 3 * at), id(base + 3 * at + 1));
+                        edges.push((second, first));
+                        if at % 3 != 0 && first != device {
+                            edges.push((first, device));
+                        }
+                        if at % 5 == 0 {
+                            edges.push((first, second));
+                        }
+                    }
                 }
             }
-            let id = forest.id(at).load(Ordering::Relaxed);
-            if id != 0 {
-                ids += 1;
-                let parent = forest.parent(at).load(Ordering::Relaxed);
-                let name = if parent == 0 { id } else { forest.id((parent - 1) as usize).load(Ordering::Relaxed) };
-                forest.parent(at).store(name, Ordering::Relaxed);
+            if edges.is_empty() {
+                continue;
             }
+            let threads = [1, 2, 3, 8][(round / 5 % 4) as usize];
+            let lists = 1 + (next(&mut state) % 4) as usize;
+            check(&edges, lists, threads, &format!("round {round}, {threads} threads"));
         }
-        ids
-    });
-    Links { table: shared, mask, shift, ids: counts.iter().sum(), timing: [parsed, joined, since(naming)] }
+    }
+
+    /// Large enough that the threads meet in the table: people like the
+    /// generator's (a few IDs each, linked to an earlier one), long chains, and
+    /// shared devices that tie hundreds of people into one.
+    #[test]
+    fn threads_naming_one_table_agree_with_the_definition() {
+        let mut state = 34;
+        for round in 0..12u64 {
+            let mut edges: Vec<(Key, Key)> = Vec::new();
+            let base = (round + 1) << 32;
+            let mut number = 0u64;
+            while edges.len() < 60_000 {
+                let r = next(&mut state);
+                let ids = match r % 100 {
+                    0 => 50 + (r >> 8) % 350,
+                    1..=44 => 2,
+                    45..=74 => 3,
+                    _ => 4 + (r >> 8) % 5,
+                };
+                let chained = r % 100 == 0;
+                let mut order: Vec<u64> = (1..ids).collect();
+                if chained {
+                    for at in (1..order.len()).rev() {
+                        order.swap(at, (next(&mut state) % (at as u64 + 1)) as usize);
+                    }
+                }
+                for at in order {
+                    let earlier = if chained { at - 1 } else { next(&mut state) % at };
+                    let (a, b) = (id(base + number + at), id(base + number + earlier));
+                    edges.push(if next(&mut state) % 2 == 0 { (a, b) } else { (b, a) });
+                }
+                if r % 250 == 7 {
+                    edges.push((id(base + number), id(base + (1 << 30) + r % 3))); // a shared device
+                }
+                number += ids;
+            }
+            // In the order a shuffled file gives them.
+            for at in (1..edges.len()).rev() {
+                edges.swap(at, (next(&mut state) % (at as u64 + 1)) as usize);
+            }
+            let threads = [8, 4, 3, 1][(round % 4) as usize];
+            check(&edges, threads, threads, &format!("large round {round}, {threads} threads"));
+        }
+    }
+
+    /// The tag that tells a pointer from a name is one no key carries.
+    #[test]
+    fn no_key_looks_like_a_pointer() {
+        let mut state = 35;
+        for number in 0..200_000u64 {
+            let r = next(&mut state);
+            let text = match number % 4 {
+                0 => format!("u{r}"),
+                1 => format!("{:x}_{}", r, number),
+                2 => format!("U{}", r % 100_000),
+                _ => format!("odd id {}", r % 10_000),
+            };
+            let key = key::key_of(&text.as_bytes()[..text.len().min(1 + (r >> 60) as usize)]);
+            assert!(key != 0 && !is_pointer(key), "{text:?} has the key {key:#x}");
+        }
+        for slot in [0usize, 1, 2, 15, 16, 1 << 20, (1 << 40) + 5] {
+            let word = pointer_to(slot);
+            assert!(word != 0 && is_pointer(word) && pointed(word) == slot);
+        }
+    }
 }
