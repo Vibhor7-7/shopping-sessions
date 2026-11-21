@@ -8,9 +8,12 @@
 //! counting passes over the partition (by bin, then by person, the second one
 //! stable), with no comparison whose outcome the CPU has to guess.
 //!
-//! Each person is then one pass over their events with two cursors into their
-//! clicks: the clicks at or before the session start, and those more than 7
-//! days before it.
+//! Each person is then one pass over their events, their clicks sorted first. Most people have a handful
+//! of clicks, and for them every session asks the same two questions of all of
+//! them at once (how many are at or before the start, how many are more than 7
+//! days before it), with no loop whose length depends on the answer: how many
+//! clicks lie between two sessions is exactly what a CPU cannot guess. People
+//! with many clicks keep two cursors and a running set of campaigns instead.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -25,6 +28,8 @@ const SESSION_GAP_MS: u32 = 1_800_000;
 const REACH: u32 = CLICK_REACH_MS as u32;
 /// People with more clicks than this keep a running set of the campaigns in the 7-day window.
 const SLIDING_MIN: usize = 16;
+/// Every other person's clicks fit in a `Few`.
+const FEW: usize = SLIDING_MIN;
 const ABSENT: u32 = u32::MAX;
 
 /// One thread's user_daily rows, as columns.
@@ -56,6 +61,7 @@ impl UserRows {
 pub struct Cells {
     /// sessions, purchasing_sessions, revenue_cents
     pub credited: Vec<[u64; 3]>,
+    /// One slot longer than the table: the last is scratch (`Tally::spare`), never read.
     pub assisted: Vec<u32>,
 }
 
@@ -310,6 +316,26 @@ impl Group {
     }
 }
 
+/// The order a person's clicks are consulted in: by time, and at one instant
+/// the smallest click_id last, so the click a session is credited to is always
+/// the last one at or before its start.
+#[inline(always)]
+fn click_order(a: &[u64; 2], b: &[u64; 2]) -> std::cmp::Ordering {
+    (a[0] >> 32).cmp(&(b[0] >> 32)).then_with(|| key::compare(b[1], a[1]))
+}
+
+/// The clicks of a person with at most `FEW` of them, in `click_order`, laid
+/// out so that a session can ask all of them a question at once.
+struct Few {
+    /// When each was; `u32::MAX`, later than any session, past the last.
+    ts: [u32; FEW],
+    /// Click i's campaign, at `i + 1`: "the last click at or before the start"
+    /// is then at the number of such clicks, whatever that number is.
+    campaign: [u32; FEW + 1],
+    /// One more than the place of the click before it with the same campaign; 0 if there is none.
+    earlier: [u32; FEW],
+}
+
 /// Everything a thread accumulates while walking people.
 struct Tally {
     wide: Option<Vec<(u32, u32)>>,
@@ -318,8 +344,13 @@ struct Tally {
     first_day: i64,
     width: usize,
     organic: usize,
+    /// The scratch slot at the end of `cells.assisted`.
+    spare: usize,
     category_sum: Vec<i64>,
     category_touched: Vec<u32>,
+    /// Per campaign, all zeros between people. For a person with many clicks: how
+    /// many of the campaign's clicks are in the 7-day window. For one with few:
+    /// one more than the place of the campaign's latest click so far (`few`).
     window_count: Vec<u32>,
     window_place: Vec<u32>,
     window: Vec<u32>,
@@ -330,11 +361,10 @@ struct Tally {
     sessions: u64,
 }
 
-/// The clicks within reach of the session being closed: `clicks[oldest..upto]`.
+/// For a person with many clicks, those within reach of the session being closed: `clicks[oldest..upto]`.
 struct Reach {
     oldest: usize,
     upto: usize,
-    sliding: bool,
 }
 
 impl Tally {
@@ -391,21 +421,74 @@ impl Tally {
         self.rows.top.push(top);
     }
 
-    /// Credits a finished session to a campaign and counts the campaigns that assisted it.
+    /// Lays out the clicks of a person with at most `FEW` of them, already in `click_order`.
+    #[inline(always)]
+    fn few(&mut self, clicks: &[[u64; 2]]) -> Few {
+        debug_assert!(clicks.len() <= FEW);
+        let mut few = Few { ts: [u32::MAX; FEW], campaign: [0; FEW + 1], earlier: [0; FEW] };
+        for (at, click) in clicks.iter().enumerate() {
+            let campaign = click[0] as u32;
+            unsafe {
+                *few.ts.get_unchecked_mut(at) = (click[0] >> 32) as u32;
+                *few.campaign.get_unchecked_mut(at + 1) = campaign;
+                let latest = self.window_count.get_unchecked_mut(campaign as usize);
+                *few.earlier.get_unchecked_mut(at) = *latest;
+                *latest = at as u32 + 1;
+            }
+        }
+        for click in clicks.iter() {
+            unsafe { *self.window_count.get_unchecked_mut(click[0] as u32 as usize) = 0 };
+        }
+        few
+    }
+
+    /// Credits a finished session of a person with few clicks (`count` of them,
+    /// in `few`) and counts the campaigns that assisted it.
+    ///
+    /// The clicks within reach are those from `oldest` up to `upto`, both found
+    /// by counting: the clicks are in time order, so the ones at or before the
+    /// start are the first so many, and so are the ones too old. One of them
+    /// assists if no click of its campaign lies between `oldest` and itself,
+    /// which is what `earlier` says. Every click is asked, in reach or not, and
+    /// those that do not assist add their 1 to a scratch slot: the loop runs
+    /// `count` times for every session of the person, and nothing in it branches.
+    #[inline(always)]
+    fn credit_few(&mut self, few: &Few, count: usize, start: u32, day: u32, revenue: i64, purchased: bool) {
+        self.sessions += 1;
+        let row = day as usize * self.width;
+        let mut credited = self.organic;
+        if count != 0 {
+            let earliest = start.saturating_sub(REACH);
+            let upto = few.ts.iter().map(|&at| u32::from(at <= start)).sum::<u32>() as usize;
+            let oldest = few.ts.iter().map(|&at| u32::from(at < earliest)).sum::<u32>() as usize;
+            debug_assert!(oldest <= upto && upto <= count);
+            unsafe {
+                credited = std::hint::select_unpredictable(upto > oldest, *few.campaign.get_unchecked(upto) as usize, self.organic);
+                for at in 0..count {
+                    let assists = (at >= oldest) & (at < upto) & (*few.earlier.get_unchecked(at) as usize <= oldest);
+                    let cell = std::hint::select_unpredictable(assists, row + *few.campaign.get_unchecked(at + 1) as usize, self.spare);
+                    *self.cells.assisted.get_unchecked_mut(cell) += 1;
+                }
+            }
+        }
+        let cell = &mut self.cells.credited[row + credited];
+        cell[0] += 1;
+        cell[1] += u64::from(purchased);
+        cell[2] += revenue as u64;
+    }
+
+    /// Credits a finished session of a person with many clicks, in `click_order`,
+    /// and counts the campaigns that assisted it: the ones in the running set.
     #[inline(always)]
     fn credit(&mut self, clicks: &[[u64; 2]], reach: &mut Reach, start: u32, day: u32, revenue: i64, purchased: bool) {
         self.sessions += 1;
         while reach.upto < clicks.len() && (clicks[reach.upto][0] >> 32) as u32 <= start {
-            if reach.sliding {
-                self.window_add(clicks[reach.upto][0] as u32);
-            }
+            self.window_add(clicks[reach.upto][0] as u32);
             reach.upto += 1;
         }
         let earliest = start.saturating_sub(REACH);
         while reach.oldest < reach.upto && ((clicks[reach.oldest][0] >> 32) as u32) < earliest {
-            if reach.sliding {
-                self.window_remove(clicks[reach.oldest][0] as u32);
-            }
+            self.window_remove(clicks[reach.oldest][0] as u32);
             reach.oldest += 1;
         }
         let row = day as usize * self.width;
@@ -414,27 +497,31 @@ impl Tally {
         cell[0] += 1;
         cell[1] += u64::from(purchased);
         cell[2] += revenue as u64;
-        if reach.sliding {
-            for &campaign in &self.window {
-                self.cells.assisted[row + campaign as usize] += 1;
-            }
+        for &campaign in &self.window {
+            self.cells.assisted[row + campaign as usize] += 1;
+        }
+    }
+
+    /// Closes a session: `credit_few` or `credit`, by how many clicks the person has.
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    fn close(&mut self, clicks: &[[u64; 2]], few: &Few, reach: &mut Reach, start: u32, day: u32, revenue: i64, purchased: bool) {
+        if clicks.len() > FEW {
+            self.credit(clicks, reach, start, day, revenue, purchased);
         } else {
-            for a in reach.oldest..reach.upto {
-                let campaign = clicks[a][0] as u32;
-                if !clicks[reach.oldest..a].iter().any(|c| c[0] as u32 == campaign) {
-                    self.cells.assisted[row + campaign as usize] += 1;
-                }
-            }
+            self.credit_few(few, clicks.len(), start, day, revenue, purchased);
         }
     }
 
     /// One person: `events` in bin order (any order within a bin), `clicks` in any order.
     fn person(&mut self, name: Key, events: &[u64], clicks: &mut [[u64; 2]]) {
         if clicks.len() > 1 {
-            // By time; at one instant the smallest click_id last, so the credited click is always the last one at or before the start.
-            clicks.sort_unstable_by(|a, b| (a[0] >> 32).cmp(&(b[0] >> 32)).then_with(|| key::compare(b[1], a[1])));
+            clicks.sort_unstable_by(click_order);
         }
-        let mut reach = Reach { oldest: 0, upto: 0, sliding: clicks.len() > SLIDING_MIN };
+        let sliding = clicks.len() > SLIDING_MIN;
+        let few = if sliding { Few { ts: [u32::MAX; FEW], campaign: [0; FEW + 1], earlier: [0; FEW] } } else { self.few(clicks) };
+        let clicks = &*clicks;
+        let mut reach = Reach { oldest: 0, upto: 0 };
         let count = events.len();
         let mut day = u32::MAX;
         let (mut day_sessions, mut day_events, mut day_revenue) = (0u32, 0u32, 0i64);
@@ -470,7 +557,7 @@ impl Tally {
                 day_sessions += 1;
                 day_events += size;
                 day_revenue += revenue;
-                self.credit(clicks, &mut reach, start, day, revenue, purchased);
+                self.close(clicks, &few, &mut reach, start, day, revenue, purchased);
                 open = false;
             }
             if !open {
@@ -508,9 +595,9 @@ impl Tally {
         day_sessions += 1;
         day_events += size;
         day_revenue += revenue;
-        self.credit(clicks, &mut reach, start, day, revenue, purchased);
+        self.close(clicks, &few, &mut reach, start, day, revenue, purchased);
         self.row(name, day, day_sessions, day_events, day_revenue);
-        if reach.sliding {
+        if sliding {
             for &campaign in &self.window {
                 self.window_count[campaign as usize] = 0;
             }
@@ -543,6 +630,7 @@ pub fn run<R: Send>(
             first_day: setup.first_day,
             width,
             organic: campaigns,
+            spare: width * setup.days,
             category_sum: vec![0; setup.catalog.categories.len()],
             category_touched: Vec::new(),
             window_count: vec![0; campaigns],
@@ -550,7 +638,7 @@ pub fn run<R: Send>(
             window: Vec::new(),
             bin_purchases: Vec::new(),
             rows: UserRows::with_capacity(expected_rows),
-            cells: Cells { credited: vec![[0; 3]; width * setup.days], assisted: vec![0; width * setup.days] },
+            cells: Cells { credited: vec![[0; 3]; width * setup.days], assisted: vec![0; width * setup.days + 1] },
             sessions: 0,
         };
         loop {
