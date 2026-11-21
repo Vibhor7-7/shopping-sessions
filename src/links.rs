@@ -422,13 +422,14 @@ pub fn build(inputs: &[Input], threads: usize) -> Links {
     });
     let edges: usize = edge_lists.iter().map(Vec::len).sum();
     let parsed = started.elapsed().as_secs_f64() * 1e3;
-    let mut links = join_and_name(&edge_lists, if edges < 20_000 { 1 } else { threads });
+    let mut links = join_and_name(&edge_lists, if edges < 20_000 { 1 } else { threads }, join_distances());
     links.timing[0] = parsed;
     links
 }
 
-/// The table for these edges (pairs of different IDs), joined and named on `threads` threads.
-fn join_and_name(edge_lists: &[Vec<(Key, Key)>], threads: usize) -> Links {
+/// The table for these edges (pairs of different IDs), joined and named on
+/// `threads` threads; `near` and `far` are the join's distances (`join_distances`).
+fn join_and_name(edge_lists: &[Vec<(Key, Key)>], threads: usize, (near, far): (usize, usize)) -> Links {
     let since = |from: std::time::Instant| from.elapsed().as_secs_f64() * 1e3;
     let edges: usize = edge_lists.iter().map(Vec::len).sum();
     // Every edge names at most two new IDs; keep the table under three quarters
@@ -440,7 +441,6 @@ fn join_and_name(edge_lists: &[Vec<(Key, Key)>], threads: usize) -> Links {
         return Links { table: sys::Shared(table), mask, shift, ids: 0, timing: [0.0; 3] };
     }
     let shared = sys::Shared(table);
-    let (near, far) = join_distances();
     let joining = std::time::Instant::now();
 
     // Join. The table is all zeros: every slot empty, every node a root.
@@ -522,13 +522,20 @@ mod tests {
         key::key_of(text.as_bytes())
     }
 
+    /// The join's distances a round is run under: the ones the pipeline uses,
+    /// and the ends of what the knobs allow (an edge joined as soon as it has
+    /// its slots, or 64 edges later; home lines asked for late, early or at once).
+    fn distances(round: u64) -> (usize, usize) {
+        [(8, 8), (1, 8), (64, 0), (2, 1), (16, 300), (4, 16)][(round % 6) as usize]
+    }
+
     /// Joins `edges`, dealt out to `lists` lists, on `threads` threads, and holds every ID to the definition.
-    fn check(edges: &[(Key, Key)], lists: usize, threads: usize, what: &str) {
+    fn check(edges: &[(Key, Key)], lists: usize, threads: usize, distances: (usize, usize), what: &str) {
         let mut edge_lists: Vec<Vec<(Key, Key)>> = vec![Vec::new(); lists];
         for (at, &edge) in edges.iter().enumerate() {
             edge_lists[at * lists / edges.len().max(1)].push(edge);
         }
-        let links = join_and_name(&edge_lists, threads);
+        let links = join_and_name(&edge_lists, threads, distances);
         let expected = names_by_definition(edges);
         assert_eq!(links.ids, expected.len(), "{what}: how many IDs");
         for (&id, &name) in &expected {
@@ -606,7 +613,8 @@ mod tests {
             }
             let threads = [1, 2, 3, 8][(round / 5 % 4) as usize];
             let lists = 1 + (next(&mut state) % 4) as usize;
-            check(&edges, lists, threads, &format!("round {round}, {threads} threads"));
+            let distances = distances(round / 20);
+            check(&edges, lists, threads, distances, &format!("round {round}, {threads} threads, distances {distances:?}"));
         }
     }
 
@@ -650,7 +658,8 @@ mod tests {
                 edges.swap(at, (next(&mut state) % (at as u64 + 1)) as usize);
             }
             let threads = [8, 4, 3, 1][(round % 4) as usize];
-            check(&edges, threads, threads, &format!("large round {round}, {threads} threads"));
+            let distances = distances(round / 4);
+            check(&edges, threads, threads, distances, &format!("large round {round}, {threads} threads, distances {distances:?}"));
         }
     }
 
