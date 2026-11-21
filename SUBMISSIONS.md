@@ -35,4 +35,4 @@ Rows up to `fac219f` were read off the page on 2026-11-21; the user made them by
 
 ## Not submitted
 
-- The probe (branch `probe`, `7b0a3c33ed0446e0aae34f45f182a122f5199e0d` when this was written). It fails the dev check on purpose, so it never meets the conditions for an unattended submission; spending a slot on it is the user's call.
+- The probe (branch `probe`, `1e977ba52d396ec43d364a08456eb34688981470` since Sat 2026-11-21, 12:40 PM EST: `main` up to experiment 43 merged in, and the whole pipeline timed at 20M on the scorer's machine; it runs for about 40 s). It fails the dev check on purpose, so it never meets the conditions for an unattended submission; spending a slot on it is the user's call.
