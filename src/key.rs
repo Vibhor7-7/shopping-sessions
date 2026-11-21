@@ -226,6 +226,7 @@ static OUTSIDE_BY_LOW: [u8; 16] = [
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 #[inline(always)]
 unsafe fn pack_two_padded(a: *const u8, a_len: usize, b: *const u8, b_len: usize) -> Option<(Key, Key)> {
+    use crate::sys::InPlace;
     use std::arch::x86_64::*;
     // Both 1 to 10 characters long. The larger of the two decides, and 0 - 1 is
     // the largest number there is. (Not the two ORed together: 7 | 8 is 15.)
@@ -249,17 +250,17 @@ unsafe fn pack_two_padded(a: *const u8, a_len: usize, b: *const u8, b_len: usize
     let codes = _mm256_add_epi8(_mm256_add_epi8(bytes, _mm256_shuffle_epi8(twice(&CODE_OFFSET), high)), underscore);
     let codes = _mm256_and_si256(codes, keep);
     // Characters 0 to 3, 4 to 7 and 8 to 11 of each ID as 24 bits each, the first character highest.
-    let pairs = _mm256_maddubs_epi16(codes, _mm256_set1_epi16(0x0140));
-    let fours = _mm256_madd_epi16(pairs, _mm256_set1_epi32(0x0001_1000));
+    // The three constants from here on are read where they are used (`sys::InPlace`):
+    // written as values, each was fetched into a register on every line first.
+    static PAIRS: InPlace = InPlace::words([0x0140; 16]);
+    static FOURS: InPlace = InPlace::words([0x1000, 1, 0x1000, 1, 0x1000, 1, 0x1000, 1, 0x1000, 1, 0x1000, 1, 0x1000, 1, 0x1000, 1]);
     // The key is the first four's 24 bits, the second's, and the 12 bits of
     // characters 8 and 9, with four zero bits below: as bytes, lowest first,
     // the upper two of the third four, then all three of the second and of the first.
-    #[rustfmt::skip]
-    let order = _mm256_setr_epi8(
-        9, 10, 4, 5, 6, 0, 1, 2, -1, -1, -1, -1, -1, -1, -1, -1,
-        9, 10, 4, 5, 6, 0, 1, 2, -1, -1, -1, -1, -1, -1, -1, -1,
-    );
-    let keys = _mm256_shuffle_epi8(fours, order);
+    static ORDER: InPlace = InPlace::twice([9, 10, 4, 5, 6, 0, 1, 2, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]);
+    let pairs = _mm256_maddubs_epi16(codes, PAIRS.read());
+    let fours = _mm256_madd_epi16(pairs, FOURS.read());
+    let keys = _mm256_shuffle_epi8(fours, ORDER.read());
     Some((_mm256_extract_epi64(keys, 0) as u64, _mm256_extract_epi64(keys, 2) as u64))
 }
 
