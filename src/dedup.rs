@@ -3,7 +3,7 @@
 //! Only a few percent of events have more than one copy, so the work is finding
 //! them. Each partition is scanned twice against a small table of two-bit
 //! counters indexed by key hash: the first scan marks the slots hit more than
-//! once, the second gathers the copies in those slots, one in seven. Those go
+//! once, the second gathers the copies in those slots, about one in eight. Those go
 //! through a small table keyed by event_id that holds the earliest copy of each
 //! so far: a copy that meets another of its event there is compared with it,
 //! and the event record of the one that loses is marked dropped. Nothing is
@@ -97,7 +97,7 @@ pub fn run(
             if count < 2 {
                 continue;
             }
-            // `filter_slots` slots a copy: 16 keep chance collisions near 6%.
+            // `filter_slots` slots a copy, rounded up to a power of two: with 16, three to six copies in a hundred share a slot by chance.
             let slots = (count * filter_slots).next_power_of_two().max(1024);
             let slot_shift = 64 - slots.trailing_zeros();
             state.clear();
@@ -127,8 +127,8 @@ pub fn run(
             // A slot hit more than once holds one copy that was not late and at
             // least one that was: at most twice as many copies as late ones.
             // They are gathered first, each copy written to the end of the list
-            // and the end moved on only for a suspect: one copy in seven is one,
-            // in no order, which is a branch the CPU cannot guess.
+            // and the end moved on only for a suspect: about one copy in eight is
+            // one, in no order, which is a branch the CPU cannot guess.
             suspects.clear();
             suspects.reserve(2 * late + 1);
             let mut found = 0usize;
