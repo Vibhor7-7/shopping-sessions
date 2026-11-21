@@ -31,8 +31,12 @@ jobs:
           target/release/synth --events ${{ inputs.events }} --clicks $(( ${{ inputs.events }} / 4 )) --seed 9 --output data
       - name: Profile, one thread
         run: |
+          # One fixed cache whatever the runner is, so that the misses of two runs can be
+          # compared: a Sapphire Rapids core's 48 KB first level, and its 2 MB second
+          # level standing in for the last one (callgrind simulates two levels).
           NCPU=1 valgrind --tool=callgrind --branch-sim=yes --cache-sim=yes --compress-strings=no --compress-pos=no \
-            --callgrind-out-file=callgrind.out target/release/pipeline data out 2>&1 | grep -E "pipeline:|Collected|refs|rate" || true
+            --I1=32768,8,64 --D1=49152,12,64 --LL=2097152,16,64 \
+            --callgrind-out-file=callgrind.out target/release/pipeline data out 2>&1 | grep -E "pipeline:|Collected|refs|rate|[Ww]arning|error" || true
           python3 scripts/hot_lines.py callgrind.out ${{ inputs.lines }}
       # callgrind counts instructions; this says where the time is, which is not
       # the same thing where memory is the limit. Hosted runners expose no hardware
