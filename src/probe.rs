@@ -89,7 +89,7 @@ pub fn run(data: &std::path::Path, output: &std::path::Path) {
     eprintln!("probe: ---- how many threads really run at once (same work per thread; flat = that many real CPUs) ----");
     for threads in [1usize, 2, 4, 8, 16] {
         let started = Instant::now();
-        let sums: Vec<u64> = crate::sys::parallel(threads, |i| spin(60_000_000 + i as u64));
+        let sums: Vec<u64> = crate::sys::parallel(threads, |i| spin(std::hint::black_box(60_000_000 + i as u64)));
         eprintln!("probe: {threads:>2} threads: {:.1} ms (checksum {:x})", started.elapsed().as_secs_f64() * 1e3, sums.iter().fold(0, |a, b| a ^ b));
     }
 
@@ -136,5 +136,159 @@ pub fn run(data: &std::path::Path, output: &std::path::Path) {
             eprintln!("probe: read the largest event file, round {round}: {bytes} bytes in {:.1} ms", started.elapsed().as_secs_f64() * 1e3);
         }
     }
+    if let Some(largest) = std::fs::read_dir(data.join("events")).ok().and_then(|d| d.flatten().max_by_key(|e| e.metadata().map(|m| m.len()).unwrap_or(0))) {
+        input_paths(&largest.path());
+    }
+    vector_widths();
     eprintln!("probe: ---- end; the output is now made wrong on purpose so this log is shown ----");
+}
+
+/// Newlines, commas and quotes in `len` bytes, 64 at a time with 256-bit compares: what stage one does.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,popcnt")]
+unsafe fn count_256(data: *const u8, len: usize) -> u64 {
+    use std::arch::x86_64::*;
+    let (nl, comma, quote) = (_mm256_set1_epi8(b'\n' as i8), _mm256_set1_epi8(b',' as i8), _mm256_set1_epi8(b'"' as i8));
+    let mut total = 0u64;
+    let mut at = 0;
+    while at + 64 <= len {
+        for half in [0, 32] {
+            let v = _mm256_loadu_si256(data.add(at + half) as *const __m256i);
+            total += (_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, nl)) as u32).count_ones() as u64
+                + (_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, comma)) as u32).count_ones() as u64 * 3
+                + (_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, quote)) as u32).count_ones() as u64 * 7;
+        }
+        at += 64;
+    }
+    total
+}
+
+/// The same with 512-bit compares straight into mask registers.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,popcnt")]
+unsafe fn count_512(data: *const u8, len: usize) -> u64 {
+    use std::arch::x86_64::*;
+    let (nl, comma, quote) = (_mm512_set1_epi8(b'\n' as i8), _mm512_set1_epi8(b',' as i8), _mm512_set1_epi8(b'"' as i8));
+    let mut total = 0u64;
+    let mut at = 0;
+    while at + 64 <= len {
+        let v = _mm512_loadu_si512(data.add(at) as *const __m512i);
+        total += _mm512_cmpeq_epi8_mask(v, nl).count_ones() as u64
+            + _mm512_cmpeq_epi8_mask(v, comma).count_ones() as u64 * 3
+            + _mm512_cmpeq_epi8_mask(v, quote).count_ones() as u64 * 7;
+        at += 64;
+    }
+    total
+}
+
+/// Reading a file through `read` into a small buffer, against reading it in place through a mapping.
+fn input_paths(path: &std::path::Path) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::FileExt;
+        use std::ffi::c_void;
+        extern "C" {
+            fn mmap(addr: *mut c_void, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut c_void;
+            fn munmap(addr: *mut c_void, len: usize) -> i32;
+            fn madvise(addr: *mut c_void, len: usize, advice: i32) -> i32;
+        }
+        eprintln!("probe: ---- input: copy with read(), or in place with mmap() ----");
+        let Ok(file) = std::fs::File::open(path) else { return };
+        let len = file.metadata().map(|m| m.len() as usize).unwrap_or(0) & !63;
+        let megabytes = len as f64 / 1048576.0;
+        let mut buffer = vec![0u8; (256 << 10) + 64];
+        let mut best = f64::MAX;
+        let mut sum = 0;
+        for _ in 0..5 {
+            let started = Instant::now();
+            sum = 0;
+            let mut at = 0;
+            while at < len {
+                let got = file.read_at(&mut buffer[..256 << 10], at as u64).unwrap_or(0);
+                if got == 0 {
+                    break;
+                }
+                sum += count_256(std::hint::black_box(buffer.as_ptr()), got & !63);
+                at += got;
+            }
+            best = best.min(started.elapsed().as_secs_f64());
+        }
+        eprintln!("probe: read() in 256 KB blocks + scan: {:.0} MB/s (best of 5, {megabytes:.0} MB, sum {sum})", megabytes / best);
+        for (label, populate) in [("mmap, faulting as it goes", false), ("mmap, MADV_POPULATE_READ first", true)] {
+            let mut best = f64::MAX;
+            let mut first = 0.0;
+            for round in 0..5 {
+                let started = Instant::now();
+                let map = mmap(std::ptr::null_mut(), len, 1, 2, file.as_raw_fd(), 0);
+                if map as isize == -1 {
+                    eprintln!("probe: mmap failed");
+                    return;
+                }
+                let advised = if populate { madvise(map, len, 22) } else { 0 };
+                sum = count_256(std::hint::black_box(map as *const u8), len);
+                munmap(map, len);
+                let took = started.elapsed().as_secs_f64();
+                if round == 0 {
+                    first = took;
+                    if populate && advised != 0 {
+                        eprintln!("probe: MADV_POPULATE_READ is not supported here");
+                    }
+                }
+                best = best.min(took);
+            }
+            eprintln!("probe: {label}: {:.0} MB/s best of 5 (map + scan + unmap), first round {:.0} MB/s (sum {sum})", megabytes / best, megabytes / first);
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = path;
+}
+
+/// Does 512-bit code pay here? Its scan against the 256-bit one, alone and mixed with scalar work
+/// (on some Xeons a core that runs 512-bit instructions slows down everything else it does).
+fn vector_widths() {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        eprintln!("probe: ---- 256-bit against 512-bit ----");
+        let wide = std::arch::is_x86_feature_detected!("avx512bw");
+        eprintln!("probe: avx512f {} avx512bw {} avx512vbmi {} avx512vbmi2 {} avx512vl {}", std::arch::is_x86_feature_detected!("avx512f"), wide, std::arch::is_x86_feature_detected!("avx512vbmi"), std::arch::is_x86_feature_detected!("avx512vbmi2"), std::arch::is_x86_feature_detected!("avx512vl"));
+        let len = 64usize << 20;
+        let text: Vec<u8> = (0..len).map(|i| b"e3k9x0abc,u1b2c3d4e,2026-10-03T23:58:10Z,\"view\",p123,\n"[i % 53]).collect();
+        let time = |f: &dyn Fn() -> u64| {
+            let mut best = f64::MAX;
+            let mut value = 0;
+            for _ in 0..5 {
+                let started = Instant::now();
+                value = std::hint::black_box(f());
+                best = best.min(started.elapsed().as_secs_f64());
+            }
+            (best * 1e3, value)
+        };
+        let (ms, value) = time(&|| count_256(std::hint::black_box(text.as_ptr()), std::hint::black_box(len)));
+        eprintln!("probe: 256-bit scan of 64 MB: {ms:.1} ms ({value})");
+        if wide {
+            let (ms, value) = time(&|| count_512(std::hint::black_box(text.as_ptr()), std::hint::black_box(len)));
+            eprintln!("probe: 512-bit scan of 64 MB: {ms:.1} ms ({value})");
+        }
+        // Mixed: scan 64 KB, then scalar work, 400 times; as the parser alternates.
+        let mixed = |use_wide: bool| {
+            time(&|| {
+                let mut total = 0u64;
+                for block in 0..400usize {
+                    let at = (block * (64 << 10)) % (len - (64 << 10));
+                    total += if use_wide { count_512(std::hint::black_box(text.as_ptr().add(at)), 64 << 10) } else { count_256(std::hint::black_box(text.as_ptr().add(at)), 64 << 10) };
+                    total ^= spin(std::hint::black_box(150_000));
+                }
+                total
+            })
+        };
+        let (ms, _) = time(&|| (0..400).fold(0u64, |a, _| a ^ spin(std::hint::black_box(150_000))));
+        eprintln!("probe: scalar work alone: {ms:.1} ms");
+        let (ms, _) = mixed(false);
+        eprintln!("probe: 256-bit scan + scalar work, alternating: {ms:.1} ms");
+        if wide {
+            let (ms, _) = mixed(true);
+            eprintln!("probe: 512-bit scan + scalar work, alternating: {ms:.1} ms");
+        }
+    }
 }
