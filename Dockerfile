@@ -6,6 +6,8 @@ FROM rust:1.100-alpine3.22 AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
+# Not built into the image; the manifest names it, so Cargo wants to see it.
+COPY ref ./ref
 # The crate has no dependencies, so the build needs nothing from the network.
 # The scorers are Cascade Lake or newer: x86-64-v3 (AVX2, BMI2) is always there.
 RUN set -eu; \

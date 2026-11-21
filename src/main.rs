@@ -271,8 +271,8 @@ fn main() {
         pools.copies.records() + pools.events.records() + pools.clicks.records(),
     );
     eprintln!(
-        "pipeline: inside links: catalog done at {catalog_ms:.1} ms; link parse {:.1}, join {:.1}, name {:.1} ms",
-        links.timing[0], links.timing[1], links.timing[2],
+        "pipeline: inside links: catalog done at {catalog_ms:.1} ms; link parse {:.1}, join {:.1}, name {:.1} ms; peak memory {} MB",
+        links.timing[0], links.timing[1], links.timing[2], sys::peak_memory_mb(),
     );
     if cfg!(target_os = "linux") && event_bytes < (256 << 20) {
         describe_machine();

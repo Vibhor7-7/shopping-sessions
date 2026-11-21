@@ -5,12 +5,13 @@ MEM   ?= 24g
 PLATFORM ?= linux/amd64
 DEV   ?= dev
 ANSWER ?= dev-answer
-CARGO ?= cargo
+# cargo from the PATH, or where rustup puts it when the PATH was left alone.
+CARGO ?= $(shell command -v cargo 2>/dev/null || echo $(HOME)/.cargo/bin/cargo)
 # The test scripts need Python 3.10+ with polars; uv supplies both without touching the system Python.
 PY    ?= uv run --quiet --python 3.12 --with polars python
 export IMAGE CPUS MEM PLATFORM
 
-.PHONY: build fixtures dev run-dev check-dev native test native-fixtures native-dev reference cross-check
+.PHONY: build fixtures dev run-dev check-dev check-out native test native-fixtures reference diff regress
 
 ## Build the image for the scorer's platform, linux/amd64 (emulated on Apple silicon)
 build:
@@ -28,8 +29,12 @@ dev:
 run-dev: build
 	rm -rf out && time scripts/docker_run.sh $(DEV) out
 
-## Compare the dev output with the published dev answer (dev-answer.zip, unzipped here)
-check-dev:
+## The dev set through the native build, compared with the published dev answer (dev-answer.zip, unzipped here).
+## After `make run-dev`, `make check-out` compares what the image wrote instead.
+check-dev: native
+	rm -rf out && target/release/pipeline $(DEV) out 2>/dev/null && $(PY) scripts/compare.py out $(ANSWER)
+
+check-out:
 	$(PY) scripts/compare.py out $(ANSWER)
 
 ## The same checks without Docker, on a native build: the fast loop
@@ -42,14 +47,16 @@ test:
 native-fixtures: native
 	$(PY) scripts/run_fixtures.py fixtures -- target/release/pipeline
 
-native-dev: native
-	rm -rf out && target/release/pipeline $(DEV) out && $(PY) scripts/compare.py out $(ANSWER)
-
 ## The slow oracle against the fixtures and the dev answer
 reference: native
 	scripts/check_reference.sh
 
-## Pipeline against the oracle on seeds with no published answer: make cross-check SEEDS="2 3 4"
+## Pipeline against the reference (ref/) on seeds with no published answer: make diff SEEDS="2 3 4" SIZE=1M
 SEEDS ?= 2 3 4 5
-cross-check: native
-	scripts/cross_check.sh "$(SEEDS)" 200000 50000
+SIZE ?= 200000
+diff: native
+	scripts/diff_vs_ref.sh "$(SEEDS)" $(SIZE)
+
+## Everything that must hold before a commit is handed to the scorer
+regress:
+	scripts/regress.sh

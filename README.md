@@ -19,7 +19,7 @@ Without Docker, with a Rust toolchain:
 
 ```sh
 make native-fixtures   # cargo build --release, then the 36 fixtures
-make native-dev        # the dev set, diffed against dev-answer/
+make check-dev         # the dev set, diffed against dev-answer/
 make test              # unit tests
 ```
 
@@ -50,8 +50,9 @@ Exactness limits, none of which the generator can reach: the window must be shor
 
 - `fixtures/`: the organizers' 36 hand-written cases.
 - `dev-answer/`: the published answer for the 1M-event dev set (not committed; unzip `dev-answer.zip` here).
-- `src/bin/reference.rs`: a second, deliberately slow implementation that reads `rules.md` literally and shares no code with the pipeline. `make reference` checks it against the fixtures and the dev answer.
-- `scripts/cross_check.sh`: the pipeline against the reference on other seeds (leap-day and year-boundary windows included), with different thread and partition counts.
+- `ref/reference.rs`: a second, deliberately slow implementation that reads `rules.md` literally and shares no code with the pipeline. `make reference` checks it against the fixtures and the dev answer.
+- `scripts/diff_vs_ref.sh`: the pipeline against the reference on other seeds (leap-day and year-boundary windows included), with different thread and partition counts.
+- `scripts/regress.sh`: all of the above, on the native build and on an x86-64 build.
 - `scripts/fuzz.sh`: the same comparison on data dirtied far past what the generator does, read in tiny blocks and tiny file ranges so every boundary is hit.
 
 `dev/` and the generator are not in this repository; `make dev` builds the dev set if `generate` is on your `PATH` or in `.tools/`.

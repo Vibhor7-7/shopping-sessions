@@ -207,6 +207,18 @@ mod huge_blocks {
     }
 }
 
+/// The most memory this process has had resident at once, in megabytes.
+pub fn peak_memory_mb() -> u64 {
+    extern "C" {
+        fn getrusage(who: i32, usage: *mut [i64; 18]) -> i32;
+    }
+    // struct rusage: two timevals (four words), then ru_maxrss.
+    let mut usage = [0i64; 18];
+    unsafe { getrusage(0, &mut usage) };
+    let unit = if cfg!(target_os = "linux") { 1 << 10 } else { 1 }; // kilobytes on Linux, bytes on macOS
+    (usage[4] as u64 * unit) >> 20
+}
+
 /// A raw pointer that may cross threads. Every use is a phase in which each
 /// thread touches its own records, with a join between phases.
 #[derive(Clone, Copy)]

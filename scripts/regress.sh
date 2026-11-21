@@ -20,4 +20,5 @@ for bin in target/release/pipeline "$X86"; do
   echo "  dev answer:          $($PY scripts/compare.py out dev-answer | tail -1)"
   echo "  fuzz:                $(BIN="$bin" SEED=$(date +%s) scripts/fuzz.sh "$ROUNDS" 20000 2>&1 | tail -1)"
 done
-echo "cross-check (4 seeds x 4 settings): $(scripts/cross_check.sh "15 29 3 8" 300000 80000 2>&1 | grep -c MATCH)/16"
+echo "diff vs reference, seeds 2 to 5: $(scripts/diff_vs_ref.sh "2 3 4 5" 300k 2>&1 | tail -1)"
+echo "diff vs reference, leap day and year end: $(scripts/diff_vs_ref.sh "15 29" 300k 2>&1 | tail -1)"
