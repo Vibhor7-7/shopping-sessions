@@ -307,13 +307,53 @@ unsafe fn civil_known(p: *const u8, dates: &Dates) -> (i64, bool) {
     (known.midnight.wrapping_add(seconds), ok)
 }
 
+/// `±HH:MM` at `p + 19` (the eight bytes from `p + 17` are read): the seconds
+/// to add to the local time before it to get UTC, and whether it is an offset
+/// at all. Never branches: which sign it has is as good as random.
+#[inline(always)]
+unsafe fn zone(p: *const u8) -> (i64, bool) {
+    let tail = (p.add(17) as *const u64).read_unaligned(); // SS±HH:MM
+    // As in `time_of_day`: a digit becomes 0 to 9 and the colon 0, or the top bit is set.
+    let zone = tail ^ 0x3030_3a30_3000_0000;
+    let wrong = (zone | zone.wrapping_add(0x7676_7f76_7600_0000)) & 0x8080_8080_8000_0000;
+    let sign = (tail >> 16) as u8;
+    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+    let (offset, in_range) = {
+        let digits = std::arch::x86_64::_pext_u64(zone, 0x0f0f_000f_0f00_0000) as usize;
+        let offset = *HOURS.get_unchecked(digits & 255) + *MINUTES.get_unchecked(digits >> 8);
+        (i64::from(offset), offset < 86_400)
+    };
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+    let (offset, in_range) = {
+        let hours = ((zone >> 24) & 15) * 10 + ((zone >> 32) & 15);
+        let minutes = ((zone >> 48) & 15) * 10 + ((zone >> 56) & 15);
+        (((hours * 60 + minutes) * 60) as i64, (hours <= 23) & (minutes <= 59))
+    };
+    // `+HH:MM` is ahead of UTC, so it is taken off.
+    let to_utc = std::hint::select_unpredictable(sign == b'+', -offset, offset);
+    (to_utc, (wrong == 0) & in_range & ((sign == b'+') | (sign == b'-')))
+}
+
+/// The offset form, `YYYY-MM-DDTHH:MM:SS±HH:MM`, finished from what
+/// `civil_known` found in the same text (`seconds`, `civil_ok`): its epoch
+/// milliseconds, and whether it is that form, well formed, on a date in the
+/// table. Anything else is for `parse_general`.
+#[inline(always)]
+unsafe fn offset_known(p: *const u8, len: usize, seconds: i64, civil_ok: bool) -> (i64, bool) {
+    let (to_utc, zone_ok) = zone(p);
+    (seconds.wrapping_add(to_utc).wrapping_mul(1_000), (len == 25) & civil_ok & zone_ok)
+}
+
 /// Epoch milliseconds of the `len` bytes at `p`, or BAD.
 ///
 /// Which form a `ts` takes is as good as random from line to line, so the two
 /// common ones (13 digits; UTC on a date already seen) are both worked out
-/// without a branch and the answer picked by the length. Everything else, one
-/// line in ten, goes to `parse_general`. `p` must be in the reader's buffer:
-/// 3 bytes before it and 32 after are read whatever `len` is.
+/// without a branch and the answer picked by the length. One line in ten has
+/// neither, and nearly all of those have the offset form on a date already
+/// seen: that one is finished here, from the date and time of day already in
+/// hand. What is left (a date not yet in the table, a bad timestamp, digits
+/// that are not thirteen) goes to `parse_general`. `p` must be in the
+/// reader's buffer: 3 bytes before it and 32 after are read whatever `len` is.
 #[inline(always)]
 pub unsafe fn parse(p: *const u8, len: usize, dates: &mut Dates) -> i64 {
     let (digits, digits_ok) = thirteen(p);
@@ -329,6 +369,11 @@ pub unsafe fn parse(p: *const u8, len: usize, dates: &mut Dates) -> i64 {
     // on each, and the first of those is the form again. black_box hides how `ok`
     // was made, so it cannot (measured: 700,000 mispredictions per million lines without it).
     if std::hint::black_box(ok) {
+        return value;
+    }
+    // Taken by nearly every line that gets here, so it is a branch the CPU predicts.
+    let (value, ok) = offset_known(p, len, seconds, civil_ok);
+    if ok {
         value
     } else {
         parse_general(p, len, dates)
@@ -434,7 +479,23 @@ mod tests {
         // And with nothing learned yet.
         assert_eq!(unsafe { parse(p, len, &mut Dates::new()) }, plain, "parse, fresh: {shown:?}");
         assert_eq!(unsafe { parse_utc(p, len, &mut Dates::new()) }, utc_pair(plain), "parse_utc, fresh: {shown:?}");
+        // Which way an offset form goes. `parse_general` gives the same answer, so
+        // the lines above cannot tell: `parse` must finish it itself exactly when it
+        // is that form and good (its date is in the table by now, being a real one).
+        let (value, finished) = unsafe { finished_here(p, len, dates) };
+        let good_offset_form = len == 25 && plain != BAD && text[4] == b'-';
+        assert_eq!(finished, good_offset_form, "which way: {shown:?}");
+        if finished {
+            assert_eq!(value, plain, "finished in parse: {shown:?}");
+        }
+        assert!(!unsafe { finished_here(p, len, &Dates::new()) }.1, "finished on a date not in the table: {shown:?}");
         plain
+    }
+
+    /// What `parse` makes of a text that is not 13 digits or UTC: `offset_known`, fed as `parse` feeds it.
+    unsafe fn finished_here(p: *const u8, len: usize, dates: &Dates) -> (i64, bool) {
+        let (seconds, civil_ok) = civil_known(p, dates);
+        offset_known(p, len, seconds, civil_ok)
     }
 
     fn next(state: &mut u64) -> u64 {
@@ -504,6 +565,44 @@ mod tests {
         assert_eq!(ts("1970-01-01T00:00:00Z"), 0);
         assert_eq!(ts("2028-02-29T12:00:00Z"), ts("2028-03-01T12:00:00Z") - DAY_MS);
         assert_eq!(ts("2000-02-29T00:00:00Z"), 951_782_400_000);
+    }
+
+    /// Every offset there is, and every byte value in every place of one: each is
+    /// finished in `parse` itself when it is good and never when it is not.
+    #[test]
+    fn every_offset_on_a_known_date_is_finished_in_parse() {
+        let mut dates = Dates::new();
+        let (mut good, mut bad) = (0, 0);
+        for sign in ['+', '-'] {
+            for hours in 0..24 {
+                for minutes in 0..60 {
+                    let text = format!("2026-10-03T19:58:10{sign}{hours:02}:{minutes:02}");
+                    let offset = (hours * 3_600 + minutes * 60) * 1_000;
+                    let utc = 1_791_057_490_000 + if sign == '+' { -offset } else { offset };
+                    assert_eq!(both(text.as_bytes(), &mut dates), utc, "{text}");
+                    good += 1;
+                }
+            }
+        }
+        for text in ["2026-10-03T19:58:10-04:00", "2026-10-31T00:00:00+12:00", "2026-10-01T23:59:59-10:00", "2028-02-29T07:08:09+05:30"] {
+            for at in 0..text.len() {
+                for byte in 0..=255u8 {
+                    let mut changed = text.as_bytes().to_vec();
+                    changed[at] = byte;
+                    if both(&changed, &mut dates) == BAD {
+                        bad += 1;
+                    } else {
+                        good += 1;
+                    }
+                    // One byte more or fewer is another form or none.
+                    changed.insert(at, byte);
+                    both(&changed, &mut dates);
+                    changed.drain(at..at + 2);
+                    both(&changed, &mut dates);
+                }
+            }
+        }
+        assert!(good > 3_000 && bad > 20_000, "{good} good, {bad} bad");
     }
 
     #[test]
