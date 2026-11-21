@@ -30,7 +30,7 @@ The test scripts need `uv` (they run `uv run --with polars`); set `PY=python3` i
 | Phase | What happens | File |
 | --- | --- | --- |
 | links | `links/` is parsed in parallel into edges and joined with a lock-free union-find. A root always adopts the byte-wise smaller ID, so each tree's root is the person's name. | `src/links.rs` |
-| parse | Files are cut into ranges; each thread reads a range in 256 KB blocks, finds every newline, comma and quote 64 bytes at a time (AVX2), then validates each line. A surviving event is filed under its person; every parsed copy also leaves a small dedup record keyed by `event_id`. | `src/reader.rs`, `src/scan.rs`, `src/parse.rs`, `src/ts.rs`, `src/key.rs` |
+| parse | Files are cut into ranges; each thread reads a range in 256 KB blocks, finds every newline, comma and quote 64 bytes at a time (AVX2), splits each line into its fields with a handful of vector instructions, then validates it. A surviving event is filed under its person; every parsed copy also leaves a small dedup record keyed by `event_id`. | `src/reader.rs`, `src/scan.rs`, `src/parse.rs`, `src/ts.rs`, `src/key.rs` |
 | dedup | Per partition, a table of two-bit counters finds the few `event_id`s seen twice; only those copies are sorted, and every copy but the earliest has its event dropped. | `src/dedup.rs` |
 | people | Per partition, events are put in half-hour-bin order by two counting passes (never sorted: events under 30 minutes apart always share a session) and walked once per person: sessions, the crediting click, the assisting campaigns. Each thread writes its own `user_daily` file. | `src/person.rs` |
 | output | `campaign_daily`, and a minimal Parquet writer (PLAIN, uncompressed). | `src/main.rs`, `src/parquet.rs` |
@@ -41,7 +41,8 @@ Things that make it fast:
 - **Dedup without a second pass over events.** A copy that would fail validation gets no event record, so if it is the earliest copy, dropping the other copies' records leaves nothing: "dedup comes before validation" for free.
 - **Clicks need no dedup.** Copies of a click are identical, so they credit the same campaign and assist as the same campaign once.
 - **No branch the CPU cannot predict on the hot path.** Which of the three forms a `ts` takes, and whether a user ID is linked, are coin tosses from line to line; both answers are computed and selected. The date part of a timestamp is a table hit.
-- **Lookups are prefetched.** The link table is larger than the cache; each line asks for its cache line 16 lines before reading it, and the four slots of that line are compared at once.
+- **Lookups are prefetched.** The link table is larger than the cache; each line asks for its cache line 12 lines before reading it, and the four slots of that line are compared at once. Reading it names the person, so the partitions the line's records go to: those are asked for then, 4 lines before the records are written.
+- **Catalog IDs by number.** The files' own IDs are a prefix and a number (`c_45`, `p123`); text of exactly that shape is looked up in a small array by the number, anything else in a map that holds every ID.
 - **Huge pages.** Every buffer of 32 KB or more is on memory advised for transparent huge pages (`src/sys.rs`): fewer page faults, fewer TLB misses, less for the kernel to free at exit.
 
 Exactness limits, none of which the generator can reach: the window must be shorter than 42 days (timestamps are stored as 32-bit offsets), and `ingest_ts` is compared in whole seconds (it is always form F1).
@@ -64,7 +65,8 @@ A laptop cannot say what is fast on the scorer's Xeon, so two workflows run on G
 ```sh
 gh workflow run bench.yml -f base=<commit>     # this commit against another, interleaved runs, per-phase minimums
 scripts/bench_result.sh                        # wait for it and print the timings
-gh workflow run profile.yml                    # instructions and mispredicted branches per source line (callgrind)
+gh workflow run profile.yml                    # instructions and mispredicted branches per source line (callgrind),
+                                               # and where the time is on 4 threads (perf, sampled on the CPU clock)
 ```
 
 Both use `src/bin/synth.rs`, a stand-in for the organizers' generator that writes data of the same shape. Things measured and dropped: reading files through `mmap` (11 to 17% slower on a virtual machine), a larger link table, smaller read blocks.

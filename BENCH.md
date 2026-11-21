@@ -4,6 +4,7 @@
 
 - **Scorer** is the only number that counts: the track page's time for a commit, on the hidden ~20M-event practice set.
 - **x86 A/B** is what decides whether a change is kept: the `bench` workflow builds two commits with the Dockerfile and runs them interleaved on one GitHub x86-64 machine (2 cores / 4 threads, stand-in 20M-event dataset from `src/bin/synth.rs`). Times are the in-process total in ms, minimum of 5 runs, base → head. Noise between repeats is about 1%. The CPU differs from run to run, so only compare within a row.
+- The workflow's 4-thread number has two threads to a core; its **one-thread** number has a core to itself. They can disagree: fewer instructions pay when threads share a core (experiment 22), a stall avoided pays when they do not (experiment 24). Which of the two the scorer's 8 CPUs are is not known until the probe's log is read, so both are given.
 - **bench.sh 20M** is `scripts/bench.sh 20M` on the development Mac (ARM, 8 threads, the organizers' generator, seed 120): best / median wall ms of 5. The Mac is under memory pressure and its numbers wander by 10% or more; they are here because the rules ask for one, not because they decide anything.
 - **Verified** means: 36 fixtures, `make check-dev`, `scripts/diff_vs_ref.sh` on seeds 2 to 5, on the native build and on an x86-64 build (`scripts/regress.sh`), then CI on real amd64.
 
@@ -57,17 +58,23 @@ Rows 1 to 15 were run before this log existed and are reconstructed from the ben
 | — | Measurement: where the time is, not the instructions (`profile` workflow, new step: `perf` sampling on the CPU clock, 20M events, 4 threads, Zen 4) | `1359a83` | parse 52% of samples, people 16%, the delimiter scan 11%, dedup 4% + 1.7% sorting its suspects, kernel: 3.2% copying file data, 2.2% zeroing new pages. By line: **10% on the first touch of a push** (loading the partition's state, writing into its buffer), 2.2% on the campaign and product hash table's slot, 8% across the timestamp code, 3.5% in the hash function | n/a | n/a | measurement only. It named experiments 24 and 25 |
 | 24 | The link table is read 12 lines after a line is parsed instead of 16; that names the person, so both partitions, whose state and buffer are prefetched then; the records are written 4 lines later | `86b8dce` | 20M: 1228 → 1221 (Ice Lake 8370C), −0.6%; repeat 1232 → 1229: nothing, with two threads to a core. **One thread: 3025 → 2935, −3.0%**; parse −4.6%. 60M (2^11 partitions): 2887 → 2825 (Granite Rapids 6975P-C), −2.2%; repeat −1.5%; one thread 7529 → 7311, −2.9% | 387 / 411, peak 1271 MB | yes | kept. A stall hurts less when a second thread can use the core meanwhile, so what this is worth on the scorer depends on whether its 8 CPUs are 8 cores; the probe's thread-scaling lines say |
 | 25 | Campaign and product IDs of the files' own shape (a prefix and a number: `c_45`, `p123`) looked up by the number in a small array; any other text, and any number past the array, still goes through the map, which holds every ID | `ea498ca` | 1160 → 1150 (Zen 3), −0.9%; repeat 1162 → 1148, −1.2%; parse −1.7%. One thread: 3117 → 3076, −1.3% | 397 / 443, peak 1256 MB | yes (and a unit test against the map on 25,000 spellings) | kept |
+| — | 22 to 25 together against the last scored commit, at 20M and at 60M | `e03e2c3` vs `f245e54` | 20M: **1244 → 1135 (Zen 3), −8.7%**; repeat 1242 → 1135; parse −12.4%; one thread 3134 → 2843, −9.3%. 60M: **3867 → 3483 (Zen 4, EPYC 9V74), −9.9%**; repeat 3828 → 3475, −9.2%; one thread 9720 → 8724, −10.2% | as 24 | yes | measurement only |
+| — | Measurement: the profile again, after 22 to 25 (Sapphire Rapids 8573C, 4 threads) | `f245e54` | 1.26 billion instructions (was 1.33). Samples: parse 45%, people 19% + 1.4% sorting clicks, the delimiter scan 9%, **kernel 10%: 5.0% copying file data, 4.8% zeroing the 1.2 GB of new pages**, dedup 4.4% + 1.7% sorting suspects, links 4% | n/a | n/a | measurement only. The first touch of a push is down from 10% to about 5% of samples |
 
-## The probe (branch `probe`, commit `3c84905`)
+## The probe (branch `probe`)
 
-Not for scoring. It runs the pipeline, logs a description of the machine (CPU model and AVX-512 subsets, whether it is a virtual machine, cgroup CPU and memory limits, huge-page settings, every mount, when the sandbox's files were created, how many threads really run at once, memory and disk speed, `read()` against `mmap()`, 256-bit against 512-bit scans) and then writes an empty `user_daily` so that the dev check fails: a failed dev check is the only case in which the track page shows a submission its log. A rejected submission does not change the best score; it does use one of the two submissions an hour.
+Not for scoring. It runs the pipeline and then makes `user_daily` empty so that the dev check fails: a failed dev check is the only case in which the track page shows a submission its log. A rejected submission does not change the best score; it does use one of the two submissions an hour. Merge `main` into it before use; the commit to hand over is in the session's report, not here, because it changes with every merge.
 
-What its answers decide:
-- virtual machine or bare metal, and the `read()`/`mmap()` numbers: whether experiment 10 should be retried;
-- AVX-512 subsets and the alternating 256/512-bit timing: whether a 512-bit stage one pays;
-- the creation times of `/app/pipeline` and `/`: whether a sandbox is unpacked per run (experiment 16);
-- thread scaling: whether 8 threads have 8 hyperthreads to themselves;
-- `/output` speed and huge-page mode: whether smaller output or other memory layouts matter.
+What it logs, and what each answer decides (first in the log is first here, in case a long log is cut):
+- **the parse phase of the dev set cut short at each stage, 8 threads** (read, + delimiter scan, + line walk, + fields into values, + link lookups, + event records, everything): where parse time goes on the scorer's CPU, to set against the same list from GitHub's machines (the `anatomy` measurement above);
+- **the whole parse phase on 1, 2, 4, 6, 8, 12 and 16 threads**, and `read()` + scan alone: whether the 8 CPUs are 8 cores or 4 cores' hyperthreads, so whether the 4-thread or the one-thread column of this file is the one to believe, and whether memory bandwidth caps the scan;
+- the CPU model and its AVX-512 subsets, cgroup CPU and memory limits, `cpu.stat` (was the run throttled), huge-page settings, every mount, the environment;
+- when the sandbox's files and the process were created: how long a sandbox takes to reach `main` (experiment 16);
+- the same spin loop on 1 to 16 threads: real CPUs, without memory in the picture;
+- **256 MB touched and unmapped under each huge-page advice, on 1 and 8 threads**: what 4 KB pages cost here going in and at exit. The pipeline touches 1.2 GB at 20M events and 3.4 GB at 60M;
+- `/output`, `/scratch` and `/tmp` write and read speed: whether a smaller output matters;
+- `read()` against `mmap()` on the largest event file: whether experiment 10 should be retried;
+- 256-bit against 512-bit scans, alone and alternating with scalar work: whether a 512-bit stage one pays.
 
 ## Before each submission
 
@@ -75,6 +82,7 @@ What its answers decide:
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `c5b2dfd` | yes, `--no-cache`, amd64 | 36/36 (locally under emulation and on CI's real amd64) | MATCH (native build, and the image's output) | 16/16 runs match | x86 CI, Docker `--cpus 4 --memory 12g` (the runner has no more): **4.06 to 4.34 s** per `docker run`, 3.07 s inside the process. Mac, native: 4.4 s best of 3, on a machine short of memory and disk | **3.4 GB** (x86, 4 threads); 3.1 to 3.4 GB on the Mac | 2.3 MB root filesystem, 3 layers |
 | `e03e2c3` | yes, `--no-cache`, amd64 | 36/36 (locally under emulation and on CI's real amd64) | MATCH (native build, x86-64 build, and the image's output) | 16/16 runs match, on both builds | x86 CI, Docker `--cpus 4 --memory 12g`: **4.21 to 4.28 s** per `docker run` on Zen 3 (3.75 to 3.81 s inside the process), 4.47 to 4.58 s on Ice Lake (4.05 to 4.16 s inside). Not run on the Mac this time: 7 GB of free disk is not enough for the 5.4 GB dataset and its output without distorting the run | **3.5 GB** (x86, 4 threads) | 2.3 MB root filesystem (the binary is 0.8 MB), 3 layers |
+| `f245e54` (code of `86b8dce`) | yes, `--no-cache`, amd64 | 36/36 (locally under emulation and on CI's real amd64) | MATCH (native build, x86-64 build, and the image's output) | 16/16 runs match, on both builds; leap-day and year-end seeds 8/8 | x86 CI, Docker `--cpus 4 --memory 12g`: **3.97 to 3.98 s** per `docker run` on Zen 4 (EPYC 9V74), 3.48 to 3.51 s inside the process; `e03e2c3` on the same machine: 3.83 to 3.87 s inside. Not run on the Mac (no room for the dataset) | **3.4 GB** (x86, 4 threads; 3,499 MB by `time`) | 2.44 MB root filesystem (the binary is 0.82 MB), 3 layers |
 
 Notes on the 60M runs:
 - No machine at hand has 8 CPUs and 24 GB for a container: the Mac's Docker VM has 8 GB, the CI runner 4 CPUs and 16 GB. The numbers above are under the largest limits each allows.
@@ -83,9 +91,12 @@ Notes on the 60M runs:
 
 ## To try, most promising first
 
-1. **Read the scorer's machine**: the probe's log, if the user spends a submission on it (merge `main` into `probe` first and hand over the new commit). Items 2 and 3 wait for it; 4 to 6 do not.
-2. **`mmap` again, if the scorer is bare metal.** It lost on virtual machines because of page-table walks (experiment 10); on bare metal those are cheap and the copy it saves is 6% of the run.
-3. **AVX-512 stage one**, if the probe shows it does not slow the scalar code around it.
-4. **More of what experiment 18 did**: memory the pipeline writes once and reads later. The people phase's staging arrays and the output buffers are the candidates.
-5. **Smaller output.** `user_daily` is 78 MB of PLAIN Parquet at 20M events. Dictionary and run-length encodings would cut it to about a third. Worth 1% under Docker (experiment 17); more only if the scorer's `/output` is slow.
-6. **Instruction-level cuts** in timestamps, keys and the quote check: 1 to 3% each (callgrind lists them).
+1. **Read the scorer's machine**: the probe's log, if the user spends a submission on it. It now decides more than items 2 and 3: whether the 8 CPUs are 8 cores (which column of this file to believe, and whether prefetching or instruction counts come first), what 4 KB pages cost there, and how fast `/output` is.
+2. **`mmap` again, if the scorer is bare metal.** It lost on virtual machines because of page-table walks (experiment 10); on bare metal those are cheap, and the copy it saves is 5% of the samples.
+3. **AVX-512 stage one**, if the probe shows it there and not slowing the scalar code around it. The scan is 9 to 11% of the run; with `vpcompressb` (Ice Lake and later) a block's delimiters become offsets in four instructions instead of thirty.
+4. **Dedup without a record for every copy.** 97% of copy records only prove that an event has no second copy. They cost a push a line (about 10% of parse), 330 MB of new pages at 20M, and the dedup phase with its sort (6%). No design yet: every exact filter seen so far needs a table the size of the IDs, read at random.
+5. **Fewer new pages.** Zeroing them is 4.8% of samples on the Intel runner. The copy records' memory is dead after dedup and could hold the output columns; the output could be written from its columns without first being copied into one buffer (78 MB at 20M).
+6. **The people phase**, 19% and not yet read line by line in the sampled profile: three passes over each partition's events, a hash lookup an event, a sort of each person's clicks.
+7. **Instruction cuts left in parse**, 1 to 2% each: both IDs of a line packed in one 256-bit operation; the `ts` flags; field bounds read from memory instead of extracted from a vector register.
+8. **Smaller output.** `user_daily` is 78 MB of PLAIN Parquet at 20M events. Dictionary and run-length encodings would cut it to about a fifth. Worth 1% under Docker (experiment 17); more only if the probe shows the scorer's `/output` is slow.
+9. **Dedup's sort of suspects**, 1.7%: a second filter to drop the chance collisions before sorting, or a small hash table instead of the sort.
