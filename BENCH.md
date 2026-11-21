@@ -38,10 +38,22 @@ Rows 1 to 15 were run before this log existed and are reconstructed from the ben
 | 14 | Link table as 4 IDs + 4 people per cache line; dedup with one two-bit array | `b58dc53` | 821 → 809 (Zen 4), −1.5% | n/a | yes | kept |
 | 15 | Direct comparison of #1 with #11 | `d698c87` vs `6bbe143` | 945 → 825 (Zen 4), −12.7% | n/a | n/a | measurement only |
 | — | Baseline for what follows | `7f9bffe` | — | 384 / 413, peak 1259 MB | yes | — |
+| 16 | Runtime image BusyBox (2.3 MB) instead of Debian (115 MB); binary unchanged | `c5b2dfd` | 1261 → 1257 (Zen 3): in-process identical, as it must be. `docker run` wall on the runner is the same for both images (Docker mounts layers, it does not unpack them) | not rerun: same binary | yes | **awaiting a score.** Only the scorer can show whether its sandboxes pay for image size |
+
+## Before each submission
+
+| Commit | Clean image build | Fixtures (image, scorer flags) | check-dev | diff seeds 2 to 5 | 60M: time | 60M: peak memory | Image |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `c5b2dfd` | yes, `--no-cache`, amd64 | 36/36 (locally under emulation and on CI's real amd64) | MATCH (native build, and the image's output) | 16/16 runs match | x86 CI, Docker `--cpus 4 --memory 12g` (the runner has no more): **4.06 to 4.34 s** per `docker run`, 3.07 s inside the process. Mac, native: 4.4 s best of 3, on a machine short of memory and disk | **3.4 GB** (x86, 4 threads); 3.1 to 3.4 GB on the Mac | 2.3 MB root filesystem, 3 layers |
+
+Notes on the 60M runs:
+- No machine at hand has 8 CPUs and 24 GB for a container: the Mac's Docker VM has 8 GB, the CI runner 4 CPUs and 16 GB. The numbers above are under the largest limits each allows.
+- The reference cannot run at 60M (it would need tens of GB), so correctness at that size rests on: two runs with different thread and partition counts (8 threads, 2^11/2^11 partitions; 3 threads, 2^8/2^12) giving identical tables (6,623,558 user rows; digests equal); `sessions` and `revenue_cents` summing to the same in both tables (10,012,569 and 19,153,547,521); and the diff against the reference at up to 3M events.
+- On the CI runner, `docker run` at 60M takes about 1.0 s longer than the process inside it; at 20M the difference is 0.2 s (0.13 s of that is an empty container). What the extra 0.8 s is has not been found yet; see the list below.
 
 ## To try, most promising first
 
-1. **Runtime image size** (experiment 16). If each sandbox unpacks the image, 115 MB of Debian is paid on every timed run.
+1. **Where container time goes outside the process.** At 60M, `docker run` takes 1.0 s more than the process reports; at 20M, 0.2 s. Time the gap with output on tmpfs, without a memory limit, and with timestamps from inside, to see whether it is our output, our memory, or the runtime.
 2. **Smaller output.** `user_daily` is 78 MB of PLAIN Parquet for 20M events. Dictionary and run-length encodings would cut it to about a third: less to write, and less left to flush if the clock waits for that.
 3. **AVX-512 delimiter scan.** The organizers say AVX-512 is there. Halves the instructions of stage one (about 12% of parse), but 512-bit code lowers the clock on Cascade Lake; needs a scorer run to judge, not CI (the CI machines are not Cascade Lake).
 4. **Timestamps, keys, quote check**: instruction-level cuts, 1 to 3% each (callgrind lists them).
