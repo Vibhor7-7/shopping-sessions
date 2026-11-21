@@ -84,10 +84,10 @@ fn write_campaign_daily(folder: &Path, catalog: &catalog::Catalog, cells: &[pers
             let at = day * width + campaign;
             let mut sum = [0u64; 4];
             for cell in cells {
-                for i in 0..3 {
-                    sum[i] += cell.credited[at][i];
-                }
-                sum[3] += u64::from(cell.assisted[at]);
+                sum[0] += u64::from(cell.counts[at][person::Cells::SESSIONS]);
+                sum[1] += cell.bought[at][0];
+                sum[2] += cell.bought[at][1];
+                sum[3] += u64::from(cell.counts[at][person::Cells::ASSISTED]);
             }
             if sum[0] == 0 && sum[3] == 0 {
                 continue;

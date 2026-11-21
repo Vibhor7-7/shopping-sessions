@@ -61,11 +61,26 @@ impl UserRows {
 }
 
 /// campaign_daily, indexed by `day * (campaigns + 1) + campaign`; `organic` is the last campaign.
+/// Both arrays are one slot longer than the table: the last is scratch (`Tally::spare`), never read.
+///
+/// The campaign a session is credited to assists it too (rules.md, clicks, step 7),
+/// so its `assisted_sessions` is written a moment before its `sessions`: the two
+/// lie side by side, and crediting a session fetches nothing of its own. What
+/// only a session with a purchase adds to is kept apart, out of their way.
 pub struct Cells {
-    /// sessions, purchasing_sessions, revenue_cents
-    pub credited: Vec<[u64; 3]>,
-    /// One slot longer than the table: the last is scratch (`Tally::spare`), never read.
-    pub assisted: Vec<u32>,
+    /// `[assisted_sessions, sessions]`
+    pub counts: Vec<[u32; 2]>,
+    /// `[purchasing_sessions, revenue_cents]`
+    pub bought: Vec<[u64; 2]>,
+}
+
+impl Cells {
+    pub const ASSISTED: usize = 0;
+    pub const SESSIONS: usize = 1;
+
+    fn new(cells: usize) -> Self {
+        Self { counts: vec![[0; 2]; cells + 1], bought: vec![[0; 2]; cells + 1] }
+    }
 }
 
 pub struct Setup<'a> {
@@ -347,7 +362,7 @@ struct Tally {
     first_day: i64,
     width: usize,
     organic: usize,
-    /// The scratch slot at the end of `cells.assisted`.
+    /// The scratch slot at the end of both arrays of `cells`.
     spare: usize,
     category_sum: Vec<i64>,
     category_touched: Vec<u32>,
@@ -445,6 +460,18 @@ impl Tally {
         few
     }
 
+    /// Counts a session for the cell it is credited to, after its assists: the
+    /// cell is `organic`'s, one of 14 or so, or one an assist has just written.
+    /// A session without a purchase adds its nothing to the scratch slot instead
+    /// of branching around the cell.
+    #[inline(always)]
+    fn credited(&mut self, cell: usize, revenue: i64, purchased: bool) {
+        self.cells.counts[cell][Cells::SESSIONS] += 1;
+        let bought = &mut self.cells.bought[std::hint::select_unpredictable(purchased, cell, self.spare)];
+        bought[0] += 1;
+        bought[1] += revenue as u64;
+    }
+
     /// Credits a finished session of a person with few clicks (`count` of them,
     /// in `few`) and counts the campaigns that assisted it.
     ///
@@ -470,14 +497,11 @@ impl Tally {
                 for at in 0..count {
                     let assists = (at >= oldest) & (at < upto) & (*few.earlier.get_unchecked(at) as usize <= oldest);
                     let cell = std::hint::select_unpredictable(assists, row + *few.campaign.get_unchecked(at + 1) as usize, self.spare);
-                    *self.cells.assisted.get_unchecked_mut(cell) += 1;
+                    self.cells.counts.get_unchecked_mut(cell)[Cells::ASSISTED] += 1;
                 }
             }
         }
-        let cell = &mut self.cells.credited[row + credited];
-        cell[0] += 1;
-        cell[1] += u64::from(purchased);
-        cell[2] += revenue as u64;
+        self.credited(row + credited, revenue, purchased);
     }
 
     /// Credits a finished session of a person with many clicks, in `click_order`,
@@ -496,13 +520,10 @@ impl Tally {
         }
         let row = day as usize * self.width;
         let credited = if reach.upto > reach.oldest { clicks[reach.upto - 1][0] as u32 as usize } else { self.organic };
-        let cell = &mut self.cells.credited[row + credited];
-        cell[0] += 1;
-        cell[1] += u64::from(purchased);
-        cell[2] += revenue as u64;
         for &campaign in &self.window {
-            self.cells.assisted[row + campaign as usize] += 1;
+            self.cells.counts[row + campaign as usize][Cells::ASSISTED] += 1;
         }
+        self.credited(row + credited, revenue, purchased);
     }
 
     /// Closes a session: `credit_few` or `credit`, by how many clicks the person has.
@@ -641,7 +662,7 @@ pub fn run<R: Send>(
             window: Vec::new(),
             bin_purchases: Vec::new(),
             rows: UserRows::with_capacity(expected_rows),
-            cells: Cells { credited: vec![[0; 3]; width * setup.days], assisted: vec![0; width * setup.days + 1] },
+            cells: Cells::new(width * setup.days),
             sessions: 0,
         };
         loop {
