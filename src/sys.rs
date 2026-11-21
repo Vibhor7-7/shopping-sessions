@@ -66,6 +66,50 @@ pub fn map<T>(count: usize) -> *mut T {
     aligned as *mut T
 }
 
+extern "C" {
+    #[cfg(not(target_os = "linux"))]
+    fn madvise(addr: *mut c_void, len: usize, advice: i32) -> i32;
+}
+
+/// A whole file mapped read-only, or None if it cannot be (the reader then falls back to `read`).
+pub fn map_file(file: &std::fs::File, len: u64) -> Option<*const u8> {
+    use std::os::fd::AsRawFd;
+    const PROT_READ: i32 = 1;
+    let at = unsafe { mmap(std::ptr::null_mut(), len as usize, PROT_READ, MAP_PRIVATE, file.as_raw_fd(), 0) };
+    if at as isize == -1 || at.is_null() {
+        None
+    } else {
+        Some(at as *const u8)
+    }
+}
+
+/// Asks the kernel to put the whole pages of `at..at + len` of a file mapping
+/// into the page table in one go (and read them in, if they are not cached),
+/// rather than taking a fault every sixteen pages.
+pub fn populate(at: *const u8, len: usize) {
+    #[cfg(target_os = "linux")]
+    advise_pages(at, len, 22); // MADV_POPULATE_READ, Linux 5.14; an older kernel just declines
+    #[cfg(not(target_os = "linux"))]
+    advise_pages(at, len, 3); // MADV_WILLNEED
+}
+
+/// Drops the page-table entries of the whole pages inside `at..at + len`, so
+/// they are not all left for the kernel to take apart, one thread, at exit.
+/// Touching the range again simply maps it again.
+pub fn release(at: *const u8, len: usize) {
+    advise_pages(at, len, 4); // MADV_DONTNEED
+}
+
+fn advise_pages(at: *const u8, len: usize, advice: i32) {
+    let from = (at as usize + 4095) & !4095;
+    let to = (at as usize + len) & !4095;
+    if to > from {
+        unsafe {
+            madvise(from as *mut c_void, to - from, advice);
+        }
+    }
+}
+
 /// A raw pointer that may cross threads. Every use is a phase in which each
 /// thread touches its own records, with a join between phases.
 #[derive(Clone, Copy)]

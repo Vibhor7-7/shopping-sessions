@@ -37,4 +37,15 @@ jobs:
           RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release
           python3 scripts/run_fixtures.py fixtures -- target/release/pipeline
           SS_JOB_BYTES=7 SS_BLOCK_BYTES=17 python3 scripts/run_fixtures.py fixtures -- target/release/pipeline
+          SS_MAP_MIN_BYTES=0 SS_MAP_TAIL=128 SS_JOB_BYTES=90 SS_BLOCK_BYTES=128 python3 scripts/run_fixtures.py fixtures -- target/release/pipeline
           scripts/check_reference.sh
+      - name: Pipeline and reference agree on a stand-in dataset, read in place and through read
+        run: |
+          cargo build --release --bin synth 2>&1 | tail -1
+          target/release/synth --events 1500000 --clicks 400000 --seed 21 --output data
+          target/release/reference data ref
+          for settings in "NCPU=4" "NCPU=3 SS_MAP_MIN_BYTES=999999999999" "NCPU=4 SS_MAP_MIN_BYTES=0 SS_MAP_TAIL=128 SS_JOB_BYTES=40000 SS_BLOCK_BYTES=3000"; do
+            rm -rf out; env $settings target/release/pipeline data out 2>/dev/null
+            echo "[$settings] $(python3 scripts/compare_exact.py out ref | tail -1)"
+            python3 scripts/compare_exact.py out ref | tail -1 | grep -q MATCH
+          done

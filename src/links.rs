@@ -6,7 +6,6 @@
 //! the root of every tree is the smallest ID of its person: the name rules.md
 //! asks for, with no separate pass to find it.
 
-use std::fs::File;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use crate::key::{self, Key};
@@ -212,8 +211,7 @@ pub fn build(inputs: &[Input], threads: usize) -> Links {
         let mut buf = ReadBuf::new();
         let mut lines = LinkLines { edges: Vec::new() };
         while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
-            let file: &File = &inputs[job.file as usize].file;
-            reader::walk(file, job.offset, job.length, &mut buf, &mut lines);
+            reader::walk(&inputs[job.file as usize], job.offset, job.length, &mut buf, &mut lines);
         }
         lines.edges
     });

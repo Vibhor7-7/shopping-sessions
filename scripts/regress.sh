@@ -16,6 +16,9 @@ for bin in target/release/pipeline "$X86"; do
   echo "$bin"
   echo "  fixtures:            $($PY scripts/run_fixtures.py fixtures -- "$bin" 2>&1 | tail -1)"
   echo "  fixtures, tiny reads: $(SS_JOB_BYTES=7 SS_BLOCK_BYTES=17 $PY scripts/run_fixtures.py fixtures -- "$bin" 2>&1 | tail -1)"
+  echo "  fixtures, mapped:     $(SS_MAP_MIN_BYTES=0 SS_MAP_TAIL=128 SS_JOB_BYTES=90 SS_BLOCK_BYTES=128 $PY scripts/run_fixtures.py fixtures -- "$bin" 2>&1 | tail -1)"
+  rm -rf out; SS_MAP_MIN_BYTES=0 SS_MAP_TAIL=128 SS_JOB_BYTES=5000 SS_BLOCK_BYTES=700 NCPU=5 "$bin" dev out 2>/dev/null
+  echo "  dev, mapped, small:   $($PY scripts/compare.py out dev-answer | tail -1)"
   rm -rf out; "$bin" dev out 2>/dev/null
   echo "  dev answer:          $($PY scripts/compare.py out dev-answer | tail -1)"
   echo "  fuzz:                $(BIN="$bin" SEED=$(date +%s) scripts/fuzz.sh "$ROUNDS" 20000 2>&1 | tail -1)"
