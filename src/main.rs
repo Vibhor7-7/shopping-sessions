@@ -188,12 +188,23 @@ fn main() {
     let first_day = catalog.window_start.div_euclid(ts::DAY_MS);
     let days = ((catalog.window_end - 1).div_euclid(ts::DAY_MS) - first_day + 1) as usize;
 
-    // Partitions of a few megabytes of input each, so the later phases work in cache.
-    let auto_bits = |bytes: u64| (bytes / (4 << 20)).max(1).next_power_of_two().trailing_zeros().clamp(4, 9);
-    let person_bits = setting("SS_PERSON_BITS").map_or(auto_bits(event_bytes), |b| b as u32).clamp(1, 12);
-    let dedup_bits = setting("SS_DEDUP_BITS").map_or(auto_bits(event_bytes), |b| b as u32).clamp(1, 12);
-    let per_tail = (event_bytes / 64) as usize / (threads << person_bits) / 4;
-    let chunk = per_tail.next_power_of_two().clamp(64, 4096);
+    // Enough partitions that the later phases work on one in cache: about 2 MB of
+    // events for a partition of people (its events are moved three times), 4 MB
+    // for a dedup partition (only looked at). More data, more partitions.
+    let bits = |bytes: u64, each: u64| (bytes / each).max(1).next_power_of_two().trailing_zeros().clamp(4, 11);
+    let person_bits = setting("SS_PERSON_BITS").map_or(bits(event_bytes, 2 << 20), |b| b as u32).clamp(1, 12);
+    let dedup_bits = setting("SS_DEDUP_BITS").map_or(bits(event_bytes, 4 << 20), |b| b as u32).clamp(1, 12);
+    // Each thread fills one chunk per partition at a time, and the last of each is
+    // left part empty: a quarter of what a thread expects to put in a partition
+    // keeps that waste near an eighth of the data.
+    let chunk = |bytes: u64, per_record: u64, partition_bits: u32| {
+        ((bytes / per_record) as usize / (threads << partition_bits) / 4).next_power_of_two().clamp(64, 4096)
+    };
+    let chunks = parse::ChunkSizes {
+        copies: chunk(event_bytes, 64, dedup_bits),
+        events: chunk(event_bytes, 64, person_bits),
+        clicks: chunk(click_bytes, 40, person_bits),
+    };
 
     let wide: Option<Mutex<Vec<(u32, u32)>>> = (catalog.categories.len() > 255).then(|| Mutex::new(Vec::new()));
     let pools = parse::Pools { copies: pool::Pool::new(), events: pool::Pool::new(), clicks: pool::Pool::new() };
@@ -206,7 +217,7 @@ fn main() {
         dedup_shift: 64 - dedup_bits,
         wide: wide.as_ref(),
     };
-    let parsed = parse::run(&context, &pools, &events, &clicks, threads, 1 << person_bits, 1 << dedup_bits, chunk);
+    let parsed = parse::run(&context, &pools, &events, &clicks, threads, 1 << person_bits, 1 << dedup_bits, chunks);
     let parsed_at = started.elapsed();
 
     let dropped = dedup::run(&pools.copies, &pools.events, &parsed, 1 << dedup_bits, 64 - dedup_bits, threads);

@@ -307,6 +307,14 @@ pub struct Pools {
     pub clicks: Pool<Click>,
 }
 
+/// Records per chunk, for each stream.
+#[derive(Clone, Copy)]
+pub struct ChunkSizes {
+    pub copies: usize,
+    pub events: usize,
+    pub clicks: usize,
+}
+
 /// What one thread wrote, per partition.
 pub struct Parsed {
     pub copies: Chunks,
@@ -323,7 +331,7 @@ pub fn run(
     threads: usize,
     person_partitions: usize,
     dedup_partitions: usize,
-    chunk: usize,
+    chunks: ChunkSizes,
 ) -> Vec<Parsed> {
     let total: u64 = events.iter().chain(clicks).map(|i| i.len).sum();
     let target = reader::job_bytes().unwrap_or((total / (threads as u64 * 16)).clamp(1 << 16, 4 << 20));
@@ -334,9 +342,9 @@ pub fn run(
         let mut buf = ReadBuf::new();
         let mut sink = Sink {
             context,
-            copies: Scatter::new(&pools.copies, dedup_partitions, chunk),
-            events: Scatter::new(&pools.events, person_partitions, chunk),
-            clicks: Scatter::new(&pools.clicks, person_partitions, chunk),
+            copies: Scatter::new(&pools.copies, dedup_partitions, chunks.copies),
+            events: Scatter::new(&pools.events, person_partitions, chunks.events),
+            clicks: Scatter::new(&pools.clicks, person_partitions, chunks.clicks),
             waiting_events: [PendingEvent::default(); RING],
             event_count: 0,
             waiting_clicks: [PendingClick::default(); RING],
