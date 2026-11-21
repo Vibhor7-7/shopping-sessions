@@ -17,7 +17,7 @@ use crate::catalog::{self, Catalog};
 use crate::key::{self, Key};
 use crate::links::Links;
 use crate::pool::{Chunks, Combine, Pool};
-use crate::reader::{self, Input, Job, Lines, ReadBuf};
+use crate::reader::{self, Fields, Input, Job, Lines, ReadBuf};
 use crate::sys;
 use crate::ts;
 
@@ -86,30 +86,38 @@ impl Context<'_> {
 }
 
 /// How many lines pass between asking for a user's slot in the link table and
-/// reading it. The table is far larger than the cache, so every lookup is a
-/// memory fetch; started this early, the fetches overlap instead of each one
-/// stalling the parser.
+/// writing the line's records. The table is far larger than the cache, so every
+/// lookup is a memory fetch; started this early, the fetches overlap instead of
+/// each one stalling the parser.
 const RING: usize = 16;
+/// How many lines after that request the slot is read (`look_up_*`). Reading it
+/// names the person, so the partitions the records go to; those are asked for
+/// then, `RING - LOOK` lines before they are written.
+const LOOK: usize = 12;
 
-/// A parsed event copy waiting for its user's link-table slot to arrive.
+/// A parsed event copy on its way to its partitions.
 #[derive(Clone, Copy, Default)]
 struct PendingEvent {
-    /// 0 for a copy that would not survive: it leaves only its dedup record.
+    /// The user until the link table has been read, then the person. 0 for a
+    /// copy that would not survive: it leaves only its dedup record.
     user: Key,
     event: Key,
     ts: u32,
     purchase: u32,
     ingest: u32,
-    /// Where the user's lookup in the link table starts.
+    /// Where the user's lookup in the link table starts; after the lookup, the
+    /// two partitions: the person's in the low half, the event's in the high half.
     home: u32,
 }
 
 #[derive(Clone, Copy, Default)]
 struct PendingClick {
+    /// The user until the link table has been read, then the person.
     user: Key,
     click: Key,
     ts: u32,
     campaign: u32,
+    /// Where the lookup starts; after it, the person's partition.
     home: u32,
 }
 
@@ -126,36 +134,68 @@ struct Sink<'a> {
 }
 
 impl Sink<'_> {
-    /// Files an event copy: its event record if it would survive, and its dedup record.
+    /// Reads the link table for an event copy: from here on it knows its person
+    /// and both its partitions, and the CPU has been asked for them.
     #[inline(always)]
-    fn settle_event(&mut self, pending: PendingEvent) {
+    fn look_up_event(&mut self, slot: usize) {
         let context = self.context;
-        let mut at = NO_EVENT;
+        let pending = unsafe { self.waiting_events.get_unchecked_mut(slot) };
+        let mut person_partition = 0;
         if pending.user != 0 {
             let person = context.links.person_at(pending.user, pending.home);
-            let partition = (sys::mix(person) >> context.person_shift) as usize;
-            at = self.events.push(partition, Event { person, ts: pending.ts, purchase: pending.purchase });
+            pending.user = person;
+            person_partition = (sys::mix(person) >> context.person_shift) as usize;
+            self.events.prefetch(person_partition);
         }
-        let partition = (sys::mix(pending.event) >> context.dedup_shift) as usize;
+        let event_partition = (sys::mix(pending.event) >> context.dedup_shift) as usize;
+        self.copies.prefetch(event_partition);
+        pending.home = person_partition as u32 | (event_partition as u32) << 16;
+    }
+
+    /// Files an event copy that has been looked up: its event record if it would survive, and its dedup record.
+    #[inline(always)]
+    fn settle_event(&mut self, pending: PendingEvent) {
+        let mut at = NO_EVENT;
+        if pending.user != 0 {
+            let partition = (pending.home & 0xffff) as usize;
+            at = self.events.push(partition, Event { person: pending.user, ts: pending.ts, purchase: pending.purchase });
+        }
+        let partition = (pending.home >> 16) as usize;
         self.copies.push(partition, Copy_ { event: pending.event, ingest: pending.ingest, at });
     }
 
     #[inline(always)]
-    fn settle_click(&mut self, pending: PendingClick) {
+    fn look_up_click(&mut self, slot: usize) {
         let context = self.context;
+        let pending = unsafe { self.waiting_clicks.get_unchecked_mut(slot) };
         let person = context.links.person_at(pending.user, pending.home);
+        pending.user = person;
         let partition = (sys::mix(person) >> context.person_shift) as usize;
-        self.clicks.push(partition, Click { person, click: pending.click, ts: pending.ts, campaign: pending.campaign });
+        self.clicks.prefetch(partition);
+        pending.home = partition as u32;
     }
 
-    /// Files everything still waiting.
+    #[inline(always)]
+    fn settle_click(&mut self, pending: PendingClick) {
+        self.clicks.push(pending.home as usize, Click { person: pending.user, click: pending.click, ts: pending.ts, campaign: pending.campaign });
+    }
+
+    /// Files everything still waiting, oldest first; the newest `LOOK` have not been looked up yet.
     fn drain(&mut self) {
-        for i in 0..self.event_count.min(RING) {
-            self.settle_event(self.waiting_events[i]);
+        let count = self.event_count;
+        for line in count.saturating_sub(RING)..count {
+            if line + LOOK >= count {
+                self.look_up_event(line & (RING - 1));
+            }
+            self.settle_event(self.waiting_events[line & (RING - 1)]);
         }
         self.event_count = 0;
-        for i in 0..self.click_count.min(RING) {
-            self.settle_click(self.waiting_clicks[i]);
+        let count = self.click_count;
+        for line in count.saturating_sub(RING)..count {
+            if line + LOOK >= count {
+                self.look_up_click(line & (RING - 1));
+            }
+            self.settle_click(self.waiting_clicks[line & (RING - 1)]);
         }
         self.click_count = 0;
     }
@@ -198,23 +238,24 @@ impl Lines for EventLines<'_, '_> {
     const COMMAS: usize = 6;
 
     #[inline(always)]
-    unsafe fn line(&mut self, data: *const u8, start: usize, commas: *const u32, end: usize, quotes: u32) {
+    unsafe fn line(&mut self, data: *const u8, delims: *const u32, quotes: u32) {
         let sink = &mut *self.0;
         let context = sink.context;
-        let comma = |i: usize| *commas.add(i) as usize;
-        let (id, id_end, w0) = reader::unquoted(data, start, comma(0));
-        let (user_at, user_end, w1) = reader::unquoted(data, comma(0) + 1, comma(1));
-        let (ts_at, ts_end, w2) = reader::unquoted(data, comma(1) + 1, comma(2));
-        let (ingest_at, ingest_end, w3) = reader::unquoted(data, comma(2) + 1, comma(3));
-        let (kind_at, kind_end, w4) = reader::unquoted(data, comma(3) + 1, comma(4));
-        let (product_at, product_end, w5) = reader::unquoted(data, comma(4) + 1, comma(5));
-        let (price_at, price_end, w6) = reader::unquoted(data, comma(5) + 1, end);
+        let mut fields = Fields::new();
+        let wrapped = reader::split::<7>(data, delims, &mut fields);
+        let (id, id_end) = (fields.at(0), fields.at(0) + fields.len(0));
+        let (user_at, user_end) = (fields.at(1), fields.at(1) + fields.len(1));
+        let (ts_at, ts_end) = (fields.at(2), fields.at(2) + fields.len(2));
+        let (ingest_at, ingest_end) = (fields.at(3), fields.at(3) + fields.len(3));
+        let (kind_at, kind_end) = (fields.at(4), fields.at(4) + fields.len(4));
+        let (product_at, product_end) = (fields.at(5), fields.at(5) + fields.len(5));
+        let (price_at, price_end) = (fields.at(6), fields.at(6) + fields.len(6));
         // Quotes anywhere but around whole fields make the line malformed; so does an empty event_id.
-        if quotes != 2 * (w0 + w1 + w2 + w3 + w4 + w5 + w6) || id == id_end {
+        if quotes != 2 * wrapped || id == id_end {
             return;
         }
         let event = key::key_of_padded(data.add(id), id_end - id);
-        let ingest = ts::parse_utc(data.add(ingest_at), ingest_end - ingest_at, &mut sink.dates);
+        let (ingest_seconds, ingest) = ts::parse_utc(data.add(ingest_at), ingest_end - ingest_at, &mut sink.dates);
         let at_ms = ts::parse(data.add(ts_at), ts_end - ts_at, &mut sink.dates);
         let catalog = context.catalog;
 
@@ -251,12 +292,15 @@ impl Lines for EventLines<'_, '_> {
         let ingest = if ingest == ts::BAD {
             u32::MAX
         } else {
-            (ingest.div_euclid(1_000) - context.ingest_epoch).clamp(0, i64::from(u32::MAX) - 1) as u32
+            (ingest_seconds - context.ingest_epoch).clamp(0, i64::from(u32::MAX) - 1) as u32
         };
         let slot = sink.event_count & (RING - 1);
         if sink.event_count >= RING {
             let ready = sink.waiting_events[slot];
             sink.settle_event(ready);
+        }
+        if sink.event_count >= LOOK {
+            sink.look_up_event((sink.event_count - LOOK) & (RING - 1));
         }
         sink.waiting_events[slot] =
             PendingEvent { user, event, ts: at_ms.wrapping_sub(context.epoch) as u32, purchase, ingest, home };
@@ -268,15 +312,16 @@ impl Lines for ClickLines<'_, '_> {
     const COMMAS: usize = 3;
 
     #[inline(always)]
-    unsafe fn line(&mut self, data: *const u8, start: usize, commas: *const u32, end: usize, quotes: u32) {
+    unsafe fn line(&mut self, data: *const u8, delims: *const u32, quotes: u32) {
         let sink = &mut *self.0;
         let context = sink.context;
-        let comma = |i: usize| *commas.add(i) as usize;
-        let (id, id_end, w0) = reader::unquoted(data, start, comma(0));
-        let (user_at, user_end, w1) = reader::unquoted(data, comma(0) + 1, comma(1));
-        let (campaign_at, campaign_end, w2) = reader::unquoted(data, comma(1) + 1, comma(2));
-        let (ts_at, ts_end, w3) = reader::unquoted(data, comma(2) + 1, end);
-        if quotes != 2 * (w0 + w1 + w2 + w3) || id == id_end || user_at == user_end {
+        let mut fields = Fields::new();
+        let wrapped = reader::split::<4>(data, delims, &mut fields);
+        let (id, id_end) = (fields.at(0), fields.at(0) + fields.len(0));
+        let (user_at, user_end) = (fields.at(1), fields.at(1) + fields.len(1));
+        let (campaign_at, campaign_end) = (fields.at(2), fields.at(2) + fields.len(2));
+        let (ts_at, ts_end) = (fields.at(3), fields.at(3) + fields.len(3));
+        if quotes != 2 * wrapped || id == id_end || user_at == user_end {
             return; // malformed, no click_id, or no user_id
         }
         let at_ms = ts::parse(data.add(ts_at), ts_end - ts_at, &mut sink.dates);
@@ -294,6 +339,9 @@ impl Lines for ClickLines<'_, '_> {
         if sink.click_count >= RING {
             let ready = sink.waiting_clicks[slot];
             sink.settle_click(ready);
+        }
+        if sink.click_count >= LOOK {
+            sink.look_up_click((sink.click_count - LOOK) & (RING - 1));
         }
         sink.waiting_clicks[slot] =
             PendingClick { user, click: key::key_of_padded(data.add(id), id_end - id), ts: (at_ms - context.epoch) as u32, campaign, home };

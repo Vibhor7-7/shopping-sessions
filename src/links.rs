@@ -123,10 +123,10 @@ impl Lines for LinkLines {
     const COMMAS: usize = 1;
 
     #[inline(always)]
-    unsafe fn line(&mut self, data: *const u8, start: usize, commas: *const u32, end: usize, quotes: u32) {
-        let comma = *commas as usize;
-        let (a0, a1, w0) = reader::unquoted(data, start, comma);
-        let (b0, b1, w1) = reader::unquoted(data, comma + 1, end);
+    unsafe fn line(&mut self, data: *const u8, delims: *const u32, quotes: u32) {
+        let comma = *delims.add(1) as usize;
+        let (a0, a1, w0) = reader::unquoted(data, (*delims).wrapping_add(1) as usize, comma);
+        let (b0, b1, w1) = reader::unquoted(data, comma + 1, *delims.add(2) as usize);
         if quotes != 2 * (w0 + w1) || a0 == a1 || b0 == b1 {
             return; // malformed, or a side is empty
         }

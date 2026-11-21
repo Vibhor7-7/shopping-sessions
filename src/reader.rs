@@ -44,9 +44,11 @@ pub trait Lines {
     /// Commas in a well-formed line: one fewer than its fields.
     const COMMAS: usize;
 
-    /// One line with the right number of commas: `data[start..end]`, whose commas
-    /// are at `commas[0..COMMAS]`, and which holds `quotes` double quotes.
-    unsafe fn line(&mut self, data: *const u8, start: usize, commas: *const u32, end: usize, quotes: u32);
+    /// One line with the right number of commas, which holds `quotes` double
+    /// quotes. `delims[0]` is the offset of the newline before it (`u32::MAX`,
+    /// which is -1, for the line at offset 0), `delims[1..=COMMAS]` are its
+    /// commas and `delims[COMMAS + 1]` is its own newline.
+    unsafe fn line(&mut self, data: *const u8, delims: *const u32, quotes: u32);
 }
 
 /// A field's bounds once the quotes around it, if it is wrapped in a pair, are
@@ -55,6 +57,85 @@ pub trait Lines {
 pub unsafe fn unquoted(data: *const u8, start: usize, end: usize) -> (usize, usize, u32) {
     let wrapped = (end - start >= 2) & (*data.add(start) == b'"') & (*data.add(end).sub(1) == b'"');
     (start + wrapped as usize, end - wrapped as usize, wrapped as u32)
+}
+
+/// Where each field of a line is, the quotes around the wrapped ones left out.
+#[repr(C, align(32))]
+pub struct Fields {
+    pub start: [u32; 8],
+    pub len: [u32; 8],
+}
+
+impl Fields {
+    #[inline(always)]
+    pub fn new() -> Self {
+        Self { start: [0; 8], len: [0; 8] }
+    }
+
+    #[inline(always)]
+    pub fn at(&self, field: usize) -> usize {
+        self.start[field] as usize
+    }
+
+    #[inline(always)]
+    pub fn len(&self, field: usize) -> usize {
+        self.len[field] as usize
+    }
+}
+
+/// Splits a line of `N` fields (at most 7) at its delimiters, `delims` as
+/// `Lines::line` gets them, and returns how many fields were wrapped in quotes.
+/// All fields at once: the four bytes around each delimiter hold the last
+/// character of the field before it and the first of the field after it, and
+/// with those side by side the seven "is this field wrapped" questions are a
+/// handful of vector instructions instead of seven rounds of loads and compares.
+/// Reads `delims[0..9]`, and the 4 bytes from one before each of those offsets.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+pub unsafe fn split<const N: usize>(data: *const u8, delims: *const u32, fields: &mut Fields) -> u32 {
+    use std::arch::x86_64::*;
+    let around = |i: usize| (data.offset(*delims.add(i) as i32 as isize - 1) as *const i32).read_unaligned();
+    let low = _mm_insert_epi32(
+        _mm_insert_epi32(_mm_insert_epi32(_mm_cvtsi32_si128(around(0)), around(1), 1), around(2), 2),
+        around(3),
+        3,
+    );
+    let high = _mm_insert_epi32(
+        _mm_insert_epi32(_mm_insert_epi32(_mm_cvtsi32_si128(around(4)), around(5), 1), around(6), 2),
+        around(7),
+        3,
+    );
+    // Lane i: the bytes at delimiter i's offset - 1, +0, +1, +2.
+    let quote = _mm256_cmpeq_epi8(_mm256_inserti128_si256(_mm256_castsi128_si256(low), high, 1), _mm256_set1_epi8(b'"' as i8));
+    // Field i lies between delimiters i and i + 1: it opens with the byte after
+    // the first (byte 2 of lane i) and closes with the byte before the second
+    // (byte 0 of lane i + 1).
+    let closes = _mm256_permutevar8x32_epi32(quote, _mm256_setr_epi32(1, 2, 3, 4, 5, 6, 7, 7));
+    let both = _mm256_and_si256(_mm256_srli_epi32(quote, 16), closes);
+    let before = _mm256_loadu_si256(delims as *const __m256i);
+    let after = _mm256_loadu_si256(delims.add(1) as *const __m256i);
+    let one = _mm256_set1_epi32(1);
+    let len = _mm256_sub_epi32(_mm256_sub_epi32(after, before), one);
+    // Wrapped: a quote at both ends, and they are two different bytes.
+    let wrapped = _mm256_and_si256(_mm256_and_si256(both, _mm256_cmpgt_epi32(len, one)), one);
+    _mm256_store_si256(fields.start.as_mut_ptr() as *mut __m256i, _mm256_add_epi32(_mm256_add_epi32(before, one), wrapped));
+    _mm256_store_si256(fields.len.as_mut_ptr() as *mut __m256i, _mm256_sub_epi32(len, _mm256_add_epi32(wrapped, wrapped)));
+    let bits = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_slli_epi32(wrapped, 31))) as u32;
+    (bits & ((1 << N) - 1)).count_ones()
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+#[inline(always)]
+pub unsafe fn split<const N: usize>(data: *const u8, delims: *const u32, fields: &mut Fields) -> u32 {
+    let mut count = 0;
+    for field in 0..N {
+        let start = (*delims.add(field)).wrapping_add(1) as usize;
+        let (from, to, wrapped) = unquoted(data, start, *delims.add(field + 1) as usize);
+        fields.start[field] = from as u32;
+        fields.len[field] = (to - from) as u32;
+        count += wrapped;
+    }
+    count
 }
 
 fn read_fully(file: &File, mut into: &mut [u8], mut at: u64) -> usize {
@@ -107,10 +188,12 @@ pub fn walk<L: Lines>(file: &File, offset: u64, length: u64, buf: &mut ReadBuf, 
         let index = &buf.index;
         let count = index.newline_count;
         let newlines = index.newlines.as_ptr();
-        let commas = index.commas.as_ptr();
+        let delims = index.delims();
 
         let mut line = 0usize; // which newline ends the next line
         let mut start = 0usize; // where the next line starts
+        // Which delimiter is the one just before `start`: -1 is the slot in front, the delimiter at offset -1.
+        let mut before = -1isize;
         if skip {
             if count == 0 {
                 if at_end {
@@ -118,39 +201,44 @@ pub fn walk<L: Lines>(file: &File, offset: u64, length: u64, buf: &mut ReadBuf, 
                 }
                 continue; // still inside the line to skip: read on
             }
-            start = unsafe { *newlines } as usize + 1;
+            let first = unsafe { *newlines };
+            start = first as usize + 1;
             line = 1;
             skip = false;
+            before = 0;
+            unsafe {
+                while *delims.offset(before) < first {
+                    before += 1;
+                }
+            }
         }
         // Lines starting at or after `stop` belong to the next range.
         let stop = usize::try_from(range_end - base).unwrap_or(usize::MAX);
-        let mut comma = 0usize;
         let mut done = false;
         unsafe {
-            while *commas.add(comma) < start as u32 {
-                comma += 1;
-            }
             let mut quotes_before = index.quotes_before(start);
             while line < count {
                 if start >= stop {
                     done = true;
                     break;
                 }
-                let end = *newlines.add(line) as usize;
-                let quotes_at_end = index.quotes_before(end);
+                let end = *newlines.add(line);
+                let quotes_at_end = index.quotes_before(end as usize);
                 let quotes = quotes_at_end - quotes_before;
                 quotes_before = quotes_at_end;
-                let end32 = end as u32;
-                if *commas.add(comma + L::COMMAS - 1) < end32 && *commas.add(comma + L::COMMAS) > end32 {
-                    sink.line(data, start, commas.add(comma), end, quotes);
-                    comma += L::COMMAS;
+                // The line's own newline is the delimiter COMMAS + 1 after the one
+                // before it exactly when COMMAS commas lie between the two.
+                if *delims.offset(before + L::COMMAS as isize + 1) == end {
+                    sink.line(data, delims.offset(before), quotes);
+                    before += L::COMMAS as isize + 1;
                 } else {
                     // Wrong number of fields (an empty line has none): malformed, dropped.
-                    while *commas.add(comma) < end32 {
-                        comma += 1;
+                    before += 1;
+                    while *delims.offset(before) < end {
+                        before += 1;
                     }
                 }
-                start = end + 1;
+                start = end as usize + 1;
                 line += 1;
             }
         }

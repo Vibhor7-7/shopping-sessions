@@ -124,6 +124,22 @@ impl<'p, T: Copy, const N: usize> Combine<'p, T, N> {
         }
     }
 
+    /// Asks the CPU for what the next `push` to `partition` will touch: its state
+    /// and its buffer. A thread writes to its partitions in no order, and the
+    /// states and buffers of a thousand partitions are far more than the first
+    /// cache level holds, so a push whose partition was not announced a few lines
+    /// earlier starts with a wait.
+    #[inline(always)]
+    pub fn prefetch(&self, partition: usize) {
+        unsafe {
+            sys::prefetch(self.states.as_ptr().add(partition));
+            let buffer = self.buffers.add(partition) as *const u8;
+            for line in 0..Self::LINES {
+                sys::prefetch(buffer.add(64 * line));
+            }
+        }
+    }
+
     /// Appends `record` to `partition` and returns its global index. The record
     /// is only in its final place once its buffer has filled, or after `finish`.
     #[inline(always)]
