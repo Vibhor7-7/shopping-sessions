@@ -21,6 +21,10 @@ mod scan;
 mod sys;
 mod ts;
 
+#[cfg(target_os = "linux")]
+#[global_allocator]
+static ALLOCATOR: sys::HugeBlocks = sys::HugeBlocks;
+
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;

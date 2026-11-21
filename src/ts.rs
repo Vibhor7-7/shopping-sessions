@@ -120,36 +120,45 @@ pub unsafe fn parse_plain(p: *const u8, len: usize) -> i64 {
 /// fall on a few dozen dates, so nearly every date is a table hit: two compares
 /// instead of validating a calendar date and counting its days.
 pub struct Dates {
-    slots: [Date; 32],
+    slots: [Date; 64],
 }
 
 #[derive(Clone, Copy)]
 struct Date {
-    /// The eight bytes `YYYY-MM-` and the two bytes `DD`, as read from the text.
+    /// The eight bytes `YYYY-MM-`, as read from the text.
     head: u64,
-    day: u16,
+    /// The three bytes `DDT` that follow them, in the low three bytes. An empty
+    /// slot has the fourth byte set, which no three bytes of text can equal.
+    tail: u32,
     /// Epoch seconds of that date's midnight.
     midnight: i64,
 }
 
+/// The `T` after the date, where it sits in `Date::tail`.
+const T_AFTER_DAY: u32 = (b'T' as u32) << 16;
+
 impl Dates {
     pub fn new() -> Self {
-        // No text made of digits and dashes is all zero bytes, and if a line does hold
-        // ten zero bytes there, the "hit" answers BAD, which is right.
-        Self { slots: [Date { head: 0, day: 0, midnight: BAD }; 32] }
+        Self { slots: [Date { head: 0, tail: u32::MAX, midnight: BAD }; 64] }
+    }
+
+    /// The slot for a day of the month, given its two characters: a different one for each of 01 to 31.
+    #[inline(always)]
+    fn slot(day: u16) -> usize {
+        (((day >> 8) & 15) | ((day & 3) << 4)) as usize
     }
 
     /// A date not in the table: checks it in full and remembers it if it is real.
     #[cold]
     #[inline(never)]
-    fn learn(&mut self, head: u64, day: u16, slot: usize) -> i64 {
+    fn learn(&mut self, head: u64, day: u16) -> i64 {
         let mut text = [0u8; 19];
         text[..8].copy_from_slice(&head.to_le_bytes());
         text[8..10].copy_from_slice(&day.to_le_bytes());
         text[10..].copy_from_slice(b"T00:00:00");
         let midnight = unsafe { civil_seconds(text.as_ptr()) };
         if midnight != BAD {
-            self.slots[slot] = Date { head, day, midnight };
+            self.slots[Self::slot(day)] = Date { head, tail: u32::from(day) | T_AFTER_DAY, midnight };
         }
         midnight
     }
@@ -180,9 +189,9 @@ unsafe fn civil_seconds_fast(p: *const u8, dates: &mut Dates) -> i64 {
     let second = u64::from(((seconds >> 8) & 15) * 10 + ((seconds >> 16) & 15));
 
     let day = rest as u16;
-    let slot = (((day & 15) * 10 + ((day >> 8) & 15)) & 31) as usize;
-    let known = *dates.slots.get_unchecked(slot);
-    let midnight = if known.head == head && known.day == day { known.midnight } else { dates.learn(head, day, slot) };
+    let known = *dates.slots.get_unchecked(Dates::slot(day));
+    let midnight =
+        if known.head == head && known.tail == u32::from(day) | T_AFTER_DAY { known.midnight } else { dates.learn(head, day) };
     if wrong != 0 || hour > 23 || minute > 59 || second > 59 || midnight == BAD {
         return BAD;
     }
@@ -290,11 +299,11 @@ unsafe fn time_of_day(p: *const u8) -> (i64, bool) {
 #[inline(always)]
 unsafe fn civil_known(p: *const u8, dates: &Dates) -> (i64, bool) {
     let head = (p as *const u64).read_unaligned();
-    let day = (p.add(8) as *const u16).read_unaligned();
-    let slot = (((day & 15) * 10 + ((day >> 8) & 15)) & 31) as usize;
-    let known = dates.slots.get_unchecked(slot);
+    let tail = (p.add(8) as *const u32).read_unaligned() & 0x00ff_ffff; // DDT
+    let known = dates.slots.get_unchecked(Dates::slot(tail as u16));
     let (seconds, time_ok) = time_of_day(p.add(11));
-    let ok = (known.head == head) & (known.day == day) & (known.midnight != BAD) & (*p.add(10) == b'T') & time_ok;
+    // Two compares cover the date, the `T`, and whether the slot is filled at all.
+    let ok = (known.head == head) & (known.tail == tail) & time_ok;
     (known.midnight.wrapping_add(seconds), ok)
 }
 
@@ -467,6 +476,13 @@ mod tests {
         assert_eq!(ts("1970-01-01T00:00:00Z"), 0);
         assert_eq!(ts("2028-02-29T12:00:00Z"), ts("2028-03-01T12:00:00Z") - DAY_MS);
         assert_eq!(ts("2000-02-29T00:00:00Z"), 951_782_400_000);
+    }
+
+    #[test]
+    fn nothing_matches_an_empty_date_slot() {
+        for text in ["\0\0\0\0\0\0\0\0\0\0\010:11:12Z", "\0\0\0\0\0\0\0\0\0\0T10:11:12Z", "\0\0\0\0\0\0\0\000T10:11:12Z"] {
+            assert_eq!(ts(text), BAD, "{text:?}");
+        }
     }
 
     #[test]

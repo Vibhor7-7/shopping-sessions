@@ -66,6 +66,110 @@ pub fn map<T>(count: usize) -> *mut T {
     aligned as *mut T
 }
 
+/// The global allocator: the system's, except that a block of 2 MB or more is
+/// its own mapping, aligned to 2 MB and advised for huge pages.
+///
+/// The big buffers (a partition's events while they are grouped, a thread's
+/// output columns) are written densely. On 4 KB pages each megabyte of them is
+/// 256 page faults going in and 256 pages for the kernel to free, one thread,
+/// at exit; where the machine only gives huge pages to memory that asks, this
+/// asks. Where it gives them to everything, or to nothing, it changes nothing.
+#[cfg(target_os = "linux")]
+pub struct HugeBlocks;
+
+#[cfg(target_os = "linux")]
+mod huge_blocks {
+    use super::*;
+    use std::alloc::{GlobalAlloc, Layout, System};
+
+    extern "C" {
+        fn munmap(addr: *mut c_void, len: usize) -> i32;
+        fn mremap(addr: *mut c_void, old_len: usize, new_len: usize, flags: i32, ...) -> *mut c_void;
+    }
+    const MREMAP_MAYMOVE: i32 = 1;
+
+    #[inline]
+    fn large(layout: Layout) -> bool {
+        layout.size() >= HUGE && layout.align() <= 4096
+    }
+
+    #[inline]
+    fn pages(size: usize) -> usize {
+        (size + 4095) & !4095
+    }
+
+    /// A fresh, zeroed mapping of `size` bytes starting on a 2 MB boundary, or null.
+    unsafe fn block(size: usize) -> *mut u8 {
+        let len = pages(size);
+        let raw = mmap(std::ptr::null_mut(), len + HUGE, PROT_READ_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        if raw as isize == -1 || raw.is_null() {
+            return std::ptr::null_mut();
+        }
+        let raw = raw as usize;
+        let start = (raw + HUGE - 1) & !(HUGE - 1);
+        // Give back what the alignment left over on either side, so the block is exactly its own mapping.
+        if start > raw {
+            munmap(raw as *mut c_void, start - raw);
+        }
+        let (end, raw_end) = (start + len, raw + len + HUGE);
+        if raw_end > end {
+            munmap(end as *mut c_void, raw_end - end);
+        }
+        madvise(start as *mut c_void, len, MADV_HUGEPAGE);
+        start as *mut u8
+    }
+
+    unsafe impl GlobalAlloc for HugeBlocks {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            if large(layout) {
+                block(layout.size())
+            } else {
+                System.alloc(layout)
+            }
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            if large(layout) {
+                block(layout.size()) // a fresh mapping is zeros already
+            } else {
+                System.alloc_zeroed(layout)
+            }
+        }
+
+        unsafe fn dealloc(&self, at: *mut u8, layout: Layout) {
+            if large(layout) {
+                munmap(at as *mut c_void, pages(layout.size()));
+            } else {
+                System.dealloc(at, layout)
+            }
+        }
+
+        unsafe fn realloc(&self, at: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            let new_layout = Layout::from_size_align_unchecked(new_size, layout.align());
+            match (large(layout), large(new_layout)) {
+                (false, false) => System.realloc(at, layout, new_size),
+                // Large to large: the kernel moves the pages, nothing is copied.
+                (true, true) => {
+                    let moved = mremap(at as *mut c_void, pages(layout.size()), pages(new_size), MREMAP_MAYMOVE);
+                    if moved as isize == -1 {
+                        std::ptr::null_mut()
+                    } else {
+                        moved as *mut u8
+                    }
+                }
+                _ => {
+                    let new = self.alloc(new_layout);
+                    if !new.is_null() {
+                        std::ptr::copy_nonoverlapping(at, new, layout.size().min(new_size));
+                        self.dealloc(at, layout);
+                    }
+                    new
+                }
+            }
+        }
+    }
+}
+
 /// A raw pointer that may cross threads. Every use is a phase in which each
 /// thread touches its own records, with a join between phases.
 #[derive(Clone, Copy)]
