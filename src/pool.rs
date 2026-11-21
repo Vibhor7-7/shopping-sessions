@@ -63,6 +63,39 @@ struct Pending<T> {
     end_index: u32,
 }
 
+/// The memory one thread's `Combine`s keep their buffers and partition states
+/// in: a single mapping that asks for a huge page.
+///
+/// A thread pushes to a couple of thousand partitions in no order, and every
+/// push reads one state and writes into one buffer. Mapped on their own, the
+/// buffers and states of the three streams are about 125 pages of 4 KB at 2^10
+/// partitions, twice the entries the first-level TLB has for both threads of a
+/// core together, so the address of nearly every one had to be looked up again
+/// in the second level, and the prefetch that announces a push waited for it
+/// (BENCH.md, experiment 32). On one huge page they are a single entry.
+pub struct Arena {
+    next: usize,
+    end: usize,
+}
+
+impl Arena {
+    /// Room for `bytes`, in whole huge pages. Zeroed, never freed.
+    pub fn new(bytes: usize) -> Self {
+        let len = bytes.max(1).next_multiple_of(sys::HUGE);
+        let start = sys::map::<u8>(len) as usize;
+        Self { next: start, end: start + len }
+    }
+
+    /// `count` zeroed `T`s, the first on a cache line.
+    fn take<T>(&mut self, count: usize) -> *mut T {
+        let start = (self.next + 63) & !63;
+        let bytes = count * std::mem::size_of::<T>();
+        assert!(std::mem::align_of::<T>() <= 64 && start + bytes <= self.end, "arena too small");
+        self.next = start + bytes;
+        start as *mut T
+    }
+}
+
 /// One thread's write side: for each partition, a write-combining buffer of `N` records.
 ///
 /// A thread appends to a couple of thousand partitions in turn, each into
@@ -75,7 +108,9 @@ pub struct Combine<'p, T, const N: usize> {
     pool: &'p Pool<T>,
     /// `N` buffered records per partition, each buffer starting on a cache line.
     buffers: *mut [T; N],
-    states: Vec<Pending<T>>,
+    /// One per partition, in the thread's `Arena` like the buffers.
+    states: *mut Pending<T>,
+    partitions: usize,
     chunks: Vec<Vec<(u32, u32)>>,
     chunk: u32,
     slab: *mut T,
@@ -108,14 +143,23 @@ impl<'p, T: Copy, const N: usize> Combine<'p, T, N> {
     /// Cache lines in a full buffer.
     const LINES: usize = N * std::mem::size_of::<T>() / 64;
 
+    /// What `new` takes from the arena for this many partitions.
+    pub const fn arena_bytes(partitions: usize) -> usize {
+        partitions * (N * std::mem::size_of::<T>() + std::mem::size_of::<Pending<T>>()) + 2 * 64
+    }
+
     /// `chunk` records per chunk: a power of two, at least `N`, no larger than a slab.
-    pub fn new(pool: &'p Pool<T>, partitions: usize, chunk: usize) -> Self {
+    /// The buffers and states come out of `arena`, which must have `arena_bytes(partitions)` left.
+    pub fn new(pool: &'p Pool<T>, arena: &mut Arena, partitions: usize, chunk: usize) -> Self {
         assert!(N.is_power_of_two() && (N * std::mem::size_of::<T>()) % 64 == 0 && std::mem::align_of::<T>() <= 64);
         assert!(chunk.is_power_of_two() && chunk >= N && chunk <= SLAB_RECORDS);
         Self {
             pool,
-            buffers: sys::map::<[T; N]>(partitions.max(64)), // page-aligned, so every buffer starts on a cache line
-            states: (0..partitions).map(|_| Pending { line: std::ptr::null_mut(), index: 0, end_index: 0 }).collect(),
+            // Every buffer starts on a cache line: the first does, and each is a whole number of lines.
+            buffers: arena.take::<[T; N]>(partitions),
+            // All zeros, as the arena hands them out: no chunk yet (`line` null), nothing buffered.
+            states: arena.take::<Pending<T>>(partitions),
+            partitions,
             chunks: vec![Vec::new(); partitions],
             chunk: chunk as u32,
             slab: std::ptr::null_mut(),
@@ -132,7 +176,7 @@ impl<'p, T: Copy, const N: usize> Combine<'p, T, N> {
     #[inline(always)]
     pub fn prefetch(&self, partition: usize) {
         unsafe {
-            sys::prefetch(self.states.as_ptr().add(partition));
+            sys::prefetch(self.states.add(partition));
             let buffer = self.buffers.add(partition) as *const u8;
             for line in 0..Self::LINES {
                 sys::prefetch(buffer.add(64 * line));
@@ -145,10 +189,10 @@ impl<'p, T: Copy, const N: usize> Combine<'p, T, N> {
     #[inline(always)]
     pub fn push(&mut self, partition: usize, record: T) -> u32 {
         unsafe {
-            if (*self.states.as_ptr().add(partition)).index == (*self.states.as_ptr().add(partition)).end_index {
+            if (*self.states.add(partition)).index == (*self.states.add(partition)).end_index {
                 self.refill(partition);
             }
-            let state = &mut *self.states.as_mut_ptr().add(partition);
+            let state = &mut *self.states.add(partition);
             let index = state.index;
             let slot = index as usize & (N - 1);
             let buffer = self.buffers.add(partition) as *mut T;
@@ -166,8 +210,10 @@ impl<'p, T: Copy, const N: usize> Combine<'p, T, N> {
     #[cold]
     #[inline(never)]
     fn refill(&mut self, partition: usize) {
-        if !self.states[partition].line.is_null() {
-            self.chunks[partition].push((self.states[partition].end_index - self.chunk, self.chunk));
+        assert!(partition < self.partitions);
+        let state = unsafe { &mut *self.states.add(partition) };
+        if !state.line.is_null() {
+            self.chunks[partition].push((state.end_index - self.chunk, self.chunk));
         }
         if self.slab_left == 0 {
             let (index, slab) = self.pool.grab();
@@ -175,7 +221,6 @@ impl<'p, T: Copy, const N: usize> Combine<'p, T, N> {
             self.slab_index = index;
             self.slab_left = SLAB_RECORDS as u32;
         }
-        let state = &mut self.states[partition];
         state.line = self.slab;
         state.index = self.slab_index;
         state.end_index = self.slab_index + self.chunk;
@@ -186,8 +231,8 @@ impl<'p, T: Copy, const N: usize> Combine<'p, T, N> {
 
     /// Puts the records still in buffers in their places and returns the chunks.
     pub fn finish(mut self) -> Chunks {
-        for partition in 0..self.states.len() {
-            let state = &self.states[partition];
+        for partition in 0..self.partitions {
+            let state = unsafe { &*self.states.add(partition) };
             if state.line.is_null() {
                 continue;
             }

@@ -16,7 +16,7 @@ use std::sync::Mutex;
 use crate::catalog::{self, Catalog};
 use crate::key::{self, Key};
 use crate::links::Links;
-use crate::pool::{Chunks, Combine, Pool};
+use crate::pool::{Arena, Chunks, Combine, Pool};
 use crate::reader::{self, Fields, Input, Job, Lines, ReadBuf};
 use crate::sys;
 use crate::ts;
@@ -396,11 +396,17 @@ pub fn run(
     let next = AtomicUsize::new(0);
     sys::parallel(threads, |_| {
         let mut buf = ReadBuf::new();
+        // The three streams' buffers and states side by side on one huge page (pool::Arena).
+        let mut arena = Arena::new(
+            Combine::<Copy_, 8>::arena_bytes(dedup_partitions)
+                + Combine::<Event, 8>::arena_bytes(person_partitions)
+                + Combine::<Click, 8>::arena_bytes(person_partitions),
+        );
         let mut sink = Sink {
             context,
-            copies: Combine::new(&pools.copies, dedup_partitions, chunks.copies),
-            events: Combine::new(&pools.events, person_partitions, chunks.events),
-            clicks: Combine::new(&pools.clicks, person_partitions, chunks.clicks),
+            copies: Combine::new(&pools.copies, &mut arena, dedup_partitions, chunks.copies),
+            events: Combine::new(&pools.events, &mut arena, person_partitions, chunks.events),
+            clicks: Combine::new(&pools.clicks, &mut arena, person_partitions, chunks.clicks),
             waiting_events: [PendingEvent::default(); RING],
             event_count: 0,
             waiting_clicks: [PendingClick::default(); RING],
