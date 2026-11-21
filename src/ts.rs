@@ -117,21 +117,43 @@ pub unsafe fn parse_plain(p: *const u8, len: usize) -> i64 {
 }
 
 /// Midnights already worked out, by day of the month. A dataset's timestamps
-/// fall on a few dozen dates, so nearly every date is a table hit: two compares
+/// fall on a few dozen dates, so nearly every date is a table hit: one compare
 /// instead of validating a calendar date and counting its days.
 pub struct Dates {
     slots: [Date; 64],
 }
 
+/// One date of the table: 32 bytes, so that a slot's address is its number shifted.
 #[derive(Clone, Copy)]
+#[repr(C, align(32))]
 struct Date {
-    /// The eight bytes `YYYY-MM-`, as read from the text.
-    head: u64,
-    /// The three bytes `DDT` that follow them, in the low three bytes. An empty
-    /// slot has the fourth byte set, which no three bytes of text can equal.
-    tail: u32,
+    /// The eleven bytes `YYYY-MM-DDT` as read from the text, then zeros: a text
+    /// is on this date when its first eleven bytes are these, and sixteen bytes
+    /// of the two can be compared at once (`dates_known`).
+    ///
+    /// An empty slot holds eleven bytes that belong in another slot (`Dates::new`),
+    /// so no text that is looked up in it can equal them.
+    text: [u8; 16],
     /// Epoch seconds of that date's midnight.
     midnight: i64,
+    spare: u64,
+}
+
+/// How many bytes of a text are its date and the `T` after it.
+const DATE_BYTES: u32 = 11;
+
+impl Date {
+    /// `YYYY-MM-` as a text has it in its first eight bytes.
+    #[inline(always)]
+    fn head(&self) -> u64 {
+        u64::from_le_bytes([self.text[0], self.text[1], self.text[2], self.text[3], self.text[4], self.text[5], self.text[6], self.text[7]])
+    }
+
+    /// `DDT` in the low three bytes, as a text has it from its ninth byte; the fourth byte is zero.
+    #[inline(always)]
+    fn tail(&self) -> u32 {
+        u32::from_le_bytes([self.text[8], self.text[9], self.text[10], self.text[11]])
+    }
 }
 
 /// The `T` after the date, where it sits in `Date::tail`.
@@ -139,13 +161,28 @@ const T_AFTER_DAY: u32 = (b'T' as u32) << 16;
 
 impl Dates {
     pub fn new() -> Self {
-        Self { slots: [Date { head: 0, tail: u32::MAX, midnight: BAD }; 64] }
+        // An empty slot must equal no text that is looked up in it. Eleven zero
+        // bytes are looked up in slot 0 (`slot(0)`), so they can fill every
+        // other slot; slot 0 itself gets a day that is looked up in slot 1.
+        let elsewhere = Date { text: [0; 16], midnight: BAD, spare: 0 };
+        let mut slots = [elsewhere; 64];
+        slots[0].text[8] = 1;
+        Self { slots }
     }
 
-    /// The slot for a day of the month, given its two characters: a different one for each of 01 to 31.
+    /// The slot for a day of the month, given its two characters: a different
+    /// one for each of 01 to 31. The low two bits of the first character, then
+    /// the low four of the second.
     #[inline(always)]
     fn slot(day: u16) -> usize {
-        (((day >> 8) & 15) | ((day & 3) << 4)) as usize
+        #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+        unsafe {
+            std::arch::x86_64::_pext_u32(u32::from(day), 0x0f03) as usize
+        }
+        #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+        {
+            usize::from((day & 3) | ((day >> 6) & 0x3c))
+        }
     }
 
     /// A date not in the table: checks it in full and remembers it if it is real.
@@ -158,7 +195,9 @@ impl Dates {
         text[10..].copy_from_slice(b"T00:00:00");
         let midnight = unsafe { civil_seconds(text.as_ptr()) };
         if midnight != BAD {
-            self.slots[Self::slot(day)] = Date { head, tail: u32::from(day) | T_AFTER_DAY, midnight };
+            let mut known = [0u8; 16];
+            known[..DATE_BYTES as usize].copy_from_slice(&text[..DATE_BYTES as usize]);
+            self.slots[Self::slot(day)] = Date { text: known, midnight, spare: 0 };
         }
         midnight
     }
@@ -192,7 +231,7 @@ unsafe fn civil_seconds_fast(p: *const u8, dates: &mut Dates) -> i64 {
     let day = rest as u16;
     let known = *dates.slots.get_unchecked(Dates::slot(day));
     let midnight =
-        if known.head == head && known.tail == u32::from(day) | T_AFTER_DAY { known.midnight } else { dates.learn(head, day) };
+        if known.head() == head && known.tail() == u32::from(day) | T_AFTER_DAY { known.midnight } else { dates.learn(head, day) };
     if wrong != 0 || hour > 23 || minute > 59 || second > 59 || midnight == BAD {
         return BAD;
     }
@@ -271,83 +310,175 @@ static HOURS: [u32; 256] = clock_table(23, 3_600);
 #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
 static MINUTES: [u32; 256] = clock_table(59, 60);
 
-/// Two texts of eight bytes side by side, each to be read as `HH:MM:SS`: for
-/// each, its seconds since midnight in the low half of its 64 bits, and all of
-/// its 64 bits set if it is a real time of day (none if it is not).
-///
-/// After an XOR with `00:00:00` a digit is 0 to 9 and a colon 0. Two
-/// multiply-adds then weigh the six digits (10 and 1 for a pair, then 3,600,
-/// 60 and 1), which is all the arithmetic there is; a byte over the largest
-/// digit its place allows, or an hour over 23, makes it no time of day.
-/// One pass for two texts costs what it costs for one, so an event line's `ts`
-/// and `ingest_ts` share it (BENCH.md, experiment 42; until then each went
-/// through a `pext` and three table reads of its own).
-#[cfg(all(target_arch = "x86_64", target_feature = "sse4.1"))]
-#[inline(always)]
-unsafe fn clocks(texts: std::arch::x86_64::__m128i) -> (std::arch::x86_64::__m128i, std::arch::x86_64::__m128i) {
-    use std::arch::x86_64::*;
-    let digits = _mm_xor_si128(texts, _mm_set1_epi64x(i64::from_le_bytes(*b"00:00:00")));
-    // H H : M M : S S, the most each place may hold.
-    let over = _mm_subs_epu8(digits, _mm_set1_epi64x(i64::from_le_bytes([2, 9, 0, 5, 9, 0, 5, 9])));
-    // Words: HH, ten times the minutes' first digit, their second digit, SS.
-    let pairs = _mm_maddubs_epi16(digits, _mm_set1_epi64x(i64::from_le_bytes([10, 1, 0, 10, 1, 0, 10, 1])));
-    let late = _mm_cmpgt_epi16(pairs, _mm_setr_epi16(23, i16::MAX, i16::MAX, i16::MAX, 23, i16::MAX, i16::MAX, i16::MAX));
-    let halves = _mm_madd_epi16(pairs, _mm_setr_epi16(3_600, 60, 60, 1, 3_600, 60, 60, 1));
-    let seconds = _mm_add_epi32(halves, _mm_srli_epi64(halves, 32));
-    (seconds, _mm_cmpeq_epi64(_mm_or_si128(over, late), _mm_setzero_si128()))
-}
-
-/// `HH:MM:SS` at `p` as seconds since midnight, and whether it is a real time of day. Never branches.
-#[cfg(all(target_arch = "x86_64", target_feature = "sse4.1"))]
-#[inline(always)]
-unsafe fn time_of_day(p: *const u8) -> (i64, bool) {
-    use std::arch::x86_64::*;
-    let (seconds, real) = clocks(_mm_loadl_epi64(p as *const __m128i));
-    (i64::from(_mm_cvtsi128_si32(seconds) as u32), _mm_cvtsi128_si32(real) != 0)
-}
-
-#[cfg(not(all(target_arch = "x86_64", target_feature = "sse4.1")))]
+/// `HH:MM:SS` at `p` as seconds since midnight, and whether it is a real time
+/// of day (00:00:00 to 23:59:59). Never branches. The definition `numbers` is
+/// held to, and what a build without AVX2 runs.
+#[cfg_attr(all(target_arch = "x86_64", target_feature = "avx2"), allow(dead_code))]
 #[inline(always)]
 unsafe fn time_of_day(p: *const u8) -> (i64, bool) {
     let time = (p as *const u64).read_unaligned() ^ 0x3030_3a30_303a_3030;
-    let wrong = (time | time.wrapping_add(0x7676_7f76_767f_7676)) & TOP_BITS;
+    let wrong = (time | time.wrapping_add(0x7676_7f76_767f_7676)) & 0x8080_8080_8080_8080;
     let hour = (time & 15) * 10 + ((time >> 8) & 15);
     let minute = ((time >> 24) & 15) * 10 + ((time >> 32) & 15);
     let second = ((time >> 48) & 15) * 10 + ((time >> 56) & 15);
     ((hour * 3_600 + minute * 60 + second) as i64, (wrong == 0) & (hour <= 23) & (minute <= 59) & (second <= 59))
 }
 
-/// `time_of_day` of `a` and of `b`, in one pass where the CPU has one.
-#[cfg(all(target_arch = "x86_64", target_feature = "sse4.1"))]
+/// Everything in a timestamp that is a number, in one pass over 32 bytes: the
+/// thirteen digits a `ts` may be (the low half: sixteen bytes ending at the
+/// last digit, the first three not ours) and two times of day (the high half:
+/// two texts of eight bytes, each to be read as `HH:MM:SS`). Returns the
+/// thirteen digits as a number and whether they are all digits, then for each
+/// time of day its seconds since midnight and whether it is one.
+///
+/// The two kinds of text take the same steps with other constants. After an
+/// XOR with what it should be made of (`0` everywhere, `00:00:00`) a digit is
+/// 0 to 9 and a colon 0; a saturating subtract finds any byte over the most
+/// its place allows; a multiply-add weighs neighbours (10 and 1, and 0 for the
+/// three bytes that are not ours and for the colons), a second one the pairs
+/// (100 and 1 for digits; 3,600, 60, 60 and 1 for a time of day). The digits
+/// then need one more multiply-add (fours to eights) and the times of day one
+/// add and a compare for an hour over 23.
+///
+/// Until experiment 43 the thirteen digits and the pair of times of day were
+/// two passes of 128 bits with a constant each for every step, more constants
+/// than the line loop has registers for, so they were fetched from memory on
+/// every line (BENCH.md).
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 #[inline(always)]
-unsafe fn times_of_day(a: *const u8, b: *const u8) -> ((i64, bool), (i64, bool)) {
+unsafe fn wide_numbers(digits: std::arch::x86_64::__m128i, times: std::arch::x86_64::__m128i) -> ((i64, bool), (i64, bool), (i64, bool)) {
     use std::arch::x86_64::*;
-    let texts = _mm_insert_epi64(_mm_loadl_epi64(a as *const __m128i), (b as *const i64).read_unaligned(), 1);
-    let (seconds, real) = clocks(texts);
-    let real = _mm_movemask_epi8(real) as u32;
+    const O: i8 = b'0' as i8;
+    const C: i8 = b':' as i8;
+    const MAX: i16 = i16::MAX;
+    let texts = _mm256_inserti128_si256(_mm256_castsi128_si256(digits), times, 1);
+    #[rustfmt::skip]
+    let values = _mm256_xor_si256(texts, _mm256_setr_epi8(
+        O, O, O, O, O, O, O, O, O, O, O, O, O, O, O, O,
+        O, O, C, O, O, C, O, O, O, O, C, O, O, C, O, O,
+    ));
+    // The most each place may hold: anything for the three bytes that are not
+    // ours, 9 for a digit; H H : M M : S S for a time of day.
+    #[rustfmt::skip]
+    let over = _mm256_subs_epu8(values, _mm256_setr_epi8(
+        -1, -1, -1, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9,
+        2, 9, 0, 5, 9, 0, 5, 9, 2, 9, 0, 5, 9, 0, 5, 9,
+    ));
+    // Words. Digits: nothing, the first digit, then six pairs. A time of day:
+    // HH, ten times the minutes' first digit, their second digit, SS.
+    #[rustfmt::skip]
+    let pairs = _mm256_maddubs_epi16(values, _mm256_setr_epi8(
+        0, 0, 0, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1,
+        10, 1, 0, 10, 1, 0, 10, 1, 10, 1, 0, 10, 1, 0, 10, 1,
+    ));
+    // An hour over 23. (A pair of digits is at most 2,805, whatever the bytes were.)
+    #[rustfmt::skip]
+    let late = _mm256_cmpgt_epi16(pairs, _mm256_setr_epi16(
+        MAX, MAX, MAX, MAX, MAX, MAX, MAX, MAX,
+        23, MAX, MAX, MAX, 23, MAX, MAX, MAX,
+    ));
+    // All 64 bits set where nothing is wrong: the digits' two halves, then each time of day.
+    let clear = _mm256_cmpeq_epi64(_mm256_or_si256(over, late), _mm256_setzero_si256());
+    let clear = _mm256_movemask_pd(_mm256_castsi256_pd(clear)) as u32;
+    // Double words. Digits: the first digit, then three fours. A time of day:
+    // the hours and the minutes' tens in seconds, then the rest.
+    #[rustfmt::skip]
+    let fours = _mm256_madd_epi16(pairs, _mm256_setr_epi16(
+        100, 1, 100, 1, 100, 1, 100, 1,
+        3_600, 60, 60, 1, 3_600, 60, 60, 1,
+    ));
+    let digits = _mm256_castsi256_si128(fours);
+    let digits = _mm_packus_epi32(digits, digits);
+    let eights = _mm_madd_epi16(digits, _mm_setr_epi16(10_000, 1, 10_000, 1, 10_000, 1, 10_000, 1));
+    let high = _mm_cvtsi128_si32(eights) as u32 as u64; // digits 0 to 4
+    let low = _mm_extract_epi32(eights, 1) as u32 as u64; // digits 5 to 12
+    let times = _mm256_extracti128_si256(fours, 1);
+    let seconds = _mm_add_epi32(times, _mm_srli_epi64(times, 32));
     (
-        (i64::from(_mm_cvtsi128_si32(seconds) as u32), real & 1 != 0),
-        (i64::from(_mm_extract_epi32(seconds, 2) as u32), real & 0x100 != 0),
+        ((high * 100_000_000 + low) as i64, clear & 3 == 3),
+        (i64::from(_mm_cvtsi128_si32(seconds) as u32), clear & 4 != 0),
+        (i64::from(_mm_extract_epi32(seconds, 2) as u32), clear & 8 != 0),
     )
 }
 
-#[cfg(not(all(target_arch = "x86_64", target_feature = "sse4.1")))]
+/// `thirteen(p)`, `time_of_day(first)` and `time_of_day(second)`, in one pass
+/// where the CPU has one (`wide_numbers`): an event line's `ts` as digits, its
+/// time of day, and its `ingest_ts`'s time of day. Reads the three bytes
+/// before `p` too.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 #[inline(always)]
-unsafe fn times_of_day(a: *const u8, b: *const u8) -> ((i64, bool), (i64, bool)) {
-    (time_of_day(a), time_of_day(b))
+unsafe fn numbers(p: *const u8, first: *const u8, second: *const u8) -> ((i64, bool), (i64, bool), (i64, bool)) {
+    use std::arch::x86_64::*;
+    let times = _mm_insert_epi64(_mm_loadl_epi64(first as *const __m128i), (second as *const i64).read_unaligned(), 1);
+    wide_numbers(_mm_loadu_si128(p.sub(3) as *const __m128i), times)
 }
 
-/// `YYYY-MM-DDTHH:MM:SS` at `p` as epoch seconds, if its date is already in the
-/// table and the rest is well formed; `time_of_day(p + 11)` is handed in.
-/// Never branches and never learns a date.
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
 #[inline(always)]
-unsafe fn civil_known(p: *const u8, dates: &Dates, (seconds, time_ok): (i64, bool)) -> (i64, bool) {
-    let head = (p as *const u64).read_unaligned();
-    let tail = (p.add(8) as *const u32).read_unaligned() & 0x00ff_ffff; // DDT
-    let known = dates.slots.get_unchecked(Dates::slot(tail as u16));
-    // Two compares cover the date, the `T`, and whether the slot is filled at all.
-    let ok = (known.head == head) & (known.tail == tail) & time_ok;
-    (known.midnight.wrapping_add(seconds), ok)
+unsafe fn numbers(p: *const u8, first: *const u8, second: *const u8) -> ((i64, bool), (i64, bool), (i64, bool)) {
+    (thirteen(p), time_of_day(first), time_of_day(second))
+}
+
+/// `thirteen(p)` and `time_of_day(time)`: `numbers` for a text alone, as a click's `ts` is.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+unsafe fn numbers_of_one(p: *const u8, time: *const u8) -> ((i64, bool), (i64, bool)) {
+    use std::arch::x86_64::*;
+    let (digits, time, _) = wide_numbers(_mm_loadu_si128(p.sub(3) as *const __m128i), _mm_loadl_epi64(time as *const __m128i));
+    (digits, time)
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+#[inline(always)]
+unsafe fn numbers_of_one(p: *const u8, time: *const u8) -> ((i64, bool), (i64, bool)) {
+    (thirteen(p), time_of_day(time))
+}
+
+/// The date `YYYY-MM-DD` and the `T` after it at `p` (sixteen bytes are read):
+/// the epoch seconds of its midnight, and whether it is in the table. When it
+/// is not, the seconds mean nothing. Never branches and never learns a date.
+#[inline(always)]
+unsafe fn date_known(p: *const u8, dates: &Dates) -> (i64, bool) {
+    let known = dates.slots.get_unchecked(Dates::slot((p.add(8) as *const u16).read_unaligned()));
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    let same = {
+        use std::arch::x86_64::*;
+        let same = _mm_cmpeq_epi8(_mm_loadu_si128(p as *const __m128i), _mm_load_si128(known.text.as_ptr() as *const __m128i));
+        !(_mm_movemask_epi8(same) as u32) & ((1 << DATE_BYTES) - 1) == 0
+    };
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+    let same = {
+        let head = (p as *const u64).read_unaligned();
+        let tail = (p.add(8) as *const u32).read_unaligned() & 0x00ff_ffff; // DDT
+        (known.head() == head) & (known.tail() == tail)
+    };
+    (known.midnight, same)
+}
+
+/// `date_known` of `a` and of `b`: an event line's `ts` and its `ingest_ts`.
+/// With AVX2 the two texts share one register and the two slots another, and
+/// one compare of 32 bytes answers for both; a slot's place is a `pext` and a
+/// shift. (Each date was two compares against a slot found in seven
+/// instructions: BENCH.md, experiment 43.)
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+unsafe fn dates_known(a: *const u8, b: *const u8, dates: &Dates) -> ((i64, bool), (i64, bool)) {
+    use std::arch::x86_64::*;
+    let known_a = dates.slots.get_unchecked(Dates::slot((a.add(8) as *const u16).read_unaligned()));
+    let known_b = dates.slots.get_unchecked(Dates::slot((b.add(8) as *const u16).read_unaligned()));
+    let both = |first: *const u8, second: *const u8| {
+        _mm256_inserti128_si256(_mm256_castsi128_si256(_mm_loadu_si128(first as *const __m128i)), _mm_loadu_si128(second as *const __m128i), 1)
+    };
+    let same = _mm256_cmpeq_epi8(both(a, b), both(known_a.text.as_ptr(), known_b.text.as_ptr()));
+    let differ = !(_mm256_movemask_epi8(same) as u32);
+    let date = (1u32 << DATE_BYTES) - 1;
+    ((known_a.midnight, differ & date == 0), (known_b.midnight, differ & (date << 16) == 0))
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+#[inline(always)]
+unsafe fn dates_known(a: *const u8, b: *const u8, dates: &Dates) -> ((i64, bool), (i64, bool)) {
+    (date_known(a, dates), date_known(b, dates))
 }
 
 /// `±HH:MM` at `p + 19` (the eight bytes from `p + 17` are read): the seconds
@@ -419,14 +550,22 @@ fn hidden(flag: bool) -> bool {
 /// reader's buffer: 3 bytes before it and 32 after are read whatever `len` is.
 #[inline(always)]
 pub unsafe fn parse(p: *const u8, len: usize, dates: &mut Dates) -> i64 {
-    parse_timed(p, len, dates, time_of_day(p.add(11)))
+    let (digits, time) = numbers_of_one(p, p.add(11));
+    finish(p, len, dates, digits, date_known(p, dates), time)
 }
 
-/// `parse`, given `time_of_day(p + 11)`.
+/// `parse`, given what the text holds as numbers (`numbers`) and its date (`date_known`).
 #[inline(always)]
-unsafe fn parse_timed(p: *const u8, len: usize, dates: &mut Dates, time: (i64, bool)) -> i64 {
-    let (digits, digits_ok) = thirteen(p);
-    let (seconds, civil_ok) = civil_known(p, dates, time);
+unsafe fn finish(
+    p: *const u8,
+    len: usize,
+    dates: &mut Dates,
+    (digits, digits_ok): (i64, bool),
+    (midnight, date_ok): (i64, bool),
+    (time, time_ok): (i64, bool),
+) -> i64 {
+    let seconds = midnight.wrapping_add(time);
+    let civil_ok = date_ok & time_ok;
     let is_digits = len == 13;
     let is_utc = (len == 20) & (*p.add(19) == b'Z');
     // Selected, not branched on: left to itself the compiler turns this back into
@@ -457,17 +596,15 @@ unsafe fn parse_timed(p: *const u8, len: usize, dates: &mut Dates, time: (i64, b
 #[inline(always)]
 #[allow(dead_code)]
 pub unsafe fn parse_utc(p: *const u8, len: usize, dates: &mut Dates) -> (i64, i64) {
-    parse_utc_timed(p, len, dates, time_of_day(p.add(11)))
+    let (_, time) = numbers_of_one(p, p.add(11));
+    finish_utc(p, len, dates, date_known(p, dates), time)
 }
 
-/// `parse_utc`, given `time_of_day(p + 11)`.
+/// `parse_utc`, given the text's date (`date_known`) and its time of day.
 #[inline(always)]
-unsafe fn parse_utc_timed(p: *const u8, len: usize, dates: &mut Dates, (seconds, time_ok): (i64, bool)) -> (i64, i64) {
-    let head = (p as *const u64).read_unaligned();
-    let tail = (p.add(8) as *const u32).read_unaligned() & 0x00ff_ffff; // DDT
-    let known = dates.slots.get_unchecked(Dates::slot(tail as u16));
-    if len == 20 && *p.add(19) == b'Z' && known.head == head && known.tail == tail && time_ok {
-        let seconds = known.midnight + seconds;
+unsafe fn finish_utc(p: *const u8, len: usize, dates: &mut Dates, (midnight, date_ok): (i64, bool), (time, time_ok): (i64, bool)) -> (i64, i64) {
+    if len == 20 && *p.add(19) == b'Z' && date_ok && time_ok {
+        let seconds = midnight + time;
         (seconds, seconds * 1_000)
     } else {
         parse_utc_general(p, len, dates)
@@ -475,15 +612,18 @@ unsafe fn parse_utc_timed(p: *const u8, len: usize, dates: &mut Dates, (seconds,
 }
 
 /// An event line's two timestamps: its `ts` as `parse` gives it, and its
-/// `ingest_ts` as `parse_utc` does. Both hold a time of day at the same place
-/// (when `ts` is not digits only), and the two are worked out in one pass
-/// (`times_of_day`). `ts` and `ingest` must each be in the reader's buffer, as
-/// for `parse`.
+/// `ingest_ts` as `parse_utc` does. What the two hold as numbers is worked out
+/// in one pass (`numbers`) and their two dates are looked up in one compare
+/// (`dates_known`), both before either is finished: a date that `ingest_ts`
+/// brings for the first time is not yet known to the `ts` beside it, which
+/// then gets its answer the slow way. `ts` and `ingest` must each be in the
+/// reader's buffer, as for `parse`.
 #[inline(always)]
 pub unsafe fn parse_both(ts: *const u8, ts_len: usize, ingest: *const u8, ingest_len: usize, dates: &mut Dates) -> (i64, (i64, i64)) {
-    let (ts_time, ingest_time) = times_of_day(ts.add(11), ingest.add(11));
-    let ingest = parse_utc_timed(ingest, ingest_len, dates, ingest_time);
-    (parse_timed(ts, ts_len, dates, ts_time), ingest)
+    let (digits, ts_time, ingest_time) = numbers(ts, ts.add(11), ingest.add(11));
+    let (ts_date, ingest_date) = dates_known(ts, ingest, dates);
+    let ingest = finish_utc(ingest, ingest_len, dates, ingest_date, ingest_time);
+    (finish(ts, ts_len, dates, digits, ts_date, ts_time), ingest)
 }
 
 #[cold]
@@ -581,13 +721,27 @@ mod tests {
             assert_eq!(value, plain, "finished in parse: {shown:?}");
         }
         assert!(!unsafe { finished_here(p, len, &Dates::new()) }.1, "finished on a date not in the table: {shown:?}");
+        // Which way the two common forms go: a good one must be found good by the
+        // passes themselves (its date is in the table by now), or it would come
+        // out right the slow way and nothing above would show it.
+        unsafe {
+            let (digits, (_, time_ok)) = numbers_of_one(p, p.add(11));
+            if len == 13 && plain != BAD {
+                assert_eq!(digits, (plain, true), "thirteen digits not taken as such: {shown:?}");
+            }
+            if len == 20 && text[19] == b'Z' && plain != BAD {
+                assert!(date_known(p, dates).1 && time_ok, "a good UTC text not finished in place: {shown:?}");
+                assert_eq!(dates_known(p, p, dates), (date_known(p, dates), date_known(p, dates)), "{shown:?}");
+            }
+        }
         plain
     }
 
     /// What `parse` makes of a text that is not 13 digits or UTC: `offset_known`, fed as `parse` feeds it.
     unsafe fn finished_here(p: *const u8, len: usize, dates: &Dates) -> (i64, bool) {
-        let (seconds, civil_ok) = civil_known(p, dates, time_of_day(p.add(11)));
-        offset_known(p, len, seconds, civil_ok)
+        let (midnight, date_ok) = date_known(p, dates);
+        let (_, (time, time_ok)) = numbers_of_one(p, p.add(11));
+        offset_known(p, len, midnight.wrapping_add(time), date_ok & time_ok)
     }
 
     fn next(state: &mut u64) -> u64 {
@@ -707,18 +861,37 @@ mod tests {
         (hour <= 23 && minute <= 59 && second <= 59).then_some(hour * 3_600 + minute * 60 + second)
     }
 
-    /// `time_of_day` of `a`, and `times_of_day` of `a` and `b` on either side, against the definition.
-    fn check_times(a: &[u8; 8], b: &[u8; 8]) -> (bool, bool) {
-        let found = |(seconds, real): (i64, bool)| real.then_some(seconds);
-        let (plain_a, plain_b) = (plain_time(a), plain_time(b));
+    /// The definition of thirteen digits: their number.
+    fn plain_thirteen(text: &[u8; 13]) -> Option<i64> {
+        text.iter().all(u8::is_ascii_digit).then(|| text.iter().fold(0, |number, &byte| number * 10 + i64::from(byte - b'0')))
+    }
+
+    /// `numbers` of thirteen bytes (with `before` in front of them, as some
+    /// other field's end would be) and two times of day, and `numbers_of_one`
+    /// of the first, against the definitions. Returns which of the three are good.
+    fn check_numbers(before: [u8; 3], digits: &[u8; 13], a: &[u8; 8], b: &[u8; 8]) -> (bool, bool, bool) {
+        let found = |(value, real): (i64, bool)| real.then_some(value);
+        let mut text = before.to_vec();
+        text.extend_from_slice(digits);
+        let plain = (plain_thirteen(digits), plain_time(a), plain_time(b));
+        let shown = format!("{:?} {:?} {:?}", String::from_utf8_lossy(digits), String::from_utf8_lossy(a), String::from_utf8_lossy(b));
         unsafe {
-            assert_eq!(found(time_of_day(a.as_ptr())), plain_a, "{:?}", String::from_utf8_lossy(a));
-            let (first, second) = times_of_day(a.as_ptr(), b.as_ptr());
-            assert_eq!((found(first), found(second)), (plain_a, plain_b), "{:?} with {:?}", String::from_utf8_lossy(a), String::from_utf8_lossy(b));
-            let (first, second) = times_of_day(b.as_ptr(), a.as_ptr());
-            assert_eq!((found(first), found(second)), (plain_b, plain_a), "{:?} with {:?}", String::from_utf8_lossy(b), String::from_utf8_lossy(a));
+            let p = text.as_ptr().add(3);
+            assert_eq!(found(time_of_day(a.as_ptr())), plain.1, "{shown}");
+            let (thirteen, first, second) = numbers(p, a.as_ptr(), b.as_ptr());
+            assert_eq!((found(thirteen), found(first), found(second)), plain, "{shown}");
+            let (thirteen, first, second) = numbers(p, b.as_ptr(), a.as_ptr());
+            assert_eq!((found(thirteen), found(first), found(second)), (plain.0, plain.2, plain.1), "{shown}, the times the other way round");
+            let (thirteen, first) = numbers_of_one(p, a.as_ptr());
+            assert_eq!((found(thirteen), found(first)), (plain.0, plain.1), "{shown}, alone");
         }
-        (plain_a.is_some(), plain_b.is_some())
+        (plain.0.is_some(), plain.1.is_some(), plain.2.is_some())
+    }
+
+    /// `check_numbers` for two times of day, beside thirteen digits that are good.
+    fn check_times(a: &[u8; 8], b: &[u8; 8]) -> (bool, bool) {
+        let (_, a_good, b_good) = check_numbers(*b",\"x", b"1791071890000", a, b);
+        (a_good, b_good)
     }
 
     /// The times of day straight, not through `parse`: one that was wrongly found
@@ -766,6 +939,119 @@ mod tests {
             }
         }
         assert!(good > 1_000 && bad > 200_000, "{good} good, {bad} bad");
+    }
+
+    /// The thirteen digits straight, as the times of day above: every byte value
+    /// in every place of them, whatever the three bytes in front and the times
+    /// of day beside them are.
+    #[test]
+    fn every_byte_in_thirteen_digits() {
+        let (mut good, mut bad) = (0, 0);
+        let mut state = 7;
+        for base in [*b"1791071890000", *b"0000000000000", *b"9999999999999", *b"1600000000001", *b"2147483648000"] {
+            for (a, b) in [(*b"12:34:56", *b"23:59:59"), (*b"24:00:00", *b"\0\0\0\0\0\0\0\0"), (*b"\xff\xff\xff\xff\xff\xff\xff\xff", *b"00:00:00")] {
+                for at in 0..13 {
+                    for byte in 0..=255u8 {
+                        let mut changed = base;
+                        changed[at] = byte;
+                        let before = next(&mut state).to_le_bytes();
+                        if check_numbers([before[0], before[1], before[2]], &changed, &a, &b).0 {
+                            good += 1;
+                        } else {
+                            bad += 1;
+                        }
+                    }
+                }
+                // The three bytes in front are another field's: none of them changes anything.
+                for at in 0..3 {
+                    for byte in 0..=255u8 {
+                        let mut before = *b"0,\"";
+                        before[at] = byte;
+                        assert_eq!(check_numbers(before, &base, &a, &b).0, true);
+                    }
+                }
+            }
+        }
+        // Numbers of every size, as they are written.
+        for _ in 0..200_000 {
+            let number = next(&mut state) % 10_000_000_000_000;
+            let text: [u8; 13] = format!("{number:013}").into_bytes().try_into().unwrap();
+            assert_eq!(plain_thirteen(&text), Some(number as i64));
+            assert_eq!(check_numbers(*b"9,9", &text, b"19:58:10", b"19:58:11").0, true);
+        }
+        assert!(good > 1_500 && bad > 45_000, "{good} good, {bad} bad");
+    }
+
+    /// The dates straight: a text's date is known exactly when it is the date
+    /// last learned for its day of the month, on either side of a pair, and
+    /// every other text is not, the ones an empty slot holds among them.
+    #[test]
+    fn a_date_is_known_exactly_when_it_was_learned() {
+        use std::collections::HashMap;
+        // What the table should hold: for a day of the month, the date last learned and its midnight.
+        let mut model: HashMap<[u8; 2], ([u8; 11], i64)> = HashMap::new();
+        let mut dates = Dates::new();
+        let padded = |date: &[u8]| {
+            let mut text = date.to_vec();
+            text.extend_from_slice(b"T19:58:10Z,1791071890000,,,,,,,,,,,,,,,,,,,,,,,,,,,");
+            text
+        };
+        let check = |text: &[u8], other: &[u8], dates: &Dates, model: &HashMap<[u8; 2], ([u8; 11], i64)>| -> bool {
+            let expected = |text: &[u8]| model.get(&[text[8], text[9]]).filter(|(date, _)| date[..] == text[..11]).map(|&(_, midnight)| midnight);
+            let found = |(midnight, known): (i64, bool)| known.then_some(midnight);
+            unsafe {
+                assert_eq!(found(date_known(text.as_ptr(), dates)), expected(text), "{:?}", String::from_utf8_lossy(&text[..11]));
+                let (first, second) = dates_known(text.as_ptr(), other.as_ptr(), dates);
+                assert_eq!((found(first), found(second)), (expected(text), expected(other)), "{:?} first", String::from_utf8_lossy(&text[..11]));
+                let (first, second) = dates_known(other.as_ptr(), text.as_ptr(), dates);
+                assert_eq!((found(first), found(second)), (expected(other), expected(text)), "{:?} second", String::from_utf8_lossy(&text[..11]));
+            }
+            expected(text).is_some()
+        };
+        // Nothing learned: no text is known. Every pair of bytes where the day
+        // is, the rest zero, is every text that an empty slot could be taken for.
+        let other = padded(b"2026-10-03");
+        for first in 0..=255u8 {
+            for second in 0..=255u8 {
+                let mut text = vec![0u8; 48];
+                (text[8], text[9]) = (first, second);
+                assert!(!check(&text, &other, &dates, &model));
+                text[10] = b'T';
+                assert!(!check(&text, &other, &dates, &model));
+            }
+        }
+        // Dates learned one after another, as `parse_general` learns them; a later
+        // month takes the earlier one's slots.
+        let (mut known, mut unknown) = (0, 0);
+        for (year, month) in [(2026, 10), (2026, 11), (2028, 2), (2025, 12), (1999, 1)] {
+            for day in 0..=32 {
+                let text = padded(format!("{year:04}-{month:02}-{day:02}").as_bytes());
+                let milliseconds = unsafe { parse_general(text.as_ptr(), 20, &mut dates) };
+                assert_eq!(milliseconds, unsafe { parse_plain(text.as_ptr(), 20) });
+                if milliseconds != BAD {
+                    model.insert([text[8], text[9]], (text[..11].try_into().unwrap(), milliseconds / 1_000 - (19 * 3_600 + 58 * 60 + 10)));
+                }
+                assert_eq!(check(&text, &other, &dates, &model), milliseconds != BAD, "{year}-{month}-{day}");
+                // Every byte value in every place of the date and its `T`, and in the five bytes after them, which are not the date's.
+                for at in 0..16 {
+                    for byte in 0..=255u8 {
+                        let mut changed = text.clone();
+                        changed[at] = byte;
+                        if check(&changed, &text, &dates, &model) {
+                            known += 1;
+                        } else {
+                            unknown += 1;
+                        }
+                    }
+                }
+            }
+        }
+        // Every date the table holds at the end is still known, with its own midnight.
+        for (date, _) in model.values() {
+            assert!(check(&padded(&date[..10]), &other, &dates, &model));
+        }
+        assert_eq!(model.len(), 31);
+        assert!(known > 150_000 && unknown > 400_000, "{known} known, {unknown} unknown");
     }
 
     /// An event line's two timestamps are each their own: every pairing of the
