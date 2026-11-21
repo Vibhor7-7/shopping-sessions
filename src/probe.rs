@@ -53,7 +53,7 @@ pub fn run(data: &std::path::Path, output: &std::path::Path) {
     for line in head("/proc/meminfo", 4096).lines().filter(|l| ["MemTotal", "MemFree", "MemAvailable", "Cached", "Dirty", "AnonHugePages", "HugePages_Total", "Hugepagesize", "SwapTotal"].iter().any(|k| l.starts_with(k))) {
         eprintln!("probe: meminfo: {line}");
     }
-    for line in head("/proc/self/mountinfo", 16000).lines().filter(|l| [" / ", " /data ", " /output ", " /scratch ", " /tmp ", " /app "].iter().any(|k| l.contains(k))).take(10) {
+    for line in head("/proc/self/mountinfo", 16000).lines().filter(|l| l.split(' ').nth(4).is_some_and(|at| ["/", "/data", "/output", "/scratch", "/tmp", "/app"].contains(&at))).take(8) {
         eprintln!("probe: mount: {}", line.chars().take(200).collect::<String>());
     }
     for line in head("/proc/self/limits", 2000).lines().filter(|l| ["Max locked memory", "Max address space", "Max open files", "Max processes", "Max stack size"].iter().any(|k| l.starts_with(k))) {
@@ -152,7 +152,7 @@ pub fn run(data: &std::path::Path, output: &std::path::Path) {
         input_paths(&largest.path());
     }
     vector_widths();
-    eprintln!("probe: ---- end; the output is now made wrong on purpose so this log is shown ----");
+    eprintln!("probe: ---- end of the machine; user_daily was emptied on purpose before all this, so that the log is shown ----");
 }
 
 /// What 4 KB pages cost here against huge ones: 256 MB mapped, every page touched, unmapped, under each advice.
@@ -405,8 +405,8 @@ fn vector_widths() {
 /// The whole pipeline on a stand-in dataset the size of the practice set (the
 /// one the bench workflow times, `src/bin/synth.rs`), each run a process of its
 /// own: what the scorer's machine makes of the real thing, from start to exit,
-/// on its own thread count and on others. Last in the log, because it is the
-/// part that takes long: if the run is cut short, everything else is out.
+/// on its own thread count and on others. After the machine's description,
+/// because it is the part that takes long: if the run is cut short, that is out.
 pub fn at_scale() {
     use std::process::{Command, Stdio};
     eprintln!("probe: ---- the whole pipeline on a stand-in dataset, each run a process of its own ----");
@@ -484,8 +484,8 @@ pub fn at_scale() {
             Ok(result) => {
                 let log = String::from_utf8_lossy(&result.stderr);
                 let phases = log.lines().find(|l| l.starts_with("pipeline: links ")).map(|l| l["pipeline: ".len()..].split(" (pool").next().unwrap_or("").to_string()).unwrap_or_default();
-                let memory = log.lines().find_map(|l| l.find("peak memory").map(|at| l[at..].to_string())).unwrap_or_default();
-                eprintln!("probe: {label}: {wall:.1} ms from start to exit ({}) | {phases} | {memory}", result.status);
+                let scan = log.lines().find_map(|l| l.rfind("; scan ").map(|at| l[at + 2..].to_string())).unwrap_or_default();
+                eprintln!("probe: {label}: {wall:.1} ms from start to exit ({}) | {phases} | {scan}", result.status);
             }
             Err(error) => eprintln!("probe: {label}: could not run: {error}"),
         }

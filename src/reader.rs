@@ -518,7 +518,7 @@ mod tests {
         let mut pieces = jobs(std::slice::from_ref(input), target);
         pieces.sort_by_key(|job| job.offset);
         let capacity = 2 * block;
-        let mut buf = ReadBuf { bytes: vec![0; FRONT + capacity + 128], index: Index::new(capacity + 64), block };
+        let mut buf = ReadBuf { bytes: vec![0; FRONT + capacity + 128], index: Index::new(capacity + 64), block, stop: 0 };
         for job in pieces {
             walk(&input.file, job.offset, job.length, &mut buf, sink);
         }

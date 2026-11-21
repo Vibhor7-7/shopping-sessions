@@ -289,9 +289,14 @@ fn main() {
         }
     }
     write_user_daily(&user_folder, &catalog, 0, person::UserRows::default());
-    describe_machine();
-    probe::anatomy(&context, &events, &clicks, threads, 1 << person_bits, 1 << dedup_bits, chunks);
+    if event_bytes >= (256 << 20) {
+        describe_machine();
+    }
+    // The machine first (seconds), then the pipeline at full size (most of a minute), then
+    // the parse phase stage by stage: last, because its runs keep their memory.
     probe::run(&data, &output);
     probe::at_scale();
+    probe::anatomy(&context, &events, &clicks, threads, 1 << person_bits, 1 << dedup_bits, chunks);
+    eprintln!("probe: ---- end of the log, {:.1} s after the start ----", started.elapsed().as_secs_f64());
     std::process::exit(0);
 }
