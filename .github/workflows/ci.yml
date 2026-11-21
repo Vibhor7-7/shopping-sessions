@@ -1,0 +1,34 @@
+name: ci
+on:
+  push:
+  pull_request:
+
+# The scorer builds the Dockerfile on linux/amd64 and runs it with the flags in
+# scripts/docker_run.sh. This does the same on a real x86-64 machine, which an
+# Apple-silicon laptop can only emulate.
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: CPU
+        run: grep -m1 'model name' /proc/cpuinfo; grep -m1 -o -w -E 'avx2|avx512f' /proc/cpuinfo | sort -u | tr '\n' ' '
+      - name: Build the image
+        run: docker build -t shopping-sessions:latest .
+      - name: Fixtures, with the scorer's flags
+        run: |
+          pip install --quiet polars
+          python3 scripts/run_fixtures.py fixtures -- scripts/docker_run.sh
+  native:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unit tests
+        run: cargo test --release
+      - name: Fixtures, pipeline and reference, with tiny read blocks too
+        run: |
+          pip install --quiet polars
+          RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release
+          python3 scripts/run_fixtures.py fixtures -- target/release/pipeline
+          SS_JOB_BYTES=7 SS_BLOCK_BYTES=17 python3 scripts/run_fixtures.py fixtures -- target/release/pipeline
+          scripts/check_reference.sh
