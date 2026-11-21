@@ -197,13 +197,17 @@ impl Forest<'_> {
 
     /// The slot of `id`, claiming an empty one if it is new.
     ///
-    /// Whether an ID is new is as good as random from edge to edge, and so is
-    /// how far down its home line it sits, so neither is branched on: the four
-    /// slots of the line are compared at once, and the first that holds the ID
-    /// or is free is claimed for it either way. On a slot that already holds
-    /// the ID the claim fails and says so, which is the answer. Only a full
-    /// line, or a free slot another thread took for another ID in between,
-    /// goes on to the search slot by slot.
+    /// How far down its home line an ID sits is as good as random, so the four
+    /// slots of the line are compared at once and the first that holds the ID
+    /// or is free is the one, with no loop over them. Whether the ID is new
+    /// (two times in three) is as random, and is branched on all the same: a
+    /// slot that already holds the ID is returned as it is, and only a free one
+    /// is claimed. Claiming either way, which fails harmlessly on a slot that
+    /// holds the ID, needs no branch but a locked instruction for nothing one
+    /// time in three, and it writes to a line other threads may be reading:
+    /// measured, it loses on Intel's CPUs what it gains on one of AMD's
+    /// (BENCH.md, experiment 34). Only a full line, or a free slot another
+    /// thread took for another ID in between, goes on to the search slot by slot.
     #[inline(always)]
     fn slot(&self, id: Key) -> usize {
         let home = home(id, self.shift);
@@ -214,6 +218,9 @@ impl Forest<'_> {
         }
         if stop != 0 {
             let at = home + stop.trailing_zeros() as usize;
+            if self.id(at).load(Ordering::Relaxed) == id {
+                return at;
+            }
             match self.id(at).compare_exchange(0, id, Ordering::AcqRel, Ordering::Acquire) {
                 Ok(_) => return at,
                 Err(held) if held == id => return at,
