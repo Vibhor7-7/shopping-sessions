@@ -264,8 +264,6 @@ impl Lines for EventLines<'_, '_> {
         if quotes != 2 * wrapped || id == id_end {
             return true;
         }
-        // Both IDs at once. An empty user_id, which no line survives, has the key 0.
-        let (event, user_key) = key::keys_of_two_padded(data.add(id), id_end - id, data.add(user_at), user_end - user_at);
         let (ingest_seconds, ingest) = ts::parse_utc(data.add(ingest_at), ingest_end - ingest_at, &mut sink.dates);
         let at_ms = ts::parse(data.add(ts_at), ts_end - ts_at, &mut sink.dates);
         let catalog = context.catalog;
@@ -295,16 +293,20 @@ impl Lines for EventLines<'_, '_> {
                 alive = false;
             }
         }
-        let (mut user, mut home) = (0, 0);
-        if alive {
-            user = user_key;
-            home = context.links.prefetch(user);
-        }
         let ingest = if ingest == ts::BAD {
             u32::MAX
         } else {
             (ingest_seconds - context.ingest_epoch).clamp(0, i64::from(u32::MAX) - 1) as u32
         };
+        // Both IDs at once, and last: nothing between here and the record needs
+        // a register they would have to wait in. An empty user_id, which no line
+        // survives, has the key 0.
+        let (event, user_key) = key::keys_of_two_padded(data.add(id), id_end - id, data.add(user_at), user_end - user_at);
+        let (mut user, mut home) = (0, 0);
+        if alive {
+            user = user_key;
+            home = context.links.prefetch(user);
+        }
         // The line first, into a slot nothing is waiting in; then the line `RING`
         // before it is filed and the one `LOOK` before it looked up.
         let count = sink.event_count;
