@@ -16,7 +16,7 @@ use std::sync::Mutex;
 use crate::catalog::{self, Catalog};
 use crate::key::{self, Key};
 use crate::links::Links;
-use crate::pool::{Chunks, Pool, Scatter};
+use crate::pool::{Chunks, Combine, Pool, Scatter};
 use crate::reader::{self, Input, Job, Lines, ReadBuf};
 use crate::sys;
 use crate::ts;
@@ -115,8 +115,8 @@ struct PendingClick {
 
 struct Sink<'a> {
     context: &'a Context<'a>,
-    copies: Scatter<'a, Copy_>,
-    events: Scatter<'a, Event>,
+    copies: Combine<'a, Copy_>,
+    events: Combine<'a, Event>,
     clicks: Scatter<'a, Click>,
     waiting_events: [PendingEvent; RING],
     event_count: usize,
@@ -342,8 +342,8 @@ pub fn run(
         let mut buf = ReadBuf::new();
         let mut sink = Sink {
             context,
-            copies: Scatter::new(&pools.copies, dedup_partitions, chunks.copies),
-            events: Scatter::new(&pools.events, person_partitions, chunks.events),
+            copies: Combine::new(&pools.copies, dedup_partitions, chunks.copies),
+            events: Combine::new(&pools.events, person_partitions, chunks.events),
             clicks: Scatter::new(&pools.clicks, person_partitions, chunks.clicks),
             waiting_events: [PendingEvent::default(); RING],
             event_count: 0,
