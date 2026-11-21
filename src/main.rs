@@ -193,11 +193,10 @@ fn main() {
     let days = ((catalog.window_end - 1).div_euclid(ts::DAY_MS) - first_day + 1) as usize;
 
     // Enough partitions that the later phases work on one in cache: about 2 MB of
-    // events for a partition of people (its events are moved three times), 4 MB
-    // for a dedup partition (only looked at). More data, more partitions.
+    // events to a partition, of people or of event copies. More data, more partitions.
     let bits = |bytes: u64, each: u64| (bytes / each).max(1).next_power_of_two().trailing_zeros().clamp(4, 11);
     let person_bits = setting("SS_PERSON_BITS").map_or(bits(event_bytes, 2 << 20), |b| b as u32).clamp(1, 12);
-    let dedup_bits = setting("SS_DEDUP_BITS").map_or(bits(event_bytes, 4 << 20), |b| b as u32).clamp(1, 12);
+    let dedup_bits = setting("SS_DEDUP_BITS").map_or(bits(event_bytes, 2 << 20), |b| b as u32).clamp(1, 12);
     // Each thread fills one chunk per partition at a time, and the last of each is
     // left part empty: a quarter of what a thread expects to put in a partition
     // keeps that waste near an eighth of the data.

@@ -84,11 +84,14 @@ def mutate(rng, line, kind, start, end, serial):
         if pick == 2: return [b'"' + b",".join(out)]
         if pick == 3: return [b",".join(out) + b'"']
         if pick == 4: return [b""]
-        if pick == 5: return [b",".join(out) + b"\r"]
+        if pick == 5:
+            # Still a well-formed line, with a `\r` on its last field: it goes on to the
+            # shared ending below, which keeps a changed event copy from tying with another.
+            out[-1] = out[-1] + b"\r"
         if pick == 6: out[rng.randrange(width)] = b'a"b'; return [b",".join(out)]
         if pick == 7: at = rng.randrange(width); return [b",".join(out[:at] + [b'""' + out[at] + b'""'] + out[at + 1:])]
-        return [b",".join(b'"' + f + b'"' for f in out)]
-    if choice < 40:      # IDs
+        if pick == 8: return [b",".join(b'"' + f + b'"' for f in out)]
+    elif choice < 40:    # IDs
         at = rng.randrange(2) if kind != "links" else rng.randrange(2)
         out[at] = odd_id(rng, out[at])
         if kind != "links" and at == 0 and out[0]:

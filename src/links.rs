@@ -15,8 +15,9 @@ use crate::sys;
 
 /// ID to person. IDs that no link line names are not in it: they are their own person.
 pub struct Links {
-    /// Slots of (ID key, person key); an ID key of 0 is an empty slot.
-    table: sys::Shared<[u64; 2]>,
+    /// Cache lines of four slots: four ID keys, then the four people they belong to.
+    /// An ID key of 0 is an empty slot.
+    table: sys::Shared<u64>,
     mask: usize,
     shift: u32,
     pub ids: usize,
@@ -38,7 +39,7 @@ impl Links {
     #[inline(always)]
     pub fn prefetch(&self, id: Key) -> u32 {
         let home = self.home(id);
-        sys::prefetch(unsafe { self.table.0.add(home) });
+        sys::prefetch(unsafe { self.table.0.add(id_word(home)) });
         home as u32
     }
 
@@ -51,12 +52,12 @@ impl Links {
     #[inline(always)]
     pub fn person_at(&self, id: Key, home: u32) -> Key {
         unsafe {
-            let line = self.table.0.add(home as usize) as *const u64; // id, person, id, person, ...
+            let line = self.table.0.add(id_word(home as usize)) as *const u64; // four IDs, then their four people
             let (found, empty) = line_masks(line, id);
             let stop = found | empty;
             if stop != 0 {
                 let slot = stop.trailing_zeros() as usize; // the first slot that is `id` or free
-                let person = *line.add(2 * slot + 1);
+                let person = *line.add(4 + slot);
                 let is_found = (found >> slot) & 1 != 0;
                 return std::hint::select_unpredictable(is_found, person, id);
             }
@@ -68,11 +69,11 @@ impl Links {
     #[inline(never)]
     fn person_from(&self, id: Key, mut at: usize) -> Key {
         loop {
-            let slot = unsafe { *self.table.0.add(at) };
-            if slot[0] == id {
-                return slot[1];
+            let held = unsafe { *self.table.0.add(id_word(at)) };
+            if held == id {
+                return unsafe { *self.table.0.add(id_word(at) + 4) };
             }
-            if slot[0] == 0 {
+            if held == 0 {
                 return id;
             }
             at = (at + 1) & self.mask;
@@ -80,21 +81,21 @@ impl Links {
     }
 }
 
-/// For the four slots at `line`: which hold `id`, and which are free, one bit a slot.
+/// Where slot `at`'s ID is in the table; the person it belongs to (or, while the
+/// table is built, its parent) is four words on. Slots 4k to 4k+3 share a cache line.
+#[inline(always)]
+fn id_word(at: usize) -> usize {
+    (at >> 2) * 8 + (at & 3)
+}
+
+/// For the four IDs at `line`: which are `id`, and which slots are free, one bit a slot.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 #[inline(always)]
 unsafe fn line_masks(line: *const u64, id: Key) -> (u32, u32) {
     use std::arch::x86_64::*;
-    let low = _mm256_loadu_si256(line as *const __m256i);
-    let high = _mm256_loadu_si256(line.add(4) as *const __m256i);
-    let wanted = _mm256_set1_epi64x(id as i64);
-    let zero = _mm256_setzero_si256();
-    // One bit per 64-bit lane; lanes 0 and 2 are IDs, 1 and 3 the people they belong to.
+    let ids = _mm256_loadu_si256(line as *const __m256i);
     let bits = |v: __m256i| _mm256_movemask_pd(_mm256_castsi256_pd(v)) as u32;
-    let ids = |lanes: u32| (lanes & 1) | ((lanes >> 1) & 2);
-    let found = ids(bits(_mm256_cmpeq_epi64(low, wanted))) | (ids(bits(_mm256_cmpeq_epi64(high, wanted))) << 2);
-    let empty = ids(bits(_mm256_cmpeq_epi64(low, zero))) | (ids(bits(_mm256_cmpeq_epi64(high, zero))) << 2);
-    (found, empty)
+    (bits(_mm256_cmpeq_epi64(ids, _mm256_set1_epi64x(id as i64))), bits(_mm256_cmpeq_epi64(ids, _mm256_setzero_si256())))
 }
 
 #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
@@ -102,7 +103,7 @@ unsafe fn line_masks(line: *const u64, id: Key) -> (u32, u32) {
 unsafe fn line_masks(line: *const u64, id: Key) -> (u32, u32) {
     let (mut found, mut empty) = (0u32, 0u32);
     for slot in 0..4 {
-        let held = *line.add(2 * slot);
+        let held = *line.add(slot);
         found |= u32::from(held == id) << slot;
         empty |= u32::from(held == 0) << slot;
     }
@@ -137,25 +138,36 @@ impl Lines for LinkLines {
     }
 }
 
-/// The union-find while it is being built: slot = [ID key, parent slot + 1 or 0 for a root].
+/// The union-find while it is being built: each slot an ID key and, in the word
+/// that will hold its person, its parent slot + 1, or 0 for a root.
 struct Forest<'a> {
-    slots: &'a [[AtomicU64; 2]],
+    words: &'a [AtomicU64],
     mask: usize,
     shift: u32,
 }
 
 impl Forest<'_> {
+    #[inline(always)]
+    fn id(&self, at: usize) -> &AtomicU64 {
+        unsafe { self.words.get_unchecked(id_word(at)) }
+    }
+
+    #[inline(always)]
+    fn parent(&self, at: usize) -> &AtomicU64 {
+        unsafe { self.words.get_unchecked(id_word(at) + 4) }
+    }
+
     /// The slot of `id`, claiming an empty one if it is new.
     #[inline]
     fn slot(&self, id: Key) -> usize {
         let mut at = home(id, self.shift);
         loop {
-            let seen = self.slots[at][0].load(Ordering::Relaxed);
+            let seen = self.id(at).load(Ordering::Relaxed);
             if seen == id {
                 return at;
             }
             if seen == 0 {
-                match self.slots[at][0].compare_exchange(0, id, Ordering::AcqRel, Ordering::Acquire) {
+                match self.id(at).compare_exchange(0, id, Ordering::AcqRel, Ordering::Acquire) {
                     Ok(_) => return at,
                     Err(other) if other == id => return at,
                     Err(_) => {}
@@ -168,17 +180,17 @@ impl Forest<'_> {
     #[inline]
     fn find(&self, mut at: usize) -> usize {
         loop {
-            let parent = self.slots[at][1].load(Ordering::Acquire);
+            let parent = self.parent(at).load(Ordering::Acquire);
             if parent == 0 {
                 return at;
             }
             let up = (parent - 1) as usize;
-            let grand = self.slots[up][1].load(Ordering::Acquire);
+            let grand = self.parent(up).load(Ordering::Acquire);
             if grand == 0 {
                 return up;
             }
             // Path halving. Losing the race only means someone else shortened it.
-            let _ = self.slots[at][1].compare_exchange_weak(parent, grand, Ordering::AcqRel, Ordering::Relaxed);
+            let _ = self.parent(at).compare_exchange_weak(parent, grand, Ordering::AcqRel, Ordering::Relaxed);
             at = up;
         }
     }
@@ -189,10 +201,10 @@ impl Forest<'_> {
             if a == b {
                 return;
             }
-            let (ka, kb) = (self.slots[a][0].load(Ordering::Relaxed), self.slots[b][0].load(Ordering::Relaxed));
+            let (ka, kb) = (self.id(a).load(Ordering::Relaxed), self.id(b).load(Ordering::Relaxed));
             // The root with the larger ID goes under the one with the smaller.
             let (small, large) = if key::compare(ka, kb).is_lt() { (a, b) } else { (b, a) };
-            if self.slots[large][1].compare_exchange(0, small as u64 + 1, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+            if self.parent(large).compare_exchange(0, small as u64 + 1, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
                 return;
             }
         }
@@ -222,7 +234,7 @@ pub fn build(inputs: &[Input], threads: usize) -> Links {
     // Every edge names at most two new IDs; keep the table under three quarters
     // full (in practice about a third, since most IDs are named by several lines).
     let capacity = (edges * 2 * 4 / 3).max(16).next_power_of_two();
-    let table = sys::map::<[u64; 2]>(capacity);
+    let table = sys::map::<u64>(capacity * 2);
     let (mask, shift) = (capacity - 1, 64 - capacity.trailing_zeros());
     let parsed = since(started);
     if edges == 0 {
@@ -238,15 +250,15 @@ pub fn build(inputs: &[Input], threads: usize) -> Links {
     // Join. The table is all zeros: every slot empty, every node a root.
     sys::parallel(join_threads, |me| {
         let forest = Forest {
-            slots: unsafe { std::slice::from_raw_parts({ shared }.0 as *const [AtomicU64; 2], capacity) },
+            words: unsafe { std::slice::from_raw_parts({ shared }.0 as *const AtomicU64, capacity * 2) },
             mask,
             shift,
         };
         for list in edge_lists.iter().skip(me).step_by(join_threads) {
             for (at, &(a, b)) in list.iter().enumerate() {
                 if let Some(&(next_a, next_b)) = list.get(at + AHEAD) {
-                    sys::prefetch(&forest.slots[home(next_a, shift)]);
-                    sys::prefetch(&forest.slots[home(next_b, shift)]);
+                    sys::prefetch(forest.id(home(next_a, shift)));
+                    sys::prefetch(forest.id(home(next_b, shift)));
                 }
                 let (a, b) = (forest.slot(a), forest.slot(b));
                 forest.join(a, b);
@@ -260,22 +272,22 @@ pub fn build(inputs: &[Input], threads: usize) -> Links {
     let ranges = |me: usize| (capacity * me / join_threads, capacity * (me + 1) / join_threads);
     sys::parallel(join_threads, |me| {
         let forest = Forest {
-            slots: unsafe { std::slice::from_raw_parts({ shared }.0 as *const [AtomicU64; 2], capacity) },
+            words: unsafe { std::slice::from_raw_parts({ shared }.0 as *const AtomicU64, capacity * 2) },
             mask,
             shift,
         };
         let (from, to) = ranges(me);
         for at in from..to {
             if at + AHEAD < to {
-                let parent = forest.slots[at + AHEAD][1].load(Ordering::Relaxed);
+                let parent = forest.parent(at + AHEAD).load(Ordering::Relaxed);
                 if parent != 0 {
-                    sys::prefetch(&forest.slots[(parent - 1) as usize]);
+                    sys::prefetch(forest.id((parent - 1) as usize));
                 }
             }
-            if forest.slots[at][0].load(Ordering::Relaxed) != 0 {
+            if forest.id(at).load(Ordering::Relaxed) != 0 {
                 let root = forest.find(at);
                 if root != at {
-                    forest.slots[at][1].store(root as u64 + 1, Ordering::Release);
+                    forest.parent(at).store(root as u64 + 1, Ordering::Release);
                 }
             }
         }
@@ -284,22 +296,26 @@ pub fn build(inputs: &[Input], threads: usize) -> Links {
     // Each thread writes only the second word of its own slots and reads only
     // first words, which no longer change.
     let counts = sys::parallel(join_threads, |me| {
-        let slots = unsafe { std::slice::from_raw_parts({ shared }.0 as *const [AtomicU64; 2], capacity) };
+        let forest = Forest {
+            words: unsafe { std::slice::from_raw_parts({ shared }.0 as *const AtomicU64, capacity * 2) },
+            mask,
+            shift,
+        };
         let (from, to) = ranges(me);
         let mut ids = 0usize;
         for at in from..to {
             if at + AHEAD < to {
-                let parent = slots[at + AHEAD][1].load(Ordering::Relaxed);
+                let parent = forest.parent(at + AHEAD).load(Ordering::Relaxed);
                 if parent != 0 {
-                    sys::prefetch(&slots[(parent - 1) as usize]);
+                    sys::prefetch(forest.id((parent - 1) as usize));
                 }
             }
-            let id = slots[at][0].load(Ordering::Relaxed);
+            let id = forest.id(at).load(Ordering::Relaxed);
             if id != 0 {
                 ids += 1;
-                let parent = slots[at][1].load(Ordering::Relaxed);
-                let name = if parent == 0 { id } else { slots[(parent - 1) as usize][0].load(Ordering::Relaxed) };
-                slots[at][1].store(name, Ordering::Relaxed);
+                let parent = forest.parent(at).load(Ordering::Relaxed);
+                let name = if parent == 0 { id } else { forest.id((parent - 1) as usize).load(Ordering::Relaxed) };
+                forest.parent(at).store(name, Ordering::Relaxed);
             }
         }
         ids

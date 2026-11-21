@@ -1,11 +1,11 @@
 //! Dedup on event_id: keep the copy with the smallest ingest_ts.
 //!
 //! Only a few percent of events have more than one copy, so the work is finding
-//! them. Each partition is scanned twice against a small bitmap of key hashes:
-//! the first scan marks the hash slots hit more than once, the second collects
-//! the copies in those slots. Only those few are sorted, by (event_id,
-//! ingest_ts); in each run of one event_id the first copy wins and the event
-//! records of the others are marked dropped.
+//! them. Each partition is scanned twice against a small table of two-bit
+//! counters indexed by key hash: the first scan marks the slots hit more than
+//! once, the second collects the copies in those slots. Only those few are
+//! sorted, by (event_id, ingest_ts); in each run of one event_id the first copy
+//! wins and the event records of the others are marked dropped.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -26,8 +26,8 @@ pub fn run(
     let next = AtomicUsize::new(0);
     let partition_bits = 64 - dedup_shift;
     let dropped = sys::parallel(threads, |_| {
-        let mut seen: Vec<u64> = Vec::new();
-        let mut again: Vec<u64> = Vec::new();
+        // Two bits a slot, 32 slots a word: seen once, seen again.
+        let mut state: Vec<u64> = Vec::new();
         let mut suspects: Vec<Copy_> = Vec::new();
         let mut dropped = 0u64;
         loop {
@@ -40,12 +40,10 @@ pub fn run(
                 continue;
             }
             // 16 slots a copy keeps chance collisions near 6%.
-            let bits = (count * 16).next_power_of_two().max(1024);
-            let slot_shift = 64 - bits.trailing_zeros();
-            seen.clear();
-            seen.resize(bits / 64, 0);
-            again.clear();
-            again.resize(bits / 64, 0);
+            let slots = (count * 16).next_power_of_two().max(1024);
+            let slot_shift = 64 - slots.trailing_zeros();
+            state.clear();
+            state.resize(slots / 32, 0);
             // The partition took the hash's top bits; the slot takes the ones below.
             let slot = |copy: &Copy_| ((sys::mix(copy.event) << partition_bits) >> slot_shift) as usize;
             for chunks in &lists {
@@ -53,11 +51,11 @@ pub fn run(
                     let records = unsafe { std::slice::from_raw_parts(copies.at(start), len as usize) };
                     for copy in records {
                         let at = slot(copy);
-                        let (word, bit) = (at >> 6, 1u64 << (at & 63));
                         unsafe {
-                            let had = *seen.get_unchecked(word) & bit;
-                            *again.get_unchecked_mut(word) |= had;
-                            *seen.get_unchecked_mut(word) |= bit;
+                            let word = state.get_unchecked_mut(at >> 5);
+                            let shift = (at & 31) * 2;
+                            let seen = (*word >> shift) & 1;
+                            *word |= (1 | (seen << 1)) << shift;
                         }
                     }
                 }
@@ -68,7 +66,7 @@ pub fn run(
                     let records = unsafe { std::slice::from_raw_parts(copies.at(start), len as usize) };
                     for copy in records {
                         let at = slot(copy);
-                        if unsafe { *again.get_unchecked(at >> 6) } & (1u64 << (at & 63)) != 0 {
+                        if unsafe { *state.get_unchecked(at >> 5) } >> ((at & 31) * 2 + 1) & 1 != 0 {
                             suspects.push(*copy);
                         }
                     }
