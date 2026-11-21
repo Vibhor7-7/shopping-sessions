@@ -29,7 +29,8 @@ Rows up to `fac219f` were read off the page on 2026-11-21; the user made them by
 | Sat 2026-11-21, 12:26 AM | BB-5C420AD1 | `7a5ddaf05a8aa81bd381832f3fff484c5ae6622a` | Scored | 0.80 s | none | |
 | Sat 12:53 AM | BB-DEE36DC7 | `fac219fce1a16f657f26dacc27a532c5fed06d8b` | Scored | 0.78 s | none | Was the entry for the final until 3:23 AM |
 | Sat 3:23 AM | BB-34D7EB6F | `8527c64796f2913b4ba12a14e46291c19d2fbad8` | Scored | 0.76 s | none | Submitted by the unattended cycle 4 (experiments 27 to 29). Scored by the time the page was looked at again, 8 minutes later. Entered in the final as the best score, by the page, without anyone choosing. 15th of 208 teams then; the board's best was 0.42 s. Was the entry for the final until 6:50 AM |
-| Sat 6:50 AM | BB-B16F12E9 | `e6ccab26927b27db7f100f68e403caf7e501854e` | Scored | **0.73 s** | none | Submitted by the unattended cycle 9 (experiments 30 to 34; the code is `026badd`). "Scoring" 35 seconds after Submit, "Scored" 70 seconds after it. Entered in the final as the best score, by the page, without anyone choosing. 18th of 241 teams; the board's best is 0.31 s |
+| Sat 6:50 AM | BB-B16F12E9 | `e6ccab26927b27db7f100f68e403caf7e501854e` | Scored | 0.73 s | none | Submitted by the unattended cycle 9 (experiments 30 to 34; the code is `026badd`). "Scoring" 35 seconds after Submit, "Scored" 70 seconds after it. Entered in the final as the best score, by the page, without anyone choosing. 18th of 241 teams then; the board's best was 0.31 s. Was the entry for the final until 9:08 AM |
+| Sat 9:08 AM | BB-83224571 | `252674a6f70b51a19e20b26eb9ca9a0485ed95fe` | Scored | **0.69 s** | none | Submitted by the unattended cycle 13 (experiments 35 to 38). Still "Scoring" 55 seconds after Submit, "Scored" when looked at again 13 seconds later. Entered in the final as the best score, by the page, without anyone choosing. 19th of 260 teams; the board's best is 0.31 s, the next four 0.36 to 0.54 s |
 
 ## Not submitted
 
