@@ -46,3 +46,24 @@ memory, and image size. Flag anything that could fail on hidden data.
   runs them interleaved on a GitHub x86 machine (about 1% noise). Runner CPUs
   differ from run to run, so compare only within one run.
 - Only a score from the track page is the truth. Record each one in BENCH.md.
+
+# How the work is done here
+- Submissions are the user's: hand over a full commit hash whose CI is green,
+  with the report "Before each real submission" asks for. They submit it on the
+  track page (2 an hour) and report the score. Never claim a scored time.
+- An experiment is a branch: push it, then
+  `gh workflow run bench.yml --ref <branch> -f base=<commit it grew from>`,
+  read it with `scripts/bench_result.sh <run id>`. Kept: fast-forward main and
+  delete the branch. Not kept: delete the branch. Either way a row in BENCH.md.
+- The same workflow takes `-f events=60000000` (the final's size),
+  `-f runs=N`, and `-f sweep="A=1;B=2 C=3" -f sweep_threads="4 1"` to try
+  settings on one commit. `profile.yml` gives instructions and mispredictions
+  per source line; `overhead.yml` splits a container's time around the process.
+- The final is scored at 60M: check a change there too before keeping it, when
+  it touches memory layout, buffers or partition counts.
+- Do not generate the 60M dataset on the development Mac: the disk has room
+  for neither it nor an honest timing. 60M numbers come from the workflow.
+- Branch `probe` is not for scoring: it fails the dev check on purpose so the
+  track page shows its log (see BENCH.md). Merge main into it before use.
+- In zsh, `env $settings command` does not split `$settings`; use
+  `sh -c "$settings command"`.

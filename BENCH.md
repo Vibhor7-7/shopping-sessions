@@ -13,8 +13,9 @@
 | --- | --- | --- | --- |
 | 2026-11-20 | `d698c87` | 1.05 s | First submission. Debian runtime image, 115 MB. |
 | 2026-11-20 | `7f9bffe` | 0.96 s | 18% less in-process time on x86 A/B, but only 9% less on the scorer. Leaderboard top: 0.40 s. |
+| 2026-11-20 | `e03e2c3` | **0.82 s** | BusyBox image (experiment 16) and write-combining buffers (18 to 20) together: 15% less than `7f9bffe`. Leaderboard top: 0.40 s. |
 
-The gap between "18% less in-process" and "9% less scored" is what experiment 16 is about.
+The gap between "18% less in-process" and "9% less scored" is what experiment 16 was about. `e03e2c3` carries both the image change and experiments 18 to 20, so its score does not separate them: the x86 A/B gave 6% (Zen 4) to 12% (Ice Lake) for 18 to 20 alone, the scorer 15% for both. `c5b2dfd` (the image change alone) was never submitted; submitting it is the only way to split the two.
 
 ## Experiments
 
@@ -38,7 +39,7 @@ Rows 1 to 15 were run before this log existed and are reconstructed from the ben
 | 14 | Link table as 4 IDs + 4 people per cache line; dedup with one two-bit array | `b58dc53` | 821 → 809 (Zen 4), −1.5% | n/a | yes | kept |
 | 15 | Direct comparison of #1 with #11 | `d698c87` vs `6bbe143` | 945 → 825 (Zen 4), −12.7% | n/a | n/a | measurement only |
 | — | Baseline for what follows | `7f9bffe` | — | 384 / 413, peak 1259 MB | yes | — |
-| 16 | Runtime image BusyBox (2.3 MB) instead of Debian (115 MB); binary unchanged | `c5b2dfd` | 1261 → 1257 (Zen 3): in-process identical, as it must be. `docker run` wall on the runner is the same for both images (Docker mounts layers, it does not unpack them) | not rerun: same binary | yes | **awaiting a score.** Only the scorer can show whether its sandboxes pay for image size |
+| 16 | Runtime image BusyBox (2.3 MB) instead of Debian (115 MB); binary unchanged | `c5b2dfd` | 1261 → 1257 (Zen 3): in-process identical, as it must be. `docker run` wall on the runner is the same for both images (Docker mounts layers, it does not unpack them) | not rerun: same binary | yes | kept. Scored only together with 18 to 20, as `e03e2c3`: 0.96 → 0.82 s. What the image alone is worth is still unknown |
 | 17 | Measurement: where a container's time goes outside the process (`overhead` workflow, 60M events, GitHub's Docker) | `c24627f` | per run: ~80 ms before `main`, ~2880 ms in the process, ~45 ms after it with output on tmpfs, ~80 ms with output on disk. The first run after an image is built: 6 s before `main`, once | n/a | n/a | measurement only. Under Docker, 0.13 to 0.16 s per run is outside the process, whatever the image and limits; writing 222 MB to disk adds ~35 ms after the process and nothing inside it. Says nothing about the scorer's `runc` sandboxes |
 | — | Thread count on 2 cores / 4 hyperthreads (Ice Lake Xeon 8370C, the scorer's class of CPU) | `1cac78b` | 2 threads 1812, 3 threads 1643, **4 threads 1492**, 6 threads 1518, 8 threads 1523 | n/a | n/a | measurement only: the second hyperthread of a core is worth 21%; more threads than hyperthreads costs 2% |
 | 18 | Event and copy records leave the parser through write-combining buffers and non-temporal stores (no cache line of fresh output is fetched just to be overwritten) | `9fcffee` | **1514 → 1334 (Ice Lake 8370C), −12%**; parse 1110 → 931 (−16%); one thread: parse 2688 → 2152 (−20%) | 374 / 401, peak 1269 MB (ARM has no such stores; no change expected there) | yes | **kept** |
@@ -74,7 +75,7 @@ Notes on the 60M runs:
 
 ## To try, most promising first
 
-1. **Read the scorer**: the score of `e03e2c3` (experiments 16 and 18 to 20 together) and, if spent, the probe's log. Most of what follows depends on them.
+1. **Read the scorer's machine**: the probe's log, if the user spends a submission on it (merge `main` into `probe` first and hand over the new commit). Items 2 and 3 wait for it; 4 to 6 do not.
 2. **`mmap` again, if the scorer is bare metal.** It lost on virtual machines because of page-table walks (experiment 10); on bare metal those are cheap and the copy it saves is 6% of the run.
 3. **AVX-512 stage one**, if the probe shows it does not slow the scalar code around it.
 4. **More of what experiment 18 did**: memory the pipeline writes once and reads later. The people phase's staging arrays and the output buffers are the candidates.
