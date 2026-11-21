@@ -12,6 +12,9 @@ on:
       lines:
         description: How many source lines to list
         default: "110"
+      perf_events:
+        description: Events in the dataset for the sampled (perf) profile; 0 skips it
+        default: "20000000"
 
 jobs:
   profile:
@@ -30,6 +33,24 @@ jobs:
           NCPU=1 valgrind --tool=callgrind --branch-sim=yes --cache-sim=yes --compress-strings=no --compress-pos=no \
             --callgrind-out-file=callgrind.out target/release/pipeline data out 2>&1 | grep -E "pipeline:|Collected|refs|rate" || true
           python3 scripts/hot_lines.py callgrind.out ${{ inputs.lines }}
+      # callgrind counts instructions; this says where the time is, which is not
+      # the same thing where memory is the limit. Hosted runners expose no hardware
+      # counters, so the samples are taken on the CPU clock.
+      - name: Where the time goes, 4 threads (perf, sampled on the CPU clock)
+        if: inputs.perf_events != '0'
+        run: |
+          sudo apt-get install -y -qq linux-tools-common linux-tools-generic "linux-tools-$(uname -r)" > /dev/null 2>&1 || true
+          PERF=$(ls /usr/lib/linux-tools*/*/perf 2>/dev/null | head -1); echo "perf: ${PERF:-none}; kernel $(uname -r)"
+          [ -n "$PERF" ] || exit 0
+          sudo sysctl -q kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0 || true
+          grep -m1 'model name' /proc/cpuinfo
+          target/release/synth --events ${{ inputs.perf_events }} --clicks $(( ${{ inputs.perf_events }} / 4 )) --seed 9 --output big
+          cat big/events/* big/clicks/* big/links/* > /dev/null
+          NCPU=4 "$PERF" record -e cpu-clock -F 4000 -o perf.data target/release/pipeline big out2 2>&1 | grep -E "pipeline: (links|inside)|perf record" || true
+          echo "--- by function"
+          "$PERF" report -i perf.data --stdio --sort dso,symbol --percent-limit 0.4 2>/dev/null | grep -v -E "^#|^$" | cut -c1-200 | head -40
+          echo "--- by source line"
+          "$PERF" report -i perf.data --stdio --sort srcline --percent-limit 0.2 2>/dev/null | grep -v -E "^#|^$" | cut -c1-160 | head -170
       - uses: actions/upload-artifact@v4
         with:
           name: callgrind
