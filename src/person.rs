@@ -126,6 +126,28 @@ struct Group {
     clicks: Vec<[u64; 2]>,
 }
 
+/// The table that numbers a partition's people, as a loop over records holds
+/// it: in registers. Read through `&self` instead, every probe fetched the two
+/// arrays' addresses, the mask and the shifts from memory again, because a
+/// store through a raw pointer may, for all the compiler knows, have changed
+/// them (BENCH.md, experiment 41).
+#[derive(Clone, Copy)]
+struct Probe {
+    keys: *const Key,
+    values: *const u32,
+    mask: usize,
+    shift: u32,
+    bits: u32,
+}
+
+impl Probe {
+    /// Where the search for `person` starts.
+    #[inline(always)]
+    fn home(&self, person: Key) -> usize {
+        ((sys::mix(person) << self.bits) >> self.shift) as usize
+    }
+}
+
 impl Group {
     fn reset(&mut self, expected_people: usize) {
         let capacity = (expected_people * 2).max(64).next_power_of_two();
@@ -143,35 +165,15 @@ impl Group {
         ((sys::mix(person) << self.bits) >> self.shift) as usize
     }
 
-    /// The person's number in this partition, or ABSENT.
-    #[inline(always)]
-    fn find(&self, person: Key) -> u32 {
-        let mut at = self.home(person);
-        loop {
-            let seen = unsafe { *self.keys.get_unchecked(at) };
-            if seen == person {
-                return unsafe { *self.values.get_unchecked(at) };
-            }
-            if seen == 0 {
-                return ABSENT;
-            }
-            at = (at + 1) & self.mask;
-        }
+    /// Where the table is, to be held in registers by a loop over records.
+    fn probe(&self) -> Probe {
+        Probe { keys: self.keys.as_ptr(), values: self.values.as_ptr(), mask: self.mask, shift: self.shift, bits: self.bits }
     }
 
-    #[inline(always)]
-    fn find_or_add(&mut self, person: Key) -> u32 {
-        let mut at = self.home(person);
-        loop {
-            let seen = unsafe { *self.keys.get_unchecked(at) };
-            if seen == person {
-                return unsafe { *self.values.get_unchecked(at) };
-            }
-            if seen == 0 {
-                break;
-            }
-            at = (at + 1) & self.mask;
-        }
+    /// A person not seen before, into the free slot their search ended at.
+    /// Returns their number. The table may have moved: `probe` again.
+    #[inline(never)]
+    fn add(&mut self, at: usize, person: Key) -> u32 {
         let number = self.people.len() as u32;
         self.keys[at] = person;
         self.values[at] = number;
@@ -217,6 +219,11 @@ impl Group {
         total as usize
     }
 
+    /// Every loop below keeps the addresses it reads and writes through in
+    /// registers (raw pointers taken once), and reads a cursor once for each
+    /// record it places: indexed through `self`, each array's address was
+    /// fetched again for every record, about 18 loads an event over the three
+    /// passes, and a cursor was read three times (BENCH.md, experiment 41).
     fn load(&mut self, setup: &Setup, events: &[&Chunks], clicks: &[&Chunks], partition: usize) {
         let event_count: usize = events.iter().map(|c| c[partition].iter().map(|x| x.1 as usize).sum::<usize>()).sum();
         self.reset(event_count / 12);
@@ -226,22 +233,43 @@ impl Group {
         self.bin_cursor.resize(setup.bins + 1, 0);
         // Pass 1: number the people, count events per person and per bin.
         let mut seen = 0;
-        for chunks in events {
-            for &(start, len) in &chunks[partition] {
-                let records: &[Event] = unsafe { std::slice::from_raw_parts(setup.pools.events.at(start), len as usize) };
-                for record in records {
-                    let number = if record.ts == DROPPED {
-                        ABSENT
-                    } else {
-                        let number = self.find_or_add(record.person);
-                        unsafe {
-                            *self.event_cursor.get_unchecked_mut(number as usize) += 1;
-                            *self.bin_cursor.get_unchecked_mut((record.ts / SESSION_GAP_MS) as usize) += 1;
-                        }
-                        number
-                    };
-                    unsafe { *self.event_person.as_mut_ptr().add(seen) = number };
-                    seen += 1;
+        {
+            let event_person = self.event_person.as_mut_ptr();
+            let bin_cursor = self.bin_cursor.as_mut_ptr();
+            let mut probe = self.probe();
+            let mut event_cursor = self.event_cursor.as_mut_ptr();
+            for chunks in events {
+                for &(start, len) in &chunks[partition] {
+                    let records: &[Event] = unsafe { std::slice::from_raw_parts(setup.pools.events.at(start), len as usize) };
+                    for record in records {
+                        let number = if record.ts == DROPPED {
+                            ABSENT
+                        } else {
+                            unsafe {
+                                let person = record.person;
+                                let mut at = probe.home(person);
+                                let number = loop {
+                                    let held = *probe.keys.add(at);
+                                    if held == person {
+                                        break *probe.values.add(at);
+                                    }
+                                    if held == 0 {
+                                        // A new person. Their counter is pushed, and the table may grow: both can move.
+                                        let number = self.add(at, person);
+                                        probe = self.probe();
+                                        event_cursor = self.event_cursor.as_mut_ptr();
+                                        break number;
+                                    }
+                                    at = (at + 1) & probe.mask;
+                                };
+                                *event_cursor.add(number as usize) += 1;
+                                *bin_cursor.add((record.ts / SESSION_GAP_MS) as usize) += 1;
+                                number
+                            }
+                        };
+                        unsafe { *event_person.add(seen) = number };
+                        seen += 1;
+                    }
                 }
             }
         }
@@ -266,66 +294,107 @@ impl Group {
             self.events.set_len(live);
         }
         // Pass 2: into bin order.
-        let mut at = 0;
-        for chunks in events {
-            for &(start, len) in &chunks[partition] {
-                let records: &[Event] = unsafe { std::slice::from_raw_parts(setup.pools.events.at(start), len as usize) };
-                for record in records {
-                    let number = unsafe { *self.event_person.get_unchecked(at) };
-                    at += 1;
-                    if number != ABSENT {
-                        unsafe {
-                            let cursor = self.bin_cursor.get_unchecked_mut((record.ts / SESSION_GAP_MS) as usize);
-                            *self.staged.get_unchecked_mut(*cursor as usize) = (u64::from(record.ts) << 32) | u64::from(record.purchase);
-                            *self.staged_person.get_unchecked_mut(*cursor as usize) = number;
-                            *cursor += 1;
+        {
+            let event_person = self.event_person.as_ptr();
+            let bin_cursor = self.bin_cursor.as_mut_ptr();
+            let staged = self.staged.as_mut_ptr();
+            let staged_person = self.staged_person.as_mut_ptr();
+            let mut at = 0;
+            for chunks in events {
+                for &(start, len) in &chunks[partition] {
+                    let records: &[Event] = unsafe { std::slice::from_raw_parts(setup.pools.events.at(start), len as usize) };
+                    for record in records {
+                        let number = unsafe { *event_person.add(at) };
+                        at += 1;
+                        if number != ABSENT {
+                            unsafe {
+                                let cursor = bin_cursor.add((record.ts / SESSION_GAP_MS) as usize);
+                                let place = *cursor;
+                                *staged.add(place as usize) = (u64::from(record.ts) << 32) | u64::from(record.purchase);
+                                *staged_person.add(place as usize) = number;
+                                *cursor = place + 1;
+                            }
                         }
                     }
                 }
             }
         }
         // Pass 3: to each person, keeping the bin order.
-        for at in 0..live {
-            unsafe {
-                let cursor = self.event_cursor.get_unchecked_mut(*self.staged_person.get_unchecked(at) as usize);
-                *self.events.get_unchecked_mut(*cursor as usize) = *self.staged.get_unchecked(at);
-                *cursor += 1;
+        {
+            let staged = self.staged.as_ptr();
+            let staged_person = self.staged_person.as_ptr();
+            let event_cursor = self.event_cursor.as_mut_ptr();
+            let sorted = self.events.as_mut_ptr();
+            for at in 0..live {
+                unsafe {
+                    let cursor = event_cursor.add(*staged_person.add(at) as usize);
+                    let place = *cursor;
+                    *sorted.add(place as usize) = *staged.add(at);
+                    *cursor = place + 1;
+                }
             }
         }
 
         // Clicks of people with no surviving event credit nothing: they are left out.
+        let click_count: usize = clicks.iter().map(|c| c[partition].iter().map(|x| x.1 as usize).sum::<usize>()).sum();
         self.click_cursor.clear();
         self.click_cursor.resize(self.people.len(), 0);
         self.click_person.clear();
-        for chunks in clicks {
-            for &(start, len) in &chunks[partition] {
-                let records: &[Click] = unsafe { std::slice::from_raw_parts(setup.pools.clicks.at(start), len as usize) };
-                for record in records {
-                    let number = self.find(record.person);
-                    if number != ABSENT {
-                        unsafe { *self.click_cursor.get_unchecked_mut(number as usize) += 1 };
+        self.click_person.reserve(click_count);
+        let mut seen = 0;
+        {
+            let probe = self.probe();
+            let click_cursor = self.click_cursor.as_mut_ptr();
+            let click_person = self.click_person.as_mut_ptr();
+            for chunks in clicks {
+                for &(start, len) in &chunks[partition] {
+                    let records: &[Click] = unsafe { std::slice::from_raw_parts(setup.pools.clicks.at(start), len as usize) };
+                    for record in records {
+                        unsafe {
+                            let person = record.person;
+                            let mut at = probe.home(person);
+                            let number = loop {
+                                let held = *probe.keys.add(at);
+                                if held == person {
+                                    let number = *probe.values.add(at);
+                                    *click_cursor.add(number as usize) += 1;
+                                    break number;
+                                }
+                                if held == 0 {
+                                    break ABSENT;
+                                }
+                                at = (at + 1) & probe.mask;
+                            };
+                            *click_person.add(seen) = number;
+                        }
+                        seen += 1;
                     }
-                    self.click_person.push(number);
                 }
             }
         }
+        unsafe { self.click_person.set_len(seen) };
         let kept = Self::offsets(&mut self.click_cursor, &mut self.click_start);
         self.clicks.clear();
         self.clicks.reserve(kept);
         unsafe { self.clicks.set_len(kept) };
-        let mut at = 0;
-        for chunks in clicks {
-            for &(start, len) in &chunks[partition] {
-                let records: &[Click] = unsafe { std::slice::from_raw_parts(setup.pools.clicks.at(start), len as usize) };
-                for record in records {
-                    let number = unsafe { *self.click_person.get_unchecked(at) };
-                    at += 1;
-                    if number != ABSENT {
-                        unsafe {
-                            let cursor = self.click_cursor.get_unchecked_mut(number as usize);
-                            *self.clicks.get_unchecked_mut(*cursor as usize) =
-                                [(u64::from(record.ts) << 32) | u64::from(record.campaign), record.click];
-                            *cursor += 1;
+        {
+            let click_person = self.click_person.as_ptr();
+            let click_cursor = self.click_cursor.as_mut_ptr();
+            let sorted = self.clicks.as_mut_ptr();
+            let mut at = 0;
+            for chunks in clicks {
+                for &(start, len) in &chunks[partition] {
+                    let records: &[Click] = unsafe { std::slice::from_raw_parts(setup.pools.clicks.at(start), len as usize) };
+                    for record in records {
+                        let number = unsafe { *click_person.add(at) };
+                        at += 1;
+                        if number != ABSENT {
+                            unsafe {
+                                let cursor = click_cursor.add(number as usize);
+                                let place = *cursor;
+                                *sorted.add(place as usize) = [(u64::from(record.ts) << 32) | u64::from(record.campaign), record.click];
+                                *cursor = place + 1;
+                            }
                         }
                     }
                 }
