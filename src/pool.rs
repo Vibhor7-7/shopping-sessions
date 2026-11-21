@@ -73,7 +73,7 @@ struct Pending<T> {
 /// threads of a core together. On one huge page they are a single entry.
 /// Measured (BENCH.md, experiment 32): parse 1 to 2% faster with two threads
 /// to a core, no different with one. That the TLB is why is a reading of
-/// those two numbers and of the profile, not something counted.
+/// those two numbers, not something counted.
 pub struct Arena {
     next: usize,
     end: usize,

@@ -43,7 +43,7 @@ Things that make it fast:
 - **No branch the CPU cannot predict on the hot path.** Which of the three forms a `ts` takes, and whether a user ID is linked, are coin tosses from line to line; both answers are computed and selected. The date part of a timestamp is a table hit.
 - **Lookups are prefetched.** The link table is larger than the cache; each line asks for its cache line 12 lines before reading it, and the four slots of that line are compared at once. Reading it names the person, so the partitions the line's records go to: those are asked for then, 4 lines before the records are written.
 - **Catalog IDs by number.** The files' own IDs are a prefix and a number (`c_45`, `p123`); text of exactly that shape is looked up in a small array by the number, anything else in a map that holds every ID.
-- **Huge pages.** Every buffer of 32 KB or more is on memory advised for transparent huge pages (`src/sys.rs`): fewer page faults, fewer TLB misses, less for the kernel to free at exit.
+- **Huge pages.** Every buffer of 32 KB or more is on memory advised for transparent huge pages (`src/sys.rs`): fewer page faults, fewer TLB misses, less for the kernel to free at exit. A parse thread's write-combining buffers and partition states, which every record goes through, share one huge page (`pool::Arena`).
 
 Exactness limits, none of which the generator can reach: the window must be shorter than 42 days (timestamps are stored as 32-bit offsets), and `ingest_ts` is compared in whole seconds (it is always form F1).
 
