@@ -23,6 +23,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Build with line tables
         run: |
+          sudo apt-get update -qq > /dev/null 2>&1 || true
           sudo apt-get install -y -qq valgrind > /dev/null
           # Cargo strips a release build's line tables unless told to keep them.
           export CARGO_PROFILE_RELEASE_DEBUG=line-tables-only CARGO_PROFILE_RELEASE_STRIP=none
