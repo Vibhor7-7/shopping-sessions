@@ -1,9 +1,9 @@
 //! Partitioned record streams.
 //!
 //! While parsing, each thread appends records to one of P partitions. A
-//! partition is a list of fixed-size chunks carved out of 4 MB slabs; a record
-//! never moves once written, and every record has a global 32-bit index, so a
-//! later phase can point at one (the dedup phase does, to drop the losing
+//! partition is a list of fixed-size chunks carved out of slabs; a record never
+//! moves once it is in its chunk, and every record has a global 32-bit index,
+//! so a later phase can point at one (the dedup phase does, to drop the losing
 //! copies of an event).
 
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
@@ -51,106 +51,19 @@ impl<T> Pool<T> {
     }
 }
 
-struct Tail<T> {
-    cur: *mut T,
-    end: *mut T,
-    /// Global index one past the chunk's last slot.
-    end_index: u32,
-}
-
-/// One thread's write side: a tail per partition.
-pub struct Scatter<'p, T> {
-    pool: &'p Pool<T>,
-    tails: Vec<Tail<T>>,
-    /// Finished chunks per partition: (global index of the first record, records).
-    chunks: Vec<Vec<(u32, u32)>>,
-    chunk: u32,
-    slab: *mut T,
-    slab_index: u32,
-    slab_left: u32,
-}
-
-/// What a thread leaves behind: per partition, its chunks.
+/// What a thread leaves behind: per partition, its chunks as (global index of the first record, records).
 pub type Chunks = Vec<Vec<(u32, u32)>>;
 
-impl<'p, T: Copy> Scatter<'p, T> {
-    /// `chunk` records per chunk, a power of two no larger than a slab.
-    pub fn new(pool: &'p Pool<T>, partitions: usize, chunk: usize) -> Self {
-        assert!(chunk.is_power_of_two() && chunk <= SLAB_RECORDS);
-        Self {
-            pool,
-            tails: (0..partitions)
-                .map(|_| Tail { cur: std::ptr::null_mut(), end: std::ptr::null_mut(), end_index: 0 })
-                .collect(),
-            chunks: vec![Vec::new(); partitions],
-            chunk: chunk as u32,
-            slab: std::ptr::null_mut(),
-            slab_index: 0,
-            slab_left: 0,
-        }
-    }
-
-    /// Appends `record` to `partition` and returns its global index.
-    #[inline(always)]
-    pub fn push(&mut self, partition: usize, record: T) -> u32 {
-        unsafe {
-            if (*self.tails.as_ptr().add(partition)).cur == (*self.tails.as_ptr().add(partition)).end {
-                self.refill(partition);
-            }
-            let tail = &mut *self.tails.as_mut_ptr().add(partition);
-            tail.cur.write(record);
-            let index = tail.end_index - tail.end.offset_from(tail.cur) as u32;
-            tail.cur = tail.cur.add(1);
-            index
-        }
-    }
-
-    #[cold]
-    #[inline(never)]
-    fn refill(&mut self, partition: usize) {
-        if !self.tails[partition].cur.is_null() {
-            self.chunks[partition].push((self.tails[partition].end_index - self.chunk, self.chunk));
-        }
-        if self.slab_left == 0 {
-            let (index, slab) = self.pool.grab();
-            self.slab = slab;
-            self.slab_index = index;
-            self.slab_left = SLAB_RECORDS as u32;
-        }
-        let tail = &mut self.tails[partition];
-        tail.cur = self.slab;
-        unsafe {
-            tail.end = self.slab.add(self.chunk as usize);
-            self.slab = tail.end;
-        }
-        self.slab_index += self.chunk;
-        tail.end_index = self.slab_index;
-        self.slab_left -= self.chunk;
-    }
-
-    pub fn finish(mut self) -> Chunks {
-        for (tail, chunks) in self.tails.iter().zip(&mut self.chunks) {
-            if !tail.cur.is_null() {
-                let free = unsafe { tail.end.offset_from(tail.cur) } as u32;
-                if free < self.chunk {
-                    chunks.push((tail.end_index - self.chunk, self.chunk - free));
-                }
-            }
-        }
-        self.chunks
-    }
-}
-
-/// Where a partition's buffered cache line of records will go.
+/// Where a partition's buffered records will go.
 struct Pending<T> {
-    /// The line's place in the chunk; null before the partition's first record.
+    /// The buffer's place in the chunk; null before the partition's first record.
     line: *mut T,
     /// Global index of the next record pushed, and one past the chunk's last.
     index: u32,
     end_index: u32,
 }
 
-/// `Scatter` through write-combining buffers of `N` records.
+/// One thread's write side: for each partition, a write-combining buffer of `N` records.
 ///
 /// A thread appends to a couple of thousand partitions in turn, each into
 /// memory nothing has touched yet. Written directly, every new cache line of
