@@ -185,7 +185,10 @@ impl Dates {
     fn slot(day: u16) -> usize {
         #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
         unsafe {
-            std::arch::x86_64::_pext_u32(u32::from(day), 0x0f03) as usize
+            // The mask is read from memory by the `pext` itself (as `InPlace` is):
+            // as a constant it takes a register the line loop does not have.
+            static BITS: u32 = 0x0f03;
+            std::arch::x86_64::_pext_u32(u32::from(day), std::ptr::read_volatile(&BITS)) as usize
         }
         #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
         {
