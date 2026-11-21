@@ -211,26 +211,26 @@ static OUTSIDE_BY_LOW: [u8; 16] = [
     1 | 8 | 16,
 ];
 
-/// The keys of the two IDs a line starts with, both at once: `key_of_padded`
-/// of `a`, which must not be empty, and of `b`, or 0 for an empty `b`. Both
-/// must be in the reader's buffer (16 readable bytes at each, whatever the lengths).
+/// The packed keys of two IDs at once, if both pack: `pack_padded` of each, or
+/// `None` if either is empty, too long or holds a character outside the
+/// alphabet. 16 bytes must be readable at each, whatever the lengths.
 ///
-/// Nearly every line has two IDs that pack, so the two share one 256-bit
-/// register, a half each, and every step `pack_padded` takes is taken once for
-/// both. The 6-bit codes are then put side by side with two multiply-adds
-/// (pairs, then fours: a code times 64 plus the next, a pair times 4096 plus
-/// the next) and one shuffle that lays the three fours of ten characters end to
-/// end, where one ID alone goes through `pext` and a handful of shifts. About
-/// 40 instructions for the two where two calls of `pack_padded` take about 80
-/// (counted in the compiled code; BENCH.md, experiment 35). An ID that does not
-/// pack, or an empty one, sends both the slow way, one at a time.
+/// The two share one 256-bit register, a half each, and every step
+/// `pack_padded` takes is taken once for both. The 6-bit codes are then put
+/// side by side with two multiply-adds (pairs, then fours: a code times 64
+/// plus the next, a pair times 4096 plus the next) and one shuffle that lays
+/// the three fours of ten characters end to end, where one ID alone goes
+/// through `pext` and a handful of shifts. About 40 instructions for the two
+/// where two calls of `pack_padded` take about 80 (counted in the compiled
+/// code; BENCH.md, experiment 35).
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 #[inline(always)]
-pub unsafe fn keys_of_two_padded(a: *const u8, a_len: usize, b: *const u8, b_len: usize) -> (Key, Key) {
+unsafe fn pack_two_padded(a: *const u8, a_len: usize, b: *const u8, b_len: usize) -> Option<(Key, Key)> {
     use std::arch::x86_64::*;
-    // Both 1 to 10 characters long: one compare, since 0 - 1 is the largest number there is.
-    if (a_len.wrapping_sub(1) | b_len.wrapping_sub(1)) > 9 {
-        return keys_of_two_apart(a, a_len, b, b_len);
+    // Both 1 to 10 characters long. The larger of the two decides, and 0 - 1 is
+    // the largest number there is. (Not the two ORed together: 7 | 8 is 15.)
+    if a_len.wrapping_sub(1).max(b_len.wrapping_sub(1)) > 9 {
+        return None;
     }
     let both = |first: *const u8, second: *const u8| {
         _mm256_inserti128_si256(_mm256_castsi128_si256(_mm_loadu_si128(first as *const __m128i)), _mm_loadu_si128(second as *const __m128i), 1)
@@ -243,7 +243,7 @@ pub unsafe fn keys_of_two_padded(a: *const u8, a_len: usize, b: *const u8, b_len
     let low = _mm256_and_si256(bytes, nibble);
     let outside = _mm256_and_si256(_mm256_shuffle_epi8(twice(&OUTSIDE_BY_HIGH), high), _mm256_shuffle_epi8(twice(&OUTSIDE_BY_LOW), low));
     if _mm256_testz_si256(outside, keep) == 0 {
-        return keys_of_two_apart(a, a_len, b, b_len);
+        return None;
     }
     let underscore = _mm256_and_si256(_mm256_cmpeq_epi8(bytes, _mm256_set1_epi8(b'_' as i8)), _mm256_set1_epi8(-4));
     let codes = _mm256_add_epi8(_mm256_add_epi8(bytes, _mm256_shuffle_epi8(twice(&CODE_OFFSET), high)), underscore);
@@ -260,12 +260,22 @@ pub unsafe fn keys_of_two_padded(a: *const u8, a_len: usize, b: *const u8, b_len
         9, 10, 4, 5, 6, 0, 1, 2, -1, -1, -1, -1, -1, -1, -1, -1,
     );
     let keys = _mm256_shuffle_epi8(fours, order);
-    (_mm256_extract_epi64(keys, 0) as u64, _mm256_extract_epi64(keys, 2) as u64)
+    Some((_mm256_extract_epi64(keys, 0) as u64, _mm256_extract_epi64(keys, 2) as u64))
 }
 
-#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+/// The keys of the two IDs a line starts with: `key_of_padded` of `a`, which
+/// must not be empty, and of `b`, or 0 for an empty `b`. Both must be in the
+/// reader's buffer (16 readable bytes at each, whatever the lengths).
+///
+/// Nearly every line has two IDs that pack, and those are packed together
+/// (`pack_two_padded`). A line with an ID that does not pack, or with an empty
+/// one, takes both the slow way, one at a time.
 #[inline(always)]
 pub unsafe fn keys_of_two_padded(a: *const u8, a_len: usize, b: *const u8, b_len: usize) -> (Key, Key) {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    if let Some(keys) = pack_two_padded(a, a_len, b, b_len) {
+        return keys;
+    }
     keys_of_two_apart(a, a_len, b, b_len)
 }
 
@@ -482,7 +492,29 @@ mod tests {
             z ^ (z >> 31)
         };
         let expected = |id: &[u8]| if id.is_empty() { 0 } else { key_of(id) };
+        // Two IDs that both pack are packed together, and no others are: the
+        // slow way gives the same keys, so only this tells the two ways apart.
+        let together = |a: &[u8], b: &[u8]| {
+            #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+            {
+                let both = (pack(a), pack(b));
+                let got = unsafe { pack_two_padded(a.as_ptr(), a.len(), b.as_ptr(), b.len()) };
+                assert_eq!(got, (both.0 != 0 && both.1 != 0).then_some(both), "together: {a:?} and {b:?}");
+            }
+            let _ = (a, b);
+        };
         let alphabet = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz";
+        // Every pair of lengths, empty and too long among them, of IDs that are otherwise fine.
+        for a_len in 0..=13usize {
+            for b_len in 0..=13usize {
+                let buffer = *b"u123456789abcdefghijklmnopqrstuv,Zyxwvutsrqponmlkjihgfedcba987654";
+                let (a, b) = (&buffer[..a_len], &buffer[33..33 + b_len]);
+                together(a, b);
+                if a_len != 0 {
+                    assert_eq!(unsafe { keys_of_two_padded(a.as_ptr(), a_len, b.as_ptr(), b_len) }, (expected(a), expected(b)), "lengths {a_len} and {b_len}");
+                }
+            }
+        }
         let (mut both_packed, mut one_exotic) = (0, 0);
         for round in 0..400_000 {
             let mut buffer = [0u8; 64];
@@ -502,6 +534,7 @@ mod tests {
             let (a, b) = (&buffer[..a_len], &buffer[b_at..b_at + b_len]);
             let got = unsafe { keys_of_two_padded(a.as_ptr(), a_len, b.as_ptr(), b_len) };
             assert_eq!(got, (expected(a), expected(b)), "round {round}: {a:?} and {b:?}");
+            together(a, b);
             both_packed += usize::from(is_packed(got.0) && got.1 != 0 && is_packed(got.1));
             one_exotic += usize::from(is_packed(got.0) != is_packed(got.1) && got.1 != 0);
         }
@@ -516,12 +549,15 @@ mod tests {
                     let (a, b) = (&buffer[..len], &buffer[32..32 + len]);
                     assert_eq!(unsafe { keys_of_two_padded(a.as_ptr(), len, b.as_ptr(), len) }, (expected(a), expected(b)), "byte {byte} at {place} of {len}");
                     assert_eq!(unsafe { keys_of_two_padded(b.as_ptr(), len, a.as_ptr(), len) }, (expected(b), expected(a)), "byte {byte} at {place} of {len}, second");
+                    together(a, b);
+                    together(b, a);
                     // The bytes after an ID are not part of it, whatever they are.
                     buffer[place] = b'u';
                     buffer[len] = byte;
                     buffer[32 + len] = byte;
                     let (a, b) = (&buffer[..len], &buffer[32..32 + len]);
                     assert_eq!(unsafe { keys_of_two_padded(a.as_ptr(), len, b.as_ptr(), len) }, (expected(a), expected(b)), "byte {byte} after {len}");
+                    together(a, b);
                 }
             }
         }
