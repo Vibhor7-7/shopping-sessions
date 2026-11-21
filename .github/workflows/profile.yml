@@ -34,6 +34,8 @@ jobs:
           # One fixed cache whatever the runner is, so that the misses of two runs can be
           # compared: a Sapphire Rapids core's 48 KB first level, and its 2 MB second
           # level standing in for the last one (callgrind simulates two levels).
+          # valgrind still prints what it found on the runner ("L3 cache found") before
+          # these sizes replace it.
           NCPU=1 valgrind --tool=callgrind --branch-sim=yes --cache-sim=yes --compress-strings=no --compress-pos=no \
             --I1=32768,8,64 --D1=49152,12,64 --LL=2097152,16,64 \
             --callgrind-out-file=callgrind.out target/release/pipeline data out 2>&1 | grep -E "pipeline:|Collected|refs|rate|[Ww]arning|error" || true
