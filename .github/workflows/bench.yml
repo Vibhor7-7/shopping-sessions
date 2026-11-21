@@ -22,6 +22,12 @@ on:
       env_b:
         description: Settings for B
         default: ""
+      sweep:
+        description: Settings to try on this commit, separated by ";" (empty = skip)
+        default: ""
+      sweep_threads:
+        description: Thread counts for the sweep
+        default: "4 1"
 
 jobs:
   bench:
@@ -79,6 +85,13 @@ jobs:
           ENV_A: ${{ inputs.env_a }}
           ENV_B: ${{ inputs.env_b }}
         run: scripts/ab.sh data bin/base bin/head 3
+      - name: Sweep of settings on this commit
+        if: inputs.sweep != ''
+        run: |
+          for threads in ${{ inputs.sweep_threads }}; do
+            echo "--- NCPU=$threads"
+            NCPU=$threads scripts/sweep.sh data bin/head 5 "${{ inputs.sweep }}"
+          done
       - name: The whole container, as the scorer times it
         run: |
           docker build -q -t shopping-sessions:latest .
@@ -89,3 +102,15 @@ jobs:
             end=$(date +%s%N)
             echo "container wall $(( (end - start) / 1000000 )) ms; inside: $(grep -o 'total [0-9.]* ms' err.log)"
           done
+          # docker_run.sh also starts a clean-up container; this is one bare `docker run`, as the scorer's clock sees it.
+          mkdir -p bare && chmod 777 bare
+          for i in 1 2 3 4 5; do
+            sudo rm -rf bare/*
+            start=$(date +%s%N)
+            docker run --rm --network none --read-only --tmpfs /tmp:rw,size=64m --cpus 4 --memory 12g --user 1000:1000 \
+              -v "$PWD/data":/data:ro -v "$PWD/bare":/output -e NCPU=4 shopping-sessions:latest 2> err.log
+            end=$(date +%s%N)
+            echo "bare docker run $(( (end - start) / 1000000 )) ms; inside: $(grep -o 'total [0-9.]* ms' err.log)"
+          done
+          start=$(date +%s%N); docker run --rm --network none shopping-sessions:latest true; end=$(date +%s%N)
+          echo "docker run of 'true' in the image: $(( (end - start) / 1000000 )) ms"
