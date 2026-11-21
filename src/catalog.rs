@@ -66,13 +66,14 @@ impl IdMap {
         map
     }
 
+    /// Looks up an ID in the reader's buffer (16 readable bytes at `id`).
     #[inline(always)]
-    fn get(&self, id: &[u8]) -> u32 {
-        let packed = key::pack(id);
+    unsafe fn get(&self, id: *const u8, len: usize) -> u32 {
+        let packed = key::pack_padded(id, len);
         if packed != 0 {
             self.packed.get(packed)
         } else {
-            self.get_other(id)
+            self.get_other(std::slice::from_raw_parts(id, len))
         }
     }
 
@@ -98,8 +99,8 @@ pub struct Catalog {
 impl Catalog {
     /// The category number of a product; `unknown`'s if the product is not in the file.
     #[inline(always)]
-    pub fn category(&self, product: &[u8]) -> u32 {
-        let found = self.products.get(product);
+    pub unsafe fn category(&self, product: *const u8, len: usize) -> u32 {
+        let found = self.products.get(product, len);
         if found == NONE {
             self.unknown
         } else {
@@ -109,8 +110,8 @@ impl Catalog {
 
     /// The campaign's number, or NONE if it is not in campaigns.csv.
     #[inline(always)]
-    pub fn campaign(&self, id: &[u8]) -> u32 {
-        self.campaigns.get(id)
+    pub unsafe fn campaign(&self, id: *const u8, len: usize) -> u32 {
+        self.campaigns.get(id, len)
     }
 }
 

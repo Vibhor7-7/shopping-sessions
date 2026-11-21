@@ -85,8 +85,8 @@ impl Lines for LinkLines {
         if quotes != 2 * wrapped || a0 == a1 || b0 == b1 {
             return; // malformed, or a side is empty
         }
-        let a = key::key_of(std::slice::from_raw_parts(data.add(a0), a1 - a0));
-        let b = key::key_of(std::slice::from_raw_parts(data.add(b0), b1 - b0));
+        let a = key::key_of_padded(data.add(a0), a1 - a0);
+        let b = key::key_of_padded(data.add(b0), b1 - b0);
         if a != b {
             self.edges.push((a, b)); // a self-link changes nothing
         }

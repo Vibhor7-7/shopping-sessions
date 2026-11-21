@@ -226,8 +226,7 @@ impl Lines for EventLines<'_, '_> {
         if quotes != 2 * wrapped || from[0] == to[0] {
             return;
         }
-        let field = |i: usize| std::slice::from_raw_parts(data.add(from[i]), to[i] - from[i]);
-        let event = key::key_of(field(0));
+        let event = key::key_of_padded(data.add(from[0]), to[0] - from[0]);
         let ingest = ts::parse(data.add(from[3]), to[3] - from[3], &mut sink.dates);
         let at_ms = ts::parse(data.add(from[2]), to[2] - from[2], &mut sink.dates);
         let catalog = context.catalog;
@@ -250,7 +249,7 @@ impl Lines for EventLines<'_, '_> {
                 if cents == 0 {
                     alive = false;
                 } else {
-                    purchase = context.purchase(cents, catalog.category(field(5)));
+                    purchase = context.purchase(cents, catalog.category(data.add(from[5]), to[5] - from[5]));
                 }
             } else {
                 alive = false;
@@ -258,7 +257,7 @@ impl Lines for EventLines<'_, '_> {
         }
         let mut user = 0;
         if alive {
-            user = key::key_of(field(1));
+            user = key::key_of_padded(data.add(from[1]), to[1] - from[1]);
             context.links.prefetch(user);
             sink.stats.event_candidates += 1;
         }
@@ -303,17 +302,16 @@ impl Lines for ClickLines<'_, '_> {
         if quotes != 2 * wrapped || from[0] == to[0] || from[1] == to[1] {
             return; // malformed, no click_id, or no user_id
         }
-        let field = |i: usize| std::slice::from_raw_parts(data.add(from[i]), to[i] - from[i]);
         let at_ms = ts::parse(data.add(from[3]), to[3] - from[3], &mut sink.dates);
         let catalog = context.catalog;
         if at_ms == ts::BAD || at_ms < context.epoch || at_ms >= catalog.window_end {
             return;
         }
-        let campaign = catalog.campaign(field(2));
+        let campaign = catalog.campaign(data.add(from[2]), to[2] - from[2]);
         if campaign == catalog::NONE {
             return;
         }
-        let user = key::key_of(field(1));
+        let user = key::key_of_padded(data.add(from[1]), to[1] - from[1]);
         context.links.prefetch(user);
         let slot = sink.click_count & (RING - 1);
         if sink.click_count >= RING {
@@ -321,7 +319,7 @@ impl Lines for ClickLines<'_, '_> {
             sink.settle_click(ready);
         }
         sink.waiting_clicks[slot] =
-            PendingClick { user, click: key::key_of(field(0)), ts: (at_ms - context.epoch) as u32, campaign };
+            PendingClick { user, click: key::key_of_padded(data.add(from[0]), to[0] - from[0]), ts: (at_ms - context.epoch) as u32, campaign };
         sink.click_count += 1;
         sink.stats.clicks += 1;
     }
