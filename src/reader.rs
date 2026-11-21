@@ -203,6 +203,50 @@ unsafe fn next_newline(data: *const u8, delims: *const u32, mut from: isize) -> 
     }
 }
 
+/// Feeds `sink` the lines of one indexed buffer, from the one at `start` (the
+/// delimiter just before it is number `before`) up to `stop` or the last whole
+/// line. Returns where the first line not taken starts, and whether that is
+/// because `stop` was reached.
+///
+/// A function of its own, never inlined: this loop runs once a line with
+/// everything `Lines::line` does inlined into it, and inside `walk` what `walk`
+/// keeps between two reads (the file, the lengths, the read buffer) competed
+/// with it for registers and was put on the stack and fetched back every line
+/// (BENCH.md, experiment 38).
+#[inline(never)]
+unsafe fn lines<L: Lines>(data: *const u8, index: &Index, mut start: usize, mut before: isize, stop: usize, sink: &mut L) -> (usize, bool) {
+    let delims = index.delims();
+    let mut quotes_before = index.quotes_before(start);
+    loop {
+        if start >= stop {
+            return (start, true);
+        }
+        // If this is a line with the right number of fields, its newline is
+        // the delimiter COMMAS + 1 after the one before it. A slot past the
+        // last delimiter holds `u32::MAX`: fewer delimiters than that are left.
+        let end = *delims.offset(before + L::COMMAS as isize + 1);
+        if end != u32::MAX {
+            let quotes_at_end = index.quotes_before(end as usize);
+            if sink.line(data, delims.offset(before), quotes_at_end - quotes_before) {
+                quotes_before = quotes_at_end;
+                before += L::COMMAS as isize + 1;
+                start = end as usize + 1;
+                continue;
+            }
+        }
+        // Not such a line. If it ends in this buffer it has the wrong number
+        // of fields (an empty line has none): malformed, dropped. If it does
+        // not, it is the unfinished line at the end of what has been read.
+        let newline = next_newline(data, delims, before + 1);
+        if newline < 0 {
+            return (start, false);
+        }
+        before = newline;
+        start = *delims.offset(newline) as usize + 1;
+        quotes_before = index.quotes_before(start);
+    }
+}
+
 /// Feeds `sink` every data line of `file` that starts in `offset..offset + length`.
 pub fn walk<L: Lines>(file: &File, offset: u64, length: u64, buf: &mut ReadBuf, sink: &mut L) {
     let range_end = offset + length;
@@ -251,39 +295,7 @@ pub fn walk<L: Lines>(file: &File, offset: u64, length: u64, buf: &mut ReadBuf, 
         }
         // Lines starting at or after `stop` belong to the next range.
         let stop = usize::try_from(range_end - base).unwrap_or(usize::MAX);
-        let mut done = false;
-        unsafe {
-            let mut quotes_before = index.quotes_before(start);
-            loop {
-                if start >= stop {
-                    done = true;
-                    break;
-                }
-                // If this is a line with the right number of fields, its newline is
-                // the delimiter COMMAS + 1 after the one before it. A slot past the
-                // last delimiter holds `u32::MAX`: fewer delimiters than that are left.
-                let end = *delims.offset(before + L::COMMAS as isize + 1);
-                if end != u32::MAX {
-                    let quotes_at_end = index.quotes_before(end as usize);
-                    if sink.line(data, delims.offset(before), quotes_at_end - quotes_before) {
-                        quotes_before = quotes_at_end;
-                        before += L::COMMAS as isize + 1;
-                        start = end as usize + 1;
-                        continue;
-                    }
-                }
-                // Not such a line. If it ends in this buffer it has the wrong number
-                // of fields (an empty line has none): malformed, dropped. If it does
-                // not, it is the unfinished line at the end of what has been read.
-                let newline = next_newline(data, delims, before + 1);
-                if newline < 0 {
-                    break;
-                }
-                before = newline;
-                start = *delims.offset(newline) as usize + 1;
-                quotes_before = index.quotes_before(start);
-            }
-        }
+        let (start, done) = unsafe { lines(data, index, start, before, stop, sink) };
         if done || at_end || base + start as u64 >= range_end {
             return;
         }
