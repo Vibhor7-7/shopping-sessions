@@ -215,7 +215,7 @@ impl Lines for EventLines<'_, '_> {
             return;
         }
         let event = key::key_of_padded(data.add(id), id_end - id);
-        let ingest = ts::parse_utc(data.add(ingest_at), ingest_end - ingest_at, &mut sink.dates);
+        let (ingest_seconds, ingest) = ts::parse_utc(data.add(ingest_at), ingest_end - ingest_at, &mut sink.dates);
         let at_ms = ts::parse(data.add(ts_at), ts_end - ts_at, &mut sink.dates);
         let catalog = context.catalog;
 
@@ -252,7 +252,7 @@ impl Lines for EventLines<'_, '_> {
         let ingest = if ingest == ts::BAD {
             u32::MAX
         } else {
-            (ingest.div_euclid(1_000) - context.ingest_epoch).clamp(0, i64::from(u32::MAX) - 1) as u32
+            (ingest_seconds - context.ingest_epoch).clamp(0, i64::from(u32::MAX) - 1) as u32
         };
         let slot = sink.event_count & (RING - 1);
         if sink.event_count >= RING {

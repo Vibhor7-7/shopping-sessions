@@ -335,14 +335,33 @@ pub unsafe fn parse(p: *const u8, len: usize, dates: &mut Dates) -> i64 {
     }
 }
 
-/// `parse` for a field that is nearly always UTC (`ingest_ts` always is): the same answer, without the digits.
+/// A field that is always UTC on a date already seen, as `ingest_ts` is: its
+/// epoch seconds and its epoch milliseconds, or BAD twice. Unlike `ts`, its form
+/// never changes from line to line, so every check here is a branch the CPU
+/// predicts, and the seconds come out without a division. Anything unexpected
+/// goes to `parse_general` and gets the same answer the slow way.
 #[inline(always)]
-pub unsafe fn parse_utc(p: *const u8, len: usize, dates: &mut Dates) -> i64 {
-    let (seconds, ok) = civil_known(p, dates);
-    if std::hint::black_box(ok & (len == 20) & (*p.add(19) == b'Z')) {
-        seconds * 1_000
+pub unsafe fn parse_utc(p: *const u8, len: usize, dates: &mut Dates) -> (i64, i64) {
+    let head = (p as *const u64).read_unaligned();
+    let tail = (p.add(8) as *const u32).read_unaligned() & 0x00ff_ffff; // DDT
+    let known = dates.slots.get_unchecked(Dates::slot(tail as u16));
+    let (seconds, time_ok) = time_of_day(p.add(11));
+    if len == 20 && *p.add(19) == b'Z' && known.head == head && known.tail == tail && time_ok {
+        let seconds = known.midnight + seconds;
+        (seconds, seconds * 1_000)
     } else {
-        parse_general(p, len, dates)
+        parse_utc_general(p, len, dates)
+    }
+}
+
+#[cold]
+#[inline(never)]
+unsafe fn parse_utc_general(p: *const u8, len: usize, dates: &mut Dates) -> (i64, i64) {
+    let milliseconds = parse_general(p, len, dates);
+    if milliseconds == BAD {
+        (BAD, BAD)
+    } else {
+        (milliseconds.div_euclid(1_000), milliseconds)
     }
 }
 
@@ -388,6 +407,15 @@ mod tests {
         both(text.as_bytes(), &mut dates)
     }
 
+    /// What `parse_utc` owes for a timestamp of `milliseconds`: its whole seconds too.
+    fn utc_pair(milliseconds: i64) -> (i64, i64) {
+        if milliseconds == BAD {
+            (BAD, BAD)
+        } else {
+            (milliseconds.div_euclid(1_000), milliseconds)
+        }
+    }
+
     fn both(text: &[u8], dates: &mut Dates) -> i64 {
         // As in the reader's buffer: other bytes before and after the field.
         let mut padded = b"9,\"1".to_vec();
@@ -400,12 +428,12 @@ mod tests {
         // Twice each: once learning the date, once from the table.
         for round in 0..2 {
             assert_eq!(unsafe { parse(p, len, dates) }, plain, "parse, round {round}: {shown:?}");
-            assert_eq!(unsafe { parse_utc(p, len, dates) }, plain, "parse_utc, round {round}: {shown:?}");
+            assert_eq!(unsafe { parse_utc(p, len, dates) }, utc_pair(plain), "parse_utc, round {round}: {shown:?}");
             assert_eq!(unsafe { parse_general(p, len, dates) }, plain, "parse_general, round {round}: {shown:?}");
         }
         // And with nothing learned yet.
         assert_eq!(unsafe { parse(p, len, &mut Dates::new()) }, plain, "parse, fresh: {shown:?}");
-        assert_eq!(unsafe { parse_utc(p, len, &mut Dates::new()) }, plain, "parse_utc, fresh: {shown:?}");
+        assert_eq!(unsafe { parse_utc(p, len, &mut Dates::new()) }, utc_pair(plain), "parse_utc, fresh: {shown:?}");
         plain
     }
 
