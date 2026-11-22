@@ -517,12 +517,9 @@ pub fn at_scale() {
         }
     };
     // Short labels: they go into the first row as they are (`finish`). Capitals
-    // are the 20M dataset, small letters the same three times over (60M).
-    let big = scratch.join("probe-data3");
-    let _ = std::fs::remove_dir_all(&big);
-    let began = Instant::now();
-    let tripled = triple(&data, &big);
-    say!("probe: three times the dataset in {:.1} s: {tripled} MB", began.elapsed().as_secs_f64());
+    // are the 20M dataset, small letters the same three times over (60M). The
+    // 20M runs first: writing the 60M one leaves the disk busy for a while, and
+    // a run's people phase writes too (`sync` waits that out before the 60M runs).
     let e = ("SS_LINES", "evex");
     let p9 = [("SS_PERSON_BITS", "9"), ("SS_DEDUP_BITS", "9")];
     let p10 = [("SS_PERSON_BITS", "10"), ("SS_DEDUP_BITS", "10")];
@@ -537,14 +534,32 @@ pub fn at_scale() {
     run("B96E", &[("SS_BLOCK_BYTES", "98304"), e], &data);
     run("B128P9E", &[("SS_BLOCK_BYTES", "131072"), p9[0], p9[1], e], &data);
     run("S3", &[], &data);
+    let big = scratch.join("probe-data3");
+    let _ = std::fs::remove_dir_all(&big);
+    let began = Instant::now();
+    let tripled = triple(&data, &big);
+    let made = began.elapsed().as_secs_f64();
+    extern "C" {
+        fn sync();
+    }
+    unsafe { sync() };
+    say!("probe: three times the dataset in {made:.1} s, synced {:.1} s after: {tripled} MB", began.elapsed().as_secs_f64() - made);
+    // The dev check allows 3 minutes for everything: no run is started after 135 s.
+    let in_time = || started.elapsed().as_secs() < 135;
     if tripled > 0 {
         for round in 1..=2 {
-            run(&format!("s{round}"), &[], &big);
-            run(&format!("b128r{round}"), &[("SS_BLOCK_BYTES", "131072")], &big);
-            run(&format!("p10r{round}"), &[p10[0], p10[1]], &big);
-            run(&format!("b128p10r{round}"), &[("SS_BLOCK_BYTES", "131072"), p10[0], p10[1]], &big);
-            run(&format!("c4096r{round}"), &[("SS_CHUNK_MIN", "4096")], &big);
-            run(&format!("b128er{round}"), &[("SS_BLOCK_BYTES", "131072"), e], &big);
+            for (label, settings) in [
+                ("s", &[][..]),
+                ("b128", &[("SS_BLOCK_BYTES", "131072")][..]),
+                ("p10", &p10[..]),
+                ("b128p10", &[("SS_BLOCK_BYTES", "131072"), p10[0], p10[1]][..]),
+                ("c4096", &[("SS_CHUNK_MIN", "4096")][..]),
+                ("b128e", &[("SS_BLOCK_BYTES", "131072"), e][..]),
+            ] {
+                if in_time() {
+                    run(&format!("{label}r{round}"), settings, &big);
+                }
+            }
         }
     }
     let _ = std::fs::remove_dir_all(&big);
