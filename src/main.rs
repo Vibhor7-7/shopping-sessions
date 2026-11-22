@@ -184,7 +184,6 @@ fn main() {
         .unwrap_or(8)
         .clamp(1, 256);
 
-<<<<<<< HEAD
     // PROBE BUILD: the machine and the full-size runs first, so that the rows written
     // below can carry what they found. A run the probe itself started is the pipeline alone.
     if std::env::var_os("SS_PROBE_CHILD").is_none() {
@@ -194,15 +193,11 @@ fn main() {
     }
     let started = Instant::now();
 
-    let events = reader::open_folder(&data.join("events"));
-    let clicks = reader::open_folder(&data.join("clicks"));
-=======
     let mut events = reader::open_folder(&data.join("events"));
     let mut clicks = reader::open_folder(&data.join("clicks"));
     if reader::map_asked() {
         events.iter_mut().chain(clicks.iter_mut()).for_each(reader::Input::map);
     }
->>>>>>> exp48-mmap
     let link_files = reader::open_folder(&data.join("links"));
     let event_bytes: u64 = events.iter().map(|i| i.len).sum();
     let click_bytes: u64 = clicks.iter().map(|i| i.len).sum();
