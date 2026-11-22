@@ -13,8 +13,13 @@ use crate::scan::Index;
 
 /// Bytes kept readable before the data, so `data[-1]` is always in bounds.
 const FRONT: usize = 64;
-/// Bytes read per call: small enough to stay in the L2 cache while it is parsed.
-const BLOCK: usize = 1 << 18;
+/// Bytes read per call: small enough to stay in the second-level cache while
+/// it is parsed, beside everything else a thread keeps there (its index of the
+/// block, and the write-combining buffers of a thousand or two partitions).
+/// 128 KB: on the scorer's Cascade Lake cores, which have 1 MB of that cache
+/// for two threads, 256 KB was 1.5% slower at 20M events and 2.4% at 60M
+/// (BENCH.md, "The probe" and experiment 49).
+const BLOCK: usize = 1 << 17;
 
 pub struct ReadBuf {
     bytes: Vec<u8>,
