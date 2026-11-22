@@ -194,8 +194,10 @@ fn main() {
     // Each thread fills one chunk per partition at a time, and the last of each is
     // left part empty: a quarter of what a thread expects to put in a partition
     // keeps that waste near an eighth of the data.
+    // `SS_CHUNK_MIN` is a measuring knob: the fewest records a chunk may hold.
+    let chunk_floor = setting("SS_CHUNK_MIN").unwrap_or(64).next_power_of_two().clamp(64, 4096);
     let chunk = |bytes: u64, per_record: u64, partition_bits: u32| {
-        ((bytes / per_record) as usize / (threads << partition_bits) / 4).next_power_of_two().clamp(64, 4096)
+        ((bytes / per_record) as usize / (threads << partition_bits) / 4).next_power_of_two().clamp(chunk_floor, 4096)
     };
     let chunks = parse::ChunkSizes {
         copies: chunk(event_bytes, 64, dedup_bits),
