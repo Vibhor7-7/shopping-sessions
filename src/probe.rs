@@ -52,7 +52,18 @@ pub fn finish(scan: &str, seconds: f64) {
     let phase = |line: &str, name: &str| -> i64 {
         line.split(name).nth(1).and_then(|rest| rest.trim_start().split(' ').next()).and_then(|v| v.parse::<f64>().ok()).map_or(0, |v| v.round() as i64)
     };
-    let mut first = format!("v4 {scan} {seconds:.0}s");
+    let mut first = format!("v5 {scan} {seconds:.0}s");
+    for line in &lines {
+        let text = line.strip_prefix("probe: ").unwrap_or(line);
+        if text.starts_with("three times") {
+            first.push_str("; x3 ");
+            first.push_str(&text.replace("three times the dataset in ", "").replace(", synced ", "+").replace(" s after", "s").replace(" s", "s"));
+        } else if let Some(at) = text.find(" made in ") {
+            first.push_str("; gen ");
+            first.push_str(text[at + 9..].split(' ').next().unwrap_or(""));
+            first.push('s');
+        }
+    }
     for (label, wall, phases) in &runs {
         first.push_str(&format!(
             "; {label}:{wall:.0}|p{} pe{} d{} l{} t{}",
@@ -63,15 +74,7 @@ pub fn finish(scan: &str, seconds: f64) {
             phase(phases, "total"),
         ));
     }
-    // Whatever else was said (the tripling's line): after the runs.
     let rest = vec![String::new(); 4];
-    for line in &lines {
-        let text = line.strip_prefix("probe: ").unwrap_or(line);
-        if text.starts_with("three times") || text.contains("made in") {
-            first.push_str("; ");
-            first.push_str(&text.split_whitespace().collect::<Vec<_>>().join(" "));
-        }
-    }
     let best = |label: &str| -> Option<&(String, f64, String)> {
         runs.iter().filter(|run| run.0.starts_with(label)).min_by(|a, b| a.1.total_cmp(&b.1))
     };
@@ -520,24 +523,21 @@ pub fn at_scale() {
     // are the 20M dataset, small letters the same three times over (60M). The
     // 20M runs first: writing the 60M one leaves the disk busy for a while, and
     // a run's people phase writes too (`sync` waits that out before the 60M runs).
-    let e = ("SS_LINES", "evex");
+    // `C`: the most records to a chunk (the default is 1,024 at 20M and 2,048 at
+    // 60M on 8 threads); `MU`: the files mapped, and unmapped once parsed; `P12`:
+    // 2^12 partitions of people.
     let m = ("SS_INPUT", "mmap");
-    let p9 = [("SS_PERSON_BITS", "9"), ("SS_DEDUP_BITS", "9")];
-    let p10 = [("SS_PERSON_BITS", "10"), ("SS_DEDUP_BITS", "10")];
+    let u = ("SS_UNMAP", "early");
+    let c = |records: &'static str| ("SS_CHUNK_MAX", records);
     for round in 1..=2 {
         run(&format!("S{round}"), &[], &data);
-        for (label, block) in [("B64", "65536"), ("B96", "98304"), ("B128", "131072"), ("B192", "196608")] {
-            run(&format!("{label}r{round}"), &[("SS_BLOCK_BYTES", block)], &data);
-        }
-        run(&format!("B128Er{round}"), &[("SS_BLOCK_BYTES", "131072"), e], &data);
-        run(&format!("B128P9r{round}"), &[("SS_BLOCK_BYTES", "131072"), p9[0], p9[1]], &data);
-        // `M`: the files parsed where they are mapped (experiment 48).
-        run(&format!("Mr{round}"), &[m], &data);
-        run(&format!("MB128r{round}"), &[m, ("SS_BLOCK_BYTES", "131072")], &data);
+        run(&format!("C512r{round}"), &[c("512")], &data);
+        run(&format!("C256r{round}"), &[c("256")], &data);
+        run(&format!("C128r{round}"), &[c("128")], &data);
+        run(&format!("MUr{round}"), &[m, u], &data);
+        run(&format!("MUC256r{round}"), &[m, u, c("256")], &data);
     }
-    run("MB128E", &[m, ("SS_BLOCK_BYTES", "131072"), e], &data);
-    run("B96E", &[("SS_BLOCK_BYTES", "98304"), e], &data);
-    run("B128P9E", &[("SS_BLOCK_BYTES", "131072"), p9[0], p9[1], e], &data);
+    run("C64", &[c("64")], &data);
     run("S3", &[], &data);
     let big = scratch.join("probe-data3");
     let _ = std::fs::remove_dir_all(&big);
@@ -552,28 +552,28 @@ pub fn at_scale() {
     // The dev check allows 3 minutes for everything: no run is started after 135 s.
     let in_time = || started.elapsed().as_secs() < 135;
     if tripled > 0 {
+        let p12 = ("SS_PERSON_BITS", "12");
         for round in 1..=2 {
-            // At 60M there are 2^11 partitions of each kind: a thread's write-combining
-            // buffers alone are 0.9 MB, and the scorer's core has 1 MB of second-level
-            // cache for two threads. `p` is the people's partitions, `d` dedup's.
-            let b = ("SS_BLOCK_BYTES", "131072");
-            let d9 = ("SS_DEDUP_BITS", "9");
             for (label, settings) in [
                 ("s", &[][..]),
-                ("b128", &[b][..]),
-                ("p10", &p10[..]),
-                ("d9", &[d9][..]),
-                ("p10d9", &[p10[0], d9][..]),
-                ("b128p10d9", &[b, p10[0], d9][..]),
-                ("c4096", &[("SS_CHUNK_MIN", "4096")][..]),
-                ("b128e", &[b, e][..]),
-                ("m", &[m][..]),
-                ("mb128", &[m, b][..]),
+                ("c1024", &[c("1024")][..]),
+                ("c512", &[c("512")][..]),
+                ("c256", &[c("256")][..]),
+                ("c128", &[c("128")][..]),
+                ("mu", &[m, u][..]),
+                ("muc256", &[m, u, c("256")][..]),
+                ("p12c256", &[p12, c("256")][..]),
             ] {
                 if in_time() {
                     run(&format!("{label}r{round}"), settings, &big);
                 }
             }
+        }
+        if in_time() {
+            run("p12", &[p12], &big);
+        }
+        if in_time() {
+            run("s3", &[], &big);
         }
     }
     let _ = std::fs::remove_dir_all(&big);
