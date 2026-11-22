@@ -229,10 +229,11 @@ fn main() {
     // Each thread fills one chunk per partition at a time, and the last of each is
     // left part empty: a quarter of what a thread expects to put in a partition
     // keeps that waste near an eighth of the data.
-    // `SS_CHUNK_MIN` is a measuring knob: the fewest records a chunk may hold.
+    // `SS_CHUNK_MIN` and `SS_CHUNK_MAX` are measuring knobs: the fewest and the most records a chunk may hold.
     let chunk_floor = setting("SS_CHUNK_MIN").unwrap_or(64).next_power_of_two().clamp(64, 4096);
+    let chunk_ceiling = setting("SS_CHUNK_MAX").unwrap_or(4096).next_power_of_two().clamp(chunk_floor, 4096);
     let chunk = |bytes: u64, per_record: u64, partition_bits: u32| {
-        ((bytes / per_record) as usize / (threads << partition_bits) / 4).next_power_of_two().clamp(chunk_floor, 4096)
+        ((bytes / per_record) as usize / (threads << partition_bits) / 4).next_power_of_two().clamp(chunk_floor, chunk_ceiling)
     };
     let chunks = parse::ChunkSizes {
         copies: chunk(event_bytes, 64, dedup_bits),
@@ -253,6 +254,8 @@ fn main() {
     };
     let parsed = parse::run(&context, &pools, &events, &clicks, threads, 1 << person_bits, 1 << dedup_bits, chunks);
     let parsed_at = started.elapsed();
+    reader::unmap_early(&mut events);
+    reader::unmap_early(&mut clicks);
 
     // Slots in dedup's filter for every copy in a partition (a measuring knob; see dedup.rs).
     let filter_slots = setting("SS_DEDUP_SLOTS").unwrap_or(16).clamp(1, 256);

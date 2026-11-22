@@ -338,3 +338,14 @@ pub fn map_file(file: &std::fs::File, len: usize) -> Option<*mut u8> {
     }
 }
 
+/// Gives back what `map_file` mapped for a file of `len` bytes at `data`.
+pub fn unmap_file(data: *mut u8, len: usize) {
+    extern "C" {
+        fn munmap(addr: *mut c_void, len: usize) -> i32;
+    }
+    const EDGE: usize = 1 << 16;
+    unsafe {
+        munmap(data.sub(EDGE) as *mut c_void, EDGE + len.div_ceil(EDGE) * EDGE + EDGE);
+    }
+}
+

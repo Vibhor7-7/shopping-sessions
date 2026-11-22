@@ -13,8 +13,13 @@ use crate::scan::Index;
 
 /// Bytes kept readable before the data, so `data[-1]` is always in bounds.
 const FRONT: usize = 64;
-/// Bytes read per call: small enough to stay in the L2 cache while it is parsed.
-const BLOCK: usize = 1 << 18;
+/// Bytes read per call: small enough to stay in the second-level cache while
+/// it is parsed, beside everything else a thread keeps there (its index of the
+/// block, and the write-combining buffers of a thousand or two partitions).
+/// 128 KB: on the scorer's Cascade Lake cores, which have 1 MB of that cache
+/// for two threads, 256 KB was 1.5% slower at 20M events and 2.4% at 60M
+/// (BENCH.md, "The probe" and experiment 49).
+const BLOCK: usize = 1 << 17;
 
 pub struct ReadBuf {
     bytes: Vec<u8>,
@@ -373,6 +378,23 @@ impl Input {
             }
             self.mapped = Some((data as usize, total));
         }
+    }
+}
+
+/// Takes down the mappings of `inputs` on a thread of its own, once nothing
+/// reads them any more: 5 GB of them are 20 ms of a process's end, which this
+/// spends while the later phases run instead (asked for with `SS_UNMAP=early`).
+pub fn unmap_early(inputs: &mut [Input]) {
+    if !std::env::var("SS_UNMAP").is_ok_and(|asked| asked.trim() == "early") {
+        return;
+    }
+    let mapped: Vec<(usize, usize)> = inputs.iter_mut().filter_map(|input| input.mapped.take().map(|(data, _)| (data, input.len as usize))).collect();
+    if !mapped.is_empty() {
+        std::thread::spawn(move || {
+            for (data, len) in mapped {
+                crate::sys::unmap_file(data as *mut u8, len);
+            }
+        });
     }
 }
 
