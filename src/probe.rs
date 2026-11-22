@@ -548,13 +548,20 @@ pub fn at_scale() {
     let in_time = || started.elapsed().as_secs() < 135;
     if tripled > 0 {
         for round in 1..=2 {
+            // At 60M there are 2^11 partitions of each kind: a thread's write-combining
+            // buffers alone are 0.9 MB, and the scorer's core has 1 MB of second-level
+            // cache for two threads. `p` is the people's partitions, `d` dedup's.
+            let b = ("SS_BLOCK_BYTES", "131072");
+            let d9 = ("SS_DEDUP_BITS", "9");
             for (label, settings) in [
                 ("s", &[][..]),
-                ("b128", &[("SS_BLOCK_BYTES", "131072")][..]),
+                ("b128", &[b][..]),
                 ("p10", &p10[..]),
-                ("b128p10", &[("SS_BLOCK_BYTES", "131072"), p10[0], p10[1]][..]),
+                ("d9", &[d9][..]),
+                ("p10d9", &[p10[0], d9][..]),
+                ("b128p10d9", &[b, p10[0], d9][..]),
                 ("c4096", &[("SS_CHUNK_MIN", "4096")][..]),
-                ("b128e", &[("SS_BLOCK_BYTES", "131072"), e][..]),
+                ("b128e", &[b, e][..]),
             ] {
                 if in_time() {
                     run(&format!("{label}r{round}"), settings, &big);
