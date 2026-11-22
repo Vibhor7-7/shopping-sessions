@@ -260,3 +260,54 @@ pub fn mix(key: u64) -> u64 {
     let product = u128::from(key ^ 0x2d35_8dcc_aa6c_78a5) * 0x8bb8_4b93_962e_acc9_u128;
     (product as u64) ^ ((product >> 64) as u64)
 }
+
+/// 32 bytes that a vector instruction reads from memory where it uses them.
+///
+/// Written as an ordinary constant, a vector of 32 bytes is loaded into a
+/// register before the line loop and held there. The loop has more such
+/// constants than there are registers, and the compiler then moves them from
+/// register to register around every step that needs one free (about a dozen
+/// moves a line in the compiled loop, and a constant or two stored to the
+/// stack and fetched back). A volatile read cannot be moved out of the loop,
+/// and it is folded into the instruction that uses it: one memory operand,
+/// no register, no move (BENCH.md, experiment 43).
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[repr(C, align(32))]
+pub struct InPlace([u8; 32]);
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+impl InPlace {
+    pub const fn bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    /// Sixteen bytes, twice.
+    pub const fn twice(half: [u8; 16]) -> Self {
+        let mut bytes = [0u8; 32];
+        let mut at = 0;
+        while at < 16 {
+            bytes[at] = half[at];
+            bytes[at + 16] = half[at];
+            at += 1;
+        }
+        Self(bytes)
+    }
+
+    /// Sixteen words, each stored low byte first.
+    pub const fn words(words: [i16; 16]) -> Self {
+        let mut bytes = [0u8; 32];
+        let mut at = 0;
+        while at < 16 {
+            let word = words[at].to_le_bytes();
+            bytes[2 * at] = word[0];
+            bytes[2 * at + 1] = word[1];
+            at += 1;
+        }
+        Self(bytes)
+    }
+
+    #[inline(always)]
+    pub fn read(&'static self) -> std::arch::x86_64::__m256i {
+        unsafe { std::ptr::read_volatile(self as *const Self as *const std::arch::x86_64::__m256i) }
+    }
+}

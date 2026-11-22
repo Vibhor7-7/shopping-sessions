@@ -40,77 +40,136 @@ pub fn carried(id: &[u8], day: i32) -> Option<&'static (String, Option<(u32, u32
     TARGETS.iter().position(|&(user, on)| user == id && on == day).and_then(|at| carried.get(at))
 }
 
-/// Sorts what was said into five texts, the most telling first in each, and the
-/// full-size runs' best times into numbers for the first two rows.
+/// What the first row carries: the page shows that row alone, cut at about 2,000
+/// characters, so the text is at most 1,680 and the most wanted comes first: the
+/// full-size runs (label: milliseconds from start to exit | parse, people, dedup,
+/// links, total), then 256 against 512 bits, `read` against `mmap`, what pages
+/// cost, the disks, the spin loop. The other four rows carry the rest, unseen.
 pub fn finish(scan: &str, seconds: f64) {
     let lines = LOG.lock().unwrap().clone();
     let runs = RUNS.lock().unwrap().clone();
-    let mut texts = vec![String::new(); 5];
-    let mut section = 3usize;
-    let mut scale = false;
-    for line in &lines {
-        let text = line.strip_prefix("probe: ").unwrap_or(line);
-        if text.starts_with("----") {
-            scale = text.contains("whole pipeline");
-            section = if scale {
-                0
-            } else if text.contains("environment") {
-                4
-            } else if text.contains("when things were made") {
-                2
-            } else if text.contains("memory") || text.contains("disks") || text.contains("input:") || text.contains("256-bit") || text.contains("how many threads") {
-                1
-            } else {
-                3
-            };
-            continue;
-        }
-        let first = ["cpu:", "flags of interest", "processors listed", "available_parallelism"].iter().any(|k| text.starts_with(k))
-            || ["transparent_hugepage/enabled", "transparent_hugepage/defrag", "cgroup/cpu.max", "cgroup/memory.max", "/proc/version"].iter().any(|k| text.contains(k));
-        let mut text = text.split_whitespace().collect::<Vec<_>>().join(" ");
-        if scale {
-            for (long, short) in [
-                (" ms from start to exit (exit status: 0)", ""),
-                (" (what a process costs by itself)", ""),
-                ("as scored, run ", "S"),
-                (", run ", "r"),
-                ("NCPU=", "N"),
-                ("SS_SCAN=narrow", "NAR"),
-                (" partitions of each kind", "p"),
-                ("SS_BLOCK_BYTES=", "B"),
-                ("links ", "l"),
-                ("parse ", "p"),
-                ("dedup ", "d"),
-                ("people ", "pe"),
-                ("total ", "t"),
-                (" ms", ""),
-                (" | scan ", "|"),
-                (" | ", "|"),
-            ] {
-                text = text.replace(long, short);
-            }
-        }
-        let into = if first { 0 } else { section };
-        texts[into].push_str(&text);
-        texts[into].push_str("; ");
-    }
-    texts[0] = format!("scan {scan}; probe took {seconds:.1} s; {}", texts[0]);
-    let best = |label: &str| -> Option<&(String, f64, String)> {
-        runs.iter().filter(|run| run.0.starts_with(label)).min_by(|a, b| a.1.total_cmp(&b.1))
-    };
     let phase = |line: &str, name: &str| -> i64 {
         line.split(name).nth(1).and_then(|rest| rest.trim_start().split(' ').next()).and_then(|v| v.parse::<f64>().ok()).map_or(0, |v| v.round() as i64)
     };
-    let wall = |label: &str| best(label).map_or(0, |run| run.1.round() as i64);
-    let first = best("as scored").map(|run| {
+    let mut first = format!("v3 {scan} {seconds:.0}s");
+    for (label, wall, phases) in &runs {
+        first.push_str(&format!(
+            "; {label}:{wall:.0}|p{} pe{} d{} l{} t{}",
+            phase(phases, "parse"),
+            phase(phases, "people"),
+            phase(phases, "dedup"),
+            phase(phases, "links"),
+            phase(phases, "total"),
+        ));
+    }
+    // Sections of the machine's description, by how much each is wanted.
+    let mut wanted: [Vec<String>; 5] = Default::default();
+    let mut rest = vec![String::new(); 4];
+    let mut section = usize::MAX;
+    let mut other = 2usize;
+    for line in &lines {
+        let text = line.strip_prefix("probe: ").unwrap_or(line);
+        if text.starts_with("----") {
+            section = if text.contains("256-bit") {
+                0
+            } else if text.contains("input:") {
+                1
+            } else if text.contains("memory") {
+                2
+            } else if text.contains("disks") {
+                3
+            } else if text.contains("how many threads") {
+                4
+            } else {
+                usize::MAX
+            };
+            other = if text.contains("environment") {
+                3
+            } else if text.contains("when things were made") {
+                1
+            } else if text.contains("whole pipeline") {
+                0
+            } else {
+                2
+            };
+            continue;
+        }
+        let mut text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        if section == usize::MAX {
+            rest[other].push_str(&text);
+            rest[other].push_str("; ");
+            continue;
+        }
+        for marker in [" (checksum", " (sum ", " (best of 5,"] {
+            if let Some(at) = text.find(marker) {
+                text.truncate(at);
+            }
+        }
+        if text.ends_with(')') {
+            if let Some(at) = text.rfind(" (") {
+                if text[at + 2..text.len() - 1].bytes().all(|b| b.is_ascii_digit()) {
+                    text.truncate(at);
+                }
+            }
+        }
+        for (long, short) in [
+            ("fresh 256 MB as the pipeline allocates it, first touch: ", "fresh: "),
+            ("the same again: ", "again: "),
+            ("this process then has ", "thp "),
+            (" kB on huge pages", "kB"),
+            ("unmap both ", "unmap "),
+            ("256 MB a thread on ", "pg"),
+            (" threads, ", "t "),
+            ("no advice", "none"),
+            ("MADV_NOHUGEPAGE", "NOHUGE"),
+            ("MADV_HUGEPAGE", "HUGE"),
+            ("touch every page ", "touch "),
+            ("(slowest thread; ", "("),
+            (" ms in all)", ")"),
+            ("write 96 MB ", "w96 "),
+            ("write 16 MB ", "w16 "),
+            (" (Ok(()))", ""),
+            ("read back ", "rb "),
+            (" (100663296 bytes)", ""),
+            (" (16777216 bytes)", ""),
+            ("delete ", "del "),
+            ("read the largest event file, round ", "big r"),
+            (" bytes in ", "B "),
+            ("read() in 256 KB blocks + scan: ", "read+scan "),
+            ("mmap, faulting as it goes: ", "mmap "),
+            ("mmap, MADV_POPULATE_READ first: ", "mmap-pop "),
+            (" best of 5 (map + scan + unmap), first round ", " first "),
+            ("avx512", ""),
+            ("256-bit scan of 64 MB: ", "256: "),
+            ("512-bit scan of 64 MB: ", "512: "),
+            ("scalar work alone: ", "sc: "),
+            ("256-bit scan + scalar work, alternating: ", "256+sc: "),
+            ("512-bit scan + scalar work, alternating: ", "512+sc: "),
+            (" threads: ", "t:"),
+            (" ms", ""),
+            (" MB/s", ""),
+        ] {
+            text = text.replace(long, short);
+        }
+        wanted[section].push(text);
+    }
+    for part in &wanted {
+        for text in part {
+            first.push_str("; ");
+            first.push_str(text);
+        }
+    }
+    let best = |label: &str| -> Option<&(String, f64, String)> {
+        runs.iter().filter(|run| run.0.starts_with(label)).min_by(|a, b| a.1.total_cmp(&b.1))
+    };
+    let numbers = best("S").map(|run| {
         (run.1.round() as u32, phase(&run.2, "total") as u32, phase(&run.2, "parse") * 1_000_000 + phase(&run.2, "people") * 1_000 + phase(&run.2, "dedup"))
     });
-    let second = best("as scored").map(|_| (wall("NCPU=4") as u32, wall("NCPU=16") as u32, wall("SS_SCAN=narrow") * 1_000_000 + wall("2^9") * 1_000 + wall("2^11")));
-    let carried = texts
-        .into_iter()
-        .enumerate()
-        .map(|(at, text)| (text.chars().take(4000).collect::<String>(), [first, second].get(at).copied().flatten()))
-        .collect();
+    eprintln!("probe: the first row's text, {} characters before the cut at 1680: {first}", first.chars().count());
+    let mut carried = vec![(first.chars().take(1680).collect::<String>(), numbers)];
+    for text in rest {
+        carried.push((text.chars().take(4000).collect::<String>(), None));
+    }
     let _ = CARRIED.set(carried);
 }
 
@@ -300,63 +359,6 @@ fn plain_pages() {
                 say!("probe: 256 MB a thread on {threads} threads, {label}: touch every page {touch:.1} ms, unmap {unmap:.1} ms (slowest thread; {wall:.1} ms in all)");
             }
         }
-    }
-}
-
-/// The parse phase of this dataset again, cut short at each stage, and whole on other thread counts.
-#[allow(dead_code)]
-pub fn anatomy(
-    context: &crate::parse::Context,
-    events: &[crate::reader::Input],
-    clicks: &[crate::reader::Input],
-    threads: usize,
-    person_partitions: usize,
-    dedup_partitions: usize,
-    chunks: crate::parse::ChunkSizes,
-) {
-    use std::sync::atomic::Ordering;
-    let time = |stop: u32, threads: usize, rounds: usize| -> f64 {
-        crate::reader::STOP.store(stop, Ordering::Relaxed);
-        let mut best = f64::MAX;
-        for _ in 0..rounds {
-            let pools = crate::parse::Pools { copies: crate::pool::Pool::new(), events: crate::pool::Pool::new(), clicks: crate::pool::Pool::new() };
-            let started = Instant::now();
-            let parsed = crate::parse::run(context, &pools, events, clicks, threads, person_partitions, dedup_partitions, chunks);
-            best = best.min(started.elapsed().as_secs_f64() * 1e3);
-            std::mem::forget(parsed);
-            std::mem::forget(pools);
-        }
-        crate::reader::STOP.store(0, Ordering::Relaxed);
-        best
-    };
-    // No run here gives its records back (the pools never free), so on a large
-    // dataset every setting is run once and the thread counts are fewer: about
-    // 5 GB at 20M events where the full list would be past the 24 GB allowed.
-    let bytes: u64 = events.iter().chain(clicks).map(|input| input.len).sum();
-    let large = bytes > (512 << 20);
-    let (stage_rounds, rounds) = if large { (1, 1) } else { (3, 2) };
-    let parse_threads: &[usize] = if large { &[4, 8] } else { &[1, 2, 4, 6, 8, 12, 16] };
-    let scan_threads: &[usize] = if large { &[1, 4, 8] } else { &[1, 2, 4, 8, 16] };
-    say!("probe: ---- the parse phase of this dataset ({} MB), cut short at each stage ({threads} threads, best of {stage_rounds}) ----", bytes >> 20);
-    for (stop, what) in [
-        (1, "read() only"),
-        (2, "+ delimiter scan"),
-        (3, "+ line walk"),
-        (4, "+ fields into values"),
-        (5, "+ link lookups"),
-        (6, "+ event records"),
-        (7, "+ copy records, not event records"),
-        (0, "everything"),
-    ] {
-        say!("probe: parse, {what}: {:.1} ms", time(stop, threads, stage_rounds));
-    }
-    say!("probe: ---- the whole parse phase by thread count (best of {rounds}) ----");
-    for &count in parse_threads {
-        say!("probe: parse on {count:>2} threads: {:.1} ms", time(0, count, rounds));
-    }
-    say!("probe: ---- read() and the delimiter scan only, by thread count (best of {rounds}) ----");
-    for &count in scan_threads {
-        say!("probe: read + scan on {count:>2} threads: {:.1} ms", time(2, count, rounds));
     }
 }
 
@@ -601,33 +603,21 @@ pub fn at_scale() {
             Err(error) => say!("probe: {label}: could not run: {error}"),
         }
     };
+    // Short labels: they go into the first row as they are (`finish`).
     for round in 1..=3 {
-        run(&format!("no data, run {round} (what a process costs by itself)"), &[], &empty);
+        run(&format!("S{round}"), &[], &data);
+        run(&format!("EV{round}"), &[("SS_LINES", "evex")], &data);
     }
-    for round in 1..=5 {
-        run(&format!("as scored, run {round}"), &[], &data);
-    }
-    for round in 1..=2 {
-        for threads in ["4", "6", "12", "16"] {
-            if round == 1 || threads == "4" || threads == "16" {
-                run(&format!("NCPU={threads}, run {round}"), &[("NCPU", threads)], &data);
-            }
-        }
-    }
-    for round in 1..=3 {
-        run(&format!("SS_SCAN=narrow, run {round}"), &[("SS_SCAN", "narrow")], &data);
-    }
-    // Partitions and the read block: what two threads of one core have to keep in its cache between them.
     for round in 1..=2 {
         for bits in ["9", "11"] {
-            run(&format!("2^{bits} partitions of each kind, run {round}"), &[("SS_PERSON_BITS", bits), ("SS_DEDUP_BITS", bits)], &data);
+            run(&format!("P{bits}r{round}"), &[("SS_PERSON_BITS", bits), ("SS_DEDUP_BITS", bits)], &data);
         }
-        for block in ["131072", "524288"] {
-            run(&format!("SS_BLOCK_BYTES={block}, run {round}"), &[("SS_BLOCK_BYTES", block)], &data);
+        for (label, block) in [("B128", "131072"), ("B512", "524288")] {
+            run(&format!("{label}r{round}"), &[("SS_BLOCK_BYTES", block)], &data);
         }
     }
-    for round in 6..=7 {
-        run(&format!("as scored, run {round}"), &[], &data);
+    for round in 4..=5 {
+        run(&format!("S{round}"), &[], &data);
     }
     clean();
     for line in head("/sys/fs/cgroup/cpu.stat", 600).lines().filter(|l| l.starts_with("nr_") || l.starts_with("throttled")) {

@@ -16,26 +16,21 @@ const FRONT: usize = 64;
 /// Bytes read per call: small enough to stay in the L2 cache while it is parsed.
 const BLOCK: usize = 1 << 18;
 
-/// PROBE BUILD ONLY: how far a line's work goes, so the probe can time the parse
-/// phase stage by stage. 0 = everything; 1 = read; 2 = + delimiter scan;
-/// 3 = + line walk; 4 = + fields into values; 5 = + link lookups;
-/// 6 = + event records; 7 = copy records instead of event records.
-pub static STOP: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-
 pub struct ReadBuf {
     bytes: Vec<u8>,
     index: Index,
     /// Bytes per read: BLOCK, unless a test asks for something tiny to put block edges everywhere.
     block: usize,
-    pub stop: u32,
+    /// Whether the line loop compiled for AVX-512 is the one to run (`evex_asked`).
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+    evex: bool,
 }
 
 impl ReadBuf {
     pub fn new() -> Self {
         let block = std::env::var("SS_BLOCK_BYTES").ok().and_then(|v| v.parse().ok()).unwrap_or(BLOCK).clamp(16, 1 << 24);
         let capacity = 2 * block;
-        let stop = STOP.load(std::sync::atomic::Ordering::Relaxed);
-        Self { bytes: vec![0; FRONT + capacity + 128], index: Index::new(capacity + 64), block, stop }
+        Self { bytes: vec![0; FRONT + capacity + 128], index: Index::new(capacity + 64), block, evex: evex_asked() }
     }
 
     /// Room for `len` bytes of data plus a newline and the vector overread.
@@ -222,7 +217,41 @@ unsafe fn next_newline(data: *const u8, delims: *const u32, mut from: isize) -> 
 /// with it for registers and was put on the stack and fetched back every line
 /// (BENCH.md, experiment 38).
 #[inline(never)]
-unsafe fn lines<L: Lines>(data: *const u8, index: &Index, mut start: usize, mut before: isize, stop: usize, sink: &mut L) -> (usize, bool) {
+unsafe fn lines<L: Lines>(data: *const u8, index: &Index, start: usize, before: isize, stop: usize, sink: &mut L) -> (usize, bool) {
+    lines_body(data, index, start, before, stop, sink)
+}
+
+/// The same loop compiled for a CPU with AVX-512 (F, VL, BW, DQ): the same
+/// 128- and 256-bit operations, with 32 vector registers to keep them in where
+/// AVX2 has 16, compares that leave their answer in a mask register, and
+/// three-way logic in one instruction. Nothing in it is 512 bits wide, so a
+/// CPU that lowers its clock for 512-bit work does not (BENCH.md, experiment 46).
+#[cfg(target_arch = "x86_64")]
+#[inline(never)]
+#[target_feature(enable = "avx512f,avx512vl,avx512bw,avx512dq")]
+unsafe fn lines_evex<L: Lines>(data: *const u8, index: &Index, start: usize, before: isize, stop: usize, sink: &mut L) -> (usize, bool) {
+    lines_body(data, index, start, before, stop, sink)
+}
+
+/// Whether `walk` uses `lines_evex`: asked for with `SS_LINES=evex` (a measuring
+/// knob) on a CPU that has the instructions.
+fn evex_asked() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        std::env::var("SS_LINES").is_ok_and(|asked| asked.trim() == "evex")
+            && is_x86_feature_detected!("avx512f")
+            && is_x86_feature_detected!("avx512vl")
+            && is_x86_feature_detected!("avx512bw")
+            && is_x86_feature_detected!("avx512dq")
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
+#[inline(always)]
+unsafe fn lines_body<L: Lines>(data: *const u8, index: &Index, mut start: usize, mut before: isize, stop: usize, sink: &mut L) -> (usize, bool) {
     let delims = index.delims();
     let mut quotes_before = index.quotes_before(start);
     loop {
@@ -258,18 +287,6 @@ unsafe fn lines<L: Lines>(data: *const u8, index: &Index, mut start: usize, mut 
 /// Feeds `sink` every data line of `file` that starts in `offset..offset + length`.
 pub fn walk<L: Lines>(file: &File, offset: u64, length: u64, buf: &mut ReadBuf, sink: &mut L) {
     let range_end = offset + length;
-    if buf.stop == 1 {
-        let mut at = offset;
-        while at < range_end {
-            let want = (buf.block as u64).min(range_end - at) as usize;
-            let got = read_fully(file, &mut buf.bytes[FRONT..FRONT + want], at);
-            if got == 0 {
-                break;
-            }
-            at += got as u64;
-        }
-        return;
-    }
     // Start one byte early: if that byte is a newline, a line starts exactly at `offset`.
     let mut next_read = offset.saturating_sub(1);
     let mut base = next_read; // file offset of data[0]
@@ -296,20 +313,6 @@ pub fn walk<L: Lines>(file: &File, offset: u64, length: u64, buf: &mut ReadBuf, 
         unsafe { buf.index.build(data, len) };
         let index = &buf.index;
         let delims = index.delims();
-        if buf.stop == 2 {
-            if at_end {
-                return;
-            }
-            // Everything up to the last newline counts as walked; the rest is kept, as the walk keeps it.
-            let start = buf.bytes[FRONT..FRONT + len].iter().rposition(|&b| b == b'\n').map_or(0, |at| at + 1);
-            if base + start as u64 >= range_end {
-                return;
-            }
-            buf.bytes.copy_within(FRONT + start..FRONT + len, FRONT);
-            len -= start;
-            base += start as u64;
-            continue;
-        }
 
         let mut start = 0usize; // where the next line starts
         // Which delimiter is the one just before `start`: -1 is the slot in front, the delimiter at offset -1.
@@ -329,6 +332,10 @@ pub fn walk<L: Lines>(file: &File, offset: u64, length: u64, buf: &mut ReadBuf, 
         }
         // Lines starting at or after `stop` belong to the next range.
         let stop = usize::try_from(range_end - base).unwrap_or(usize::MAX);
+        #[cfg(target_arch = "x86_64")]
+        let (start, done) =
+            unsafe { if buf.evex { lines_evex(data, index, start, before, stop, sink) } else { lines(data, index, start, before, stop, sink) } };
+        #[cfg(not(target_arch = "x86_64"))]
         let (start, done) = unsafe { lines(data, index, start, before, stop, sink) };
         if done || at_end || base + start as u64 >= range_end {
             return;
@@ -518,7 +525,7 @@ mod tests {
         let mut pieces = jobs(std::slice::from_ref(input), target);
         pieces.sort_by_key(|job| job.offset);
         let capacity = 2 * block;
-        let mut buf = ReadBuf { bytes: vec![0; FRONT + capacity + 128], index: Index::new(capacity + 64), block, stop: 0 };
+        let mut buf = ReadBuf { bytes: vec![0; FRONT + capacity + 128], index: Index::new(capacity + 64), block, evex: evex_asked() };
         for job in pieces {
             walk(&input.file, job.offset, job.length, &mut buf, sink);
         }

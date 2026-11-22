@@ -318,44 +318,8 @@ static HOURS: [u32; 256] = clock_table(23, 3_600);
 #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
 static MINUTES: [u32; 256] = clock_table(59, 60);
 
-/// 32 bytes that a vector instruction reads from memory where it uses them.
-///
-/// Written as an ordinary constant, a vector of 32 bytes is loaded into a
-/// register before the line loop and held there. The loop has more such
-/// constants than there are registers, and the compiler then moves them from
-/// register to register around every step that needs one free (about a dozen
-/// moves a line in the compiled loop, and a constant or two stored to the
-/// stack and fetched back). A volatile read cannot be moved out of the loop,
-/// and it is folded into the instruction that uses it: one memory operand,
-/// no register, no move (BENCH.md, experiment 43).
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-#[repr(C, align(32))]
-struct InPlace([u8; 32]);
-
-#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-impl InPlace {
-    const fn bytes(bytes: [u8; 32]) -> Self {
-        Self(bytes)
-    }
-
-    /// Sixteen words, each stored low byte first.
-    const fn words(words: [i16; 16]) -> Self {
-        let mut bytes = [0u8; 32];
-        let mut at = 0;
-        while at < 16 {
-            let word = words[at].to_le_bytes();
-            bytes[2 * at] = word[0];
-            bytes[2 * at + 1] = word[1];
-            at += 1;
-        }
-        Self(bytes)
-    }
-
-    #[inline(always)]
-    fn read(&'static self) -> std::arch::x86_64::__m256i {
-        unsafe { std::ptr::read_volatile(self as *const Self as *const std::arch::x86_64::__m256i) }
-    }
-}
+use crate::sys::InPlace;
 
 /// `HH:MM:SS` at `p` as seconds since midnight, and whether it is a real time
 /// of day (00:00:00 to 23:59:59). Never branches. The definition `numbers` is
