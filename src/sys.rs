@@ -311,3 +311,30 @@ impl InPlace {
         unsafe { std::ptr::read_volatile(self as *const Self as *const std::arch::x86_64::__m256i) }
     }
 }
+
+/// A file's bytes where they lie in the kernel's cache, with no copy: `len`
+/// bytes at the pointer returned, zeros for at least 64 KB before them and
+/// after them (readable, and writable too: the mapping is private, so a write
+/// changes this process's view and not the file). `None` if the kernel says no.
+pub fn map_file(file: &std::fs::File, len: usize) -> Option<*mut u8> {
+    use std::os::fd::AsRawFd;
+    const MAP_FIXED: i32 = 0x10;
+    // A multiple of every page size this runs on (4 KB, and 16 KB on Apple's chips).
+    const EDGE: usize = 1 << 16;
+    let whole = EDGE + len.div_ceil(EDGE) * EDGE + EDGE;
+    unsafe {
+        let all = mmap(std::ptr::null_mut(), whole, PROT_READ_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        if all as isize == -1 {
+            return None;
+        }
+        let data = (all as *mut u8).add(EDGE);
+        if len > 0 {
+            let mapped = mmap(data as *mut c_void, len, PROT_READ_WRITE, MAP_PRIVATE | MAP_FIXED, file.as_raw_fd(), 0);
+            if mapped as isize == -1 {
+                return None;
+            }
+        }
+        Some(data)
+    }
+}
+
