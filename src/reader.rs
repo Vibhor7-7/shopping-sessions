@@ -381,6 +381,23 @@ impl Input {
     }
 }
 
+/// Takes down the mappings of `inputs` on a thread of its own, once nothing
+/// reads them any more: 5 GB of them are 20 ms of a process's end, which this
+/// spends while the later phases run instead (asked for with `SS_UNMAP=early`).
+pub fn unmap_early(inputs: &mut [Input]) {
+    if !std::env::var("SS_UNMAP").is_ok_and(|asked| asked.trim() == "early") {
+        return;
+    }
+    let mapped: Vec<(usize, usize)> = inputs.iter_mut().filter_map(|input| input.mapped.take().map(|(data, _)| (data, input.len as usize))).collect();
+    if !mapped.is_empty() {
+        std::thread::spawn(move || {
+            for (data, len) in mapped {
+                crate::sys::unmap_file(data as *mut u8, len);
+            }
+        });
+    }
+}
+
 /// Whether the event and click files are to be mapped (`Input::map`).
 pub fn map_asked() -> bool {
     std::env::var("SS_INPUT").is_ok_and(|asked| asked.trim() == "mmap")
