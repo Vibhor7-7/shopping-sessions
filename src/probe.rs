@@ -521,6 +521,7 @@ pub fn at_scale() {
     // 20M runs first: writing the 60M one leaves the disk busy for a while, and
     // a run's people phase writes too (`sync` waits that out before the 60M runs).
     let e = ("SS_LINES", "evex");
+    let m = ("SS_INPUT", "mmap");
     let p9 = [("SS_PERSON_BITS", "9"), ("SS_DEDUP_BITS", "9")];
     let p10 = [("SS_PERSON_BITS", "10"), ("SS_DEDUP_BITS", "10")];
     for round in 1..=2 {
@@ -530,7 +531,11 @@ pub fn at_scale() {
         }
         run(&format!("B128Er{round}"), &[("SS_BLOCK_BYTES", "131072"), e], &data);
         run(&format!("B128P9r{round}"), &[("SS_BLOCK_BYTES", "131072"), p9[0], p9[1]], &data);
+        // `M`: the files parsed where they are mapped (experiment 48).
+        run(&format!("Mr{round}"), &[m], &data);
+        run(&format!("MB128r{round}"), &[m, ("SS_BLOCK_BYTES", "131072")], &data);
     }
+    run("MB128E", &[m, ("SS_BLOCK_BYTES", "131072"), e], &data);
     run("B96E", &[("SS_BLOCK_BYTES", "98304"), e], &data);
     run("B128P9E", &[("SS_BLOCK_BYTES", "131072"), p9[0], p9[1], e], &data);
     run("S3", &[], &data);
@@ -562,6 +567,8 @@ pub fn at_scale() {
                 ("b128p10d9", &[b, p10[0], d9][..]),
                 ("c4096", &[("SS_CHUNK_MIN", "4096")][..]),
                 ("b128e", &[b, e][..]),
+                ("m", &[m][..]),
+                ("mb128", &[m, b][..]),
             ] {
                 if in_time() {
                     run(&format!("{label}r{round}"), settings, &big);
