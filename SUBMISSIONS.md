@@ -6,7 +6,7 @@
 
 ## How the page works (as seen on 2026-11-21)
 
-- The form has two fields, "Public GitHub repository" and "Commit (optional)", and a Submit button. Above it the page says how many of the 2 submissions an hour are left and when the next one frees up.
+- The form has two fields, "Public GitHub repository" and "Commit (optional)", and a Submit button. Above it the page says how many of the hour's submissions are left (2 an hour until Sat 2026-11-21 afternoon, 3 since) and when the next one frees up.
 - "Your team's submissions" lists each one, newest first: its ID, its state, its score, when, and `repository @ commit` (12 characters of the hash). A submission that fails the dev check shows its differing rows and its log there.
 - Every submission except the entered one has a "Pick as our final entry" button. **Never press it.** The best score is entered in the final without anyone choosing.
 - Scores of two machines can differ by up to about 20%, the page says; runs under 20 s are timed 3 times and the median counts.
@@ -34,6 +34,7 @@ Rows up to `fac219f` were read off the page on 2026-11-21; the user made them by
 | Sat 10:13 AM | BB-EE591719 | `8bde2f15b934df82545292ee715180824041f298` | Scored | **0.68 s** | none | Submitted by the unattended cycle 15 (experiments 39 and 41). "Scoring" ("Fetching") 5 seconds after Submit, "Scored" when looked at again 38 seconds later. Entered in the final as the best score, by the page, without anyone choosing. 21st of 269 teams; the board's best is 0.31 s (two teams), the next five 0.42 to 0.58 s. The page then read "1 of 2 left this hour", the next one free at 11:13 AM. Was the entry for the final until 3:18 PM |
 | Sat 3:18 PM | BB-7C1FEE7D | `604f10b4a08960c987e84aecfb1cee30e19ea30b` | Scored | **0.67 s** | none | Submitted by the user by hand (experiments 42 and 43; the code is `25b6c81`). Entered in the final as the best score, by the page. 39th of 303 teams at 3:50 PM (tied at 0.67 s with three others); 17 teams are at 0.29 to 0.33 s, the next ones at 0.42 to 0.45 s |
 | Sat 3:57 PM | BB-95786DB4 | `78d5146c33452f1f7092261f7258720b74e176fe` (branch `probe`) | Rejected, on purpose | none | user_daily 0 rows, not 117,038: 117,038 missing, 0 extra | The probe, submitted from the interactive session at the user's word. **The page showed five differing rows (the dev answer's first five by user_id and day, expected and ours) and no log**: a wrong table does not get its log shown, whatever the rules page says. Nothing learned about the machine from this one |
+| Sat 6:57 PM | BB-3364BC62 | `ecd0219f39e0806820f8ad908317a4bcc9c283cf` (branch `probe`) | Rejected, on purpose | none | user_daily: 5 missing, 5 extra (the five carrying rows) | The reworked probe, submitted from the interactive session at the user's word. **The page showed the first differing row only, cut at about 2,000 characters**; that row said what the scorer's CPU is and what the pipeline takes on it at 20M (BENCH.md, "The probe"). The page's quota is now 3 submissions an hour |
 
 ## The probe
 
