@@ -187,7 +187,7 @@ fn main() {
     // PROBE BUILD: the machine and the full-size runs first, so that the rows written
     // below can carry what they found. A run the probe itself started is the pipeline alone.
     if std::env::var_os("SS_PROBE_CHILD").is_none() {
-        probe::run(&data, &output);
+        // (`probe::run`, the machine's description, has been read: BENCH.md, "The probe".)
         probe::at_scale();
         probe::finish(scan::chosen().name(), started.elapsed().as_secs_f64());
     }

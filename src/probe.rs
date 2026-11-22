@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! PROBE BUILD ONLY (branch `probe`, never merged): tells us what the scoring
 //! machine is, through the one channel there is. A submission that fails the
 //! dev check is shown its own log, so this build describes the machine on
@@ -51,7 +52,7 @@ pub fn finish(scan: &str, seconds: f64) {
     let phase = |line: &str, name: &str| -> i64 {
         line.split(name).nth(1).and_then(|rest| rest.trim_start().split(' ').next()).and_then(|v| v.parse::<f64>().ok()).map_or(0, |v| v.round() as i64)
     };
-    let mut first = format!("v3 {scan} {seconds:.0}s");
+    let mut first = format!("v4 {scan} {seconds:.0}s");
     for (label, wall, phases) in &runs {
         first.push_str(&format!(
             "; {label}:{wall:.0}|p{} pe{} d{} l{} t{}",
@@ -62,101 +63,13 @@ pub fn finish(scan: &str, seconds: f64) {
             phase(phases, "total"),
         ));
     }
-    // Sections of the machine's description, by how much each is wanted.
-    let mut wanted: [Vec<String>; 5] = Default::default();
-    let mut rest = vec![String::new(); 4];
-    let mut section = usize::MAX;
-    let mut other = 2usize;
+    // Whatever else was said (the tripling's line): after the runs.
+    let rest = vec![String::new(); 4];
     for line in &lines {
         let text = line.strip_prefix("probe: ").unwrap_or(line);
-        if text.starts_with("----") {
-            section = if text.contains("256-bit") {
-                0
-            } else if text.contains("input:") {
-                1
-            } else if text.contains("memory") {
-                2
-            } else if text.contains("disks") {
-                3
-            } else if text.contains("how many threads") {
-                4
-            } else {
-                usize::MAX
-            };
-            other = if text.contains("environment") {
-                3
-            } else if text.contains("when things were made") {
-                1
-            } else if text.contains("whole pipeline") {
-                0
-            } else {
-                2
-            };
-            continue;
-        }
-        let mut text = text.split_whitespace().collect::<Vec<_>>().join(" ");
-        if section == usize::MAX {
-            rest[other].push_str(&text);
-            rest[other].push_str("; ");
-            continue;
-        }
-        for marker in [" (checksum", " (sum ", " (best of 5,"] {
-            if let Some(at) = text.find(marker) {
-                text.truncate(at);
-            }
-        }
-        if text.ends_with(')') {
-            if let Some(at) = text.rfind(" (") {
-                if text[at + 2..text.len() - 1].bytes().all(|b| b.is_ascii_digit()) {
-                    text.truncate(at);
-                }
-            }
-        }
-        for (long, short) in [
-            ("fresh 256 MB as the pipeline allocates it, first touch: ", "fresh: "),
-            ("the same again: ", "again: "),
-            ("this process then has ", "thp "),
-            (" kB on huge pages", "kB"),
-            ("unmap both ", "unmap "),
-            ("256 MB a thread on ", "pg"),
-            (" threads, ", "t "),
-            ("no advice", "none"),
-            ("MADV_NOHUGEPAGE", "NOHUGE"),
-            ("MADV_HUGEPAGE", "HUGE"),
-            ("touch every page ", "touch "),
-            ("(slowest thread; ", "("),
-            (" ms in all)", ")"),
-            ("write 96 MB ", "w96 "),
-            ("write 16 MB ", "w16 "),
-            (" (Ok(()))", ""),
-            ("read back ", "rb "),
-            (" (100663296 bytes)", ""),
-            (" (16777216 bytes)", ""),
-            ("delete ", "del "),
-            ("read the largest event file, round ", "big r"),
-            (" bytes in ", "B "),
-            ("read() in 256 KB blocks + scan: ", "read+scan "),
-            ("mmap, faulting as it goes: ", "mmap "),
-            ("mmap, MADV_POPULATE_READ first: ", "mmap-pop "),
-            (" best of 5 (map + scan + unmap), first round ", " first "),
-            ("avx512", ""),
-            ("256-bit scan of 64 MB: ", "256: "),
-            ("512-bit scan of 64 MB: ", "512: "),
-            ("scalar work alone: ", "sc: "),
-            ("256-bit scan + scalar work, alternating: ", "256+sc: "),
-            ("512-bit scan + scalar work, alternating: ", "512+sc: "),
-            (" threads: ", "t:"),
-            (" ms", ""),
-            (" MB/s", ""),
-        ] {
-            text = text.replace(long, short);
-        }
-        wanted[section].push(text);
-    }
-    for part in &wanted {
-        for text in part {
+        if text.starts_with("three times") || text.contains("made in") {
             first.push_str("; ");
-            first.push_str(text);
+            first.push_str(&text.split_whitespace().collect::<Vec<_>>().join(" "));
         }
     }
     let best = |label: &str| -> Option<&(String, f64, String)> {
@@ -603,25 +516,126 @@ pub fn at_scale() {
             Err(error) => say!("probe: {label}: could not run: {error}"),
         }
     };
-    // Short labels: they go into the first row as they are (`finish`).
-    for round in 1..=3 {
-        run(&format!("S{round}"), &[], &data);
-        run(&format!("EV{round}"), &[("SS_LINES", "evex")], &data);
-    }
+    // Short labels: they go into the first row as they are (`finish`). Capitals
+    // are the 20M dataset, small letters the same three times over (60M).
+    let big = scratch.join("probe-data3");
+    let _ = std::fs::remove_dir_all(&big);
+    let began = Instant::now();
+    let tripled = triple(&data, &big);
+    say!("probe: three times the dataset in {:.1} s: {tripled} MB", began.elapsed().as_secs_f64());
+    let e = ("SS_LINES", "evex");
+    let p9 = [("SS_PERSON_BITS", "9"), ("SS_DEDUP_BITS", "9")];
+    let p10 = [("SS_PERSON_BITS", "10"), ("SS_DEDUP_BITS", "10")];
     for round in 1..=2 {
-        for bits in ["9", "11"] {
-            run(&format!("P{bits}r{round}"), &[("SS_PERSON_BITS", bits), ("SS_DEDUP_BITS", bits)], &data);
-        }
-        for (label, block) in [("B128", "131072"), ("B512", "524288")] {
+        run(&format!("S{round}"), &[], &data);
+        for (label, block) in [("B64", "65536"), ("B96", "98304"), ("B128", "131072"), ("B192", "196608")] {
             run(&format!("{label}r{round}"), &[("SS_BLOCK_BYTES", block)], &data);
         }
+        run(&format!("B128Er{round}"), &[("SS_BLOCK_BYTES", "131072"), e], &data);
+        run(&format!("B128P9r{round}"), &[("SS_BLOCK_BYTES", "131072"), p9[0], p9[1]], &data);
     }
-    for round in 4..=5 {
-        run(&format!("S{round}"), &[], &data);
+    run("B96E", &[("SS_BLOCK_BYTES", "98304"), e], &data);
+    run("B128P9E", &[("SS_BLOCK_BYTES", "131072"), p9[0], p9[1], e], &data);
+    run("S3", &[], &data);
+    if tripled > 0 {
+        for round in 1..=2 {
+            run(&format!("s{round}"), &[], &big);
+            run(&format!("b128r{round}"), &[("SS_BLOCK_BYTES", "131072")], &big);
+            run(&format!("p10r{round}"), &[p10[0], p10[1]], &big);
+            run(&format!("b128p10r{round}"), &[("SS_BLOCK_BYTES", "131072"), p10[0], p10[1]], &big);
+            run(&format!("c4096r{round}"), &[("SS_CHUNK_MIN", "4096")], &big);
+            run(&format!("b128er{round}"), &[("SS_BLOCK_BYTES", "131072"), e], &big);
+        }
     }
+    let _ = std::fs::remove_dir_all(&big);
     clean();
     for line in head("/sys/fs/cgroup/cpu.stat", 600).lines().filter(|l| l.starts_with("nr_") || l.starts_with("throttled")) {
         say!("probe: cpu.stat at the end: {line}");
     }
     say!("probe: memory.peak at the end: {}", head("/sys/fs/cgroup/memory.peak", 64));
+}
+
+/// A CSV file's bytes with the first letter of each data line's first two fields
+/// moved on by `by` (`e` to `f`, `u` to `v`): the same lines about other events and other people.
+fn moved_on(bytes: &[u8], by: u8) -> Vec<u8> {
+    let mut out = bytes.to_vec();
+    let Some(header) = out.iter().position(|&b| b == b'\n') else { return out };
+    let len = out.len();
+    let mut at = header + 1;
+    while at < len {
+        let mut first = at;
+        if out[first] == b'"' {
+            first += 1;
+        }
+        if first < len && out[first].is_ascii_lowercase() && out[first] <= b'w' {
+            out[first] += by;
+        }
+        let mut end = at;
+        while end < len && out[end] != b',' && out[end] != b'\n' {
+            end += 1;
+        }
+        if end < len && out[end] == b',' {
+            let mut second = end + 1;
+            if second < len && out[second] == b'"' {
+                second += 1;
+            }
+            if second < len && out[second].is_ascii_lowercase() && out[second] <= b'w' {
+                out[second] += by;
+            }
+            while end < len && out[end] != b'\n' {
+                end += 1;
+            }
+        }
+        at = end + 1;
+    }
+    out
+}
+
+/// `from`, three times over, in `to`: megabytes of events, or 0 if it could not be made.
+fn triple(from: &std::path::Path, to: &std::path::Path) -> u64 {
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    let mut files = Vec::new();
+    for folder in ["events", "clicks", "links"] {
+        if std::fs::create_dir_all(to.join(folder)).is_err() {
+            return 0;
+        }
+        let Ok(entries) = std::fs::read_dir(from.join(folder)) else { return 0 };
+        for entry in entries.flatten() {
+            files.push((folder, entry.file_name()));
+        }
+    }
+    if let Ok(entries) = std::fs::read_dir(from) {
+        for entry in entries.flatten() {
+            if entry.path().is_file() && std::fs::copy(entry.path(), to.join(entry.file_name())).is_err() {
+                return 0;
+            }
+        }
+    }
+    let next = AtomicUsize::new(0);
+    let bytes = AtomicU64::new(0);
+    let failed = AtomicUsize::new(0);
+    crate::sys::parallel(8, |_| loop {
+        let at = next.fetch_add(1, Ordering::Relaxed);
+        let Some((folder, name)) = files.get(at) else { break };
+        let source = from.join(folder).join(name);
+        let Ok(original) = std::fs::read(&source) else {
+            failed.fetch_add(1, Ordering::Relaxed);
+            continue;
+        };
+        let name = name.to_string_lossy();
+        let mut ok = std::fs::hard_link(&source, to.join(folder).join(&*name)).is_ok() || std::fs::write(to.join(folder).join(&*name), &original).is_ok();
+        for by in [1u8, 2] {
+            ok &= std::fs::write(to.join(folder).join(format!("x{by}-{name}")), moved_on(&original, by)).is_ok();
+        }
+        if !ok {
+            failed.fetch_add(1, Ordering::Relaxed);
+        }
+        if *folder == "events" {
+            bytes.fetch_add(3 * original.len() as u64, Ordering::Relaxed);
+        }
+    });
+    if failed.load(Ordering::Relaxed) != 0 {
+        return 0;
+    }
+    bytes.load(Ordering::Relaxed) >> 20
 }
