@@ -161,8 +161,11 @@ fn main() {
         .unwrap_or(8)
         .clamp(1, 256);
 
-    let events = reader::open_folder(&data.join("events"));
-    let clicks = reader::open_folder(&data.join("clicks"));
+    let mut events = reader::open_folder(&data.join("events"));
+    let mut clicks = reader::open_folder(&data.join("clicks"));
+    if reader::map_asked() {
+        events.iter_mut().chain(clicks.iter_mut()).for_each(reader::Input::map);
+    }
     let link_files = reader::open_folder(&data.join("links"));
     let event_bytes: u64 = events.iter().map(|i| i.len).sum();
     let click_bytes: u64 = clicks.iter().map(|i| i.len).sum();

@@ -351,6 +351,98 @@ pub fn walk<L: Lines>(file: &File, offset: u64, length: u64, buf: &mut ReadBuf, 
 pub struct Input {
     pub file: File,
     pub len: u64,
+    /// Where the file's bytes are mapped, if they are, and how many there are
+    /// with the newline put after a last line that has none (`Input::map`).
+    mapped: Option<(usize, u64)>,
+}
+
+impl Input {
+    /// Maps the file, so that `walk_input` parses it where it lies instead of
+    /// reading it into a buffer first. Asked for with `SS_INPUT=mmap`: a
+    /// measuring knob (BENCH.md, experiments 10 and 48).
+    pub fn map(&mut self) {
+        let len = self.len as usize;
+        if let Some(data) = crate::sys::map_file(&self.file, len) {
+            let mut total = self.len;
+            // A last line with no newline is still a line.
+            unsafe {
+                if len > 0 && *data.add(len - 1) != b'\n' {
+                    *data.add(len) = b'\n';
+                    total += 1;
+                }
+            }
+            self.mapped = Some((data as usize, total));
+        }
+    }
+}
+
+/// Whether the event and click files are to be mapped (`Input::map`).
+pub fn map_asked() -> bool {
+    std::env::var("SS_INPUT").is_ok_and(|asked| asked.trim() == "mmap")
+}
+
+/// `walk`, through the file's mapping if it has one.
+pub fn walk_input<L: Lines>(input: &Input, offset: u64, length: u64, buf: &mut ReadBuf, sink: &mut L) {
+    match input.mapped {
+        Some((data, total)) => walk_mapped(data as *const u8, total, offset, length, buf, sink),
+        None => walk(&input.file, offset, length, buf, sink),
+    }
+}
+
+/// `walk` over a file that is mapped at `file_start` (`total` bytes, ending in
+/// a newline): the same steps, with a window on the mapping where `walk` has
+/// its buffer. The window grows by a block where `walk` reads one, and moves
+/// on to the unfinished line where `walk` copies that line to the front.
+fn walk_mapped<L: Lines>(file_start: *const u8, total: u64, offset: u64, length: u64, buf: &mut ReadBuf, sink: &mut L) {
+    let range_end = offset + length;
+    // Start one byte early: if that byte is a newline, a line starts exactly at `offset`.
+    let mut base = offset.saturating_sub(1); // file offset of data[0]
+    let mut len = 0usize; // bytes in the window
+    let mut skip = true; // the header, or the line this range starts inside
+    let mut at_end = false;
+    loop {
+        if !at_end {
+            let block = buf.block;
+            let got = block.min((total - (base + len as u64)) as usize);
+            len += got;
+            if got < block {
+                at_end = true;
+            }
+            if len > buf.index.capacity() {
+                buf.index = Index::new(len.next_power_of_two() + 64);
+            }
+        }
+        let data = unsafe { file_start.add(base as usize) };
+        unsafe { buf.index.build(data, len) };
+        let index = &buf.index;
+        let delims = index.delims();
+
+        let mut start = 0usize;
+        let mut before = -1isize;
+        if skip {
+            let first = unsafe { next_newline(data, delims, 0) };
+            if first < 0 {
+                if at_end {
+                    return;
+                }
+                continue;
+            }
+            before = first;
+            start = unsafe { *delims.offset(first) } as usize + 1;
+            skip = false;
+        }
+        let stop = usize::try_from(range_end - base).unwrap_or(usize::MAX);
+        #[cfg(target_arch = "x86_64")]
+        let (start, done) =
+            unsafe { if buf.evex { lines_evex(data, index, start, before, stop, sink) } else { lines(data, index, start, before, stop, sink) } };
+        #[cfg(not(target_arch = "x86_64"))]
+        let (start, done) = unsafe { lines(data, index, start, before, stop, sink) };
+        if done || at_end || base + start as u64 >= range_end {
+            return;
+        }
+        len -= start;
+        base += start as u64;
+    }
 }
 
 /// The `*.csv` files directly in `dir`, opened. A missing folder holds none.
@@ -373,7 +465,7 @@ pub fn open_folder(dir: &std::path::Path) -> Vec<Input> {
             continue;
         }
         match File::open(&path) {
-            Ok(file) => inputs.push(Input { file, len: meta.len() }),
+            Ok(file) => inputs.push(Input { file, len: meta.len(), mapped: None }),
             Err(e) => {
                 eprintln!("pipeline: cannot open {}: {e}", path.display());
                 std::process::abort();
@@ -527,7 +619,7 @@ mod tests {
         let capacity = 2 * block;
         let mut buf = ReadBuf { bytes: vec![0; FRONT + capacity + 128], index: Index::new(capacity + 64), block, evex: evex_asked() };
         for job in pieces {
-            walk(&input.file, job.offset, job.length, &mut buf, sink);
+            walk_input(input, job.offset, job.length, &mut buf, sink);
         }
     }
 
@@ -567,27 +659,33 @@ mod tests {
                 at = end + 1;
             }
             std::fs::write(&path, &content).unwrap();
-            let input = Input { file: File::open(&path).unwrap(), len: content.len() as u64 };
+            // Read into a buffer, and parsed where the file is mapped: the same lines either way.
+            let plain = Input { file: File::open(&path).unwrap(), len: content.len() as u64, mapped: None };
+            let mut mapped = Input { file: File::open(&path).unwrap(), len: content.len() as u64, mapped: None };
+            mapped.map();
+            assert!(mapped.mapped.is_some());
             let whole = content.len() as u64 + 1;
+            for input in [&plain, &mapped] {
             for (block, target) in [(16, whole), (17, 7), (16, 1), (64, 50), (61, 33), (128, whole), (1000, 129), (4096, whole)] {
                 let mut two = Plain::<2>(Vec::new());
-                read_with(&input, block, target, &mut two);
+                read_with(input, block, target, &mut two);
                 assert_eq!(two.0, expected(&content, 2), "round {round}, 2 fields, block {block}, ranges of {target}");
                 let mut two = Split::<2>(Vec::new());
-                read_with(&input, block, target, &mut two);
+                read_with(input, block, target, &mut two);
                 assert_eq!(two.0, expected(&content, 2), "round {round}, 2 fields split, block {block}, ranges of {target}");
                 let mut four = Split::<4>(Vec::new());
-                read_with(&input, block, target, &mut four);
+                read_with(input, block, target, &mut four);
                 assert_eq!(four.0, expected(&content, 4), "round {round}, 4 fields, block {block}, ranges of {target}");
                 let mut four = Plain::<4>(Vec::new());
-                read_with(&input, block, target, &mut four);
+                read_with(input, block, target, &mut four);
                 assert_eq!(four.0, expected(&content, 4), "round {round}, 4 fields plain, block {block}, ranges of {target}");
                 let mut seven = Split::<7>(Vec::new());
-                read_with(&input, block, target, &mut seven);
+                read_with(input, block, target, &mut seven);
                 assert_eq!(seven.0, expected(&content, 7), "round {round}, 7 fields, block {block}, ranges of {target}");
                 lines_seen[0] += two.0.len();
                 lines_seen[1] += four.0.len();
                 lines_seen[2] += seven.0.len();
+            }
             }
         }
         std::fs::remove_file(&path).ok();
